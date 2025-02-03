@@ -1,25 +1,33 @@
 {
   "format": 1,
   "restore": {
-    "/home/sharku/Documents/Projects/CrossV9/cross/cross.csproj": {}
+    "T:\\githubRepos\\cross\\cross.csproj": {}
   },
   "projects": {
-    "/home/sharku/Documents/Projects/CrossV9/cross/cross.csproj": {
+    "T:\\githubRepos\\cross\\cross.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "/home/sharku/Documents/Projects/CrossV9/cross/cross.csproj",
+        "projectUniqueName": "T:\\githubRepos\\cross\\cross.csproj",
         "projectName": "cross",
-        "projectPath": "/home/sharku/Documents/Projects/CrossV9/cross/cross.csproj",
-        "packagesPath": "/home/sharku/.nuget/packages/",
-        "outputPath": "/home/sharku/Documents/Projects/CrossV9/cross/obj/",
+        "projectPath": "T:\\githubRepos\\cross\\cross.csproj",
+        "packagesPath": "C:\\Users\\alira\\.nuget\\packages\\",
+        "outputPath": "T:\\githubRepos\\cross\\obj\\",
         "projectStyle": "PackageReference",
+        "fallbackFolders": [
+          "C:\\Program Files (x86)\\Microsoft\\Xamarin\\NuGet\\"
+        ],
         "configFilePaths": [
-          "/home/sharku/.nuget/NuGet/NuGet.Config"
+          "C:\\Users\\alira\\AppData\\Roaming\\NuGet\\NuGet.Config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Xamarin.Offline.config"
         ],
         "originalTargetFrameworks": [
           "net8.0"
         ],
         "sources": {
+          "C:\\Program Files (x86)\\Microsoft SDKs\\NuGetPackages\\": {},
+          "C:\\Users\\alira\\Desktop\\Techpology\\HtmlInterpreter_Lib\\bin\\Debug": {},
+          "T:\\cSharp\\TpdbSharp\\bin\\Debug\\net8.0": {},
           "https://api.nuget.org/v3/index.json": {}
         },
         "frameworks": {
@@ -32,6 +40,11 @@
           "warnAsError": [
             "NU1605"
           ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
         }
       },
       "frameworks": {
@@ -72,7 +85,7 @@
               "privateAssets": "all"
             }
           },
-          "runtimeIdentifierGraphPath": "/usr/lib/dotnet/sdk/8.0.112/PortableRuntimeIdentifierGraph.json"
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.202/PortableRuntimeIdentifierGraph.json"
         }
       }
     }
