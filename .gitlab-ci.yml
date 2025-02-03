@@ -1,26 +1,26 @@
-﻿---
+---
 stages:
-	- build
-	- deploy
+  - build
+  - deploy
 
 build:
-	stage: build
-	image: docker:latest
-	services:
-		- docker:dind
-	before_script:
-		- echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
-	script:
-		- docker build -t registry.gitlab.com/tpvdb/cross .
-		- docker push registry.gitlab.com/tpvdb/cross .
-	only:
-		- dev
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+  script:
+    - docker build -t registry.gitlab.com/tpvdb/cross .
+    - docker push registry.gitlab.com/tpvdb/cross .
+  only:
+    - dev
 
 deploy:
-	stage: deploy
-	script:
-		- echo "User $(whoami)"
-		- kubectl get pods
-		- kubectl set image deployment/cross-deployment cross=registry.gitlab.com/tpvdb/tpvdb/cross --record
-	only:
-		- dev
+  stage: deploy
+  script:
+    - echo "User $(whoami)"
+    - kubectl get pods
+    - kubectl set image deployment/cross-deployment cross=registry.gitlab.com/tpvdb/tpvdb/cross --record
+  only:
+    - dev
