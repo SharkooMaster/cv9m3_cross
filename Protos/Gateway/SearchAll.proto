@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package gatewayService;
+
+service GatewayService {
+  rpc SearchAll(FileRequest) returns (FileResponse);
+}
+
+message QueryRequest {
+}
+
+message FileRequest {
+  bytes file_content = 1;
+}
+
+message FileResponse {
+  bytes file_content = 1;
+}
