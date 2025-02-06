@@ -796,33 +796,24 @@
     ]
   },
   "packageFolders": {
-    "C:\\Users\\alira\\.nuget\\packages\\": {},
-    "C:\\Program Files (x86)\\Microsoft\\Xamarin\\NuGet\\": {}
+    "/home/sharku/.nuget/packages/": {}
   },
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "T:\\githubRepos\\cross\\cross.csproj",
+      "projectUniqueName": "/home/sharku/Documents/Projects/CrossV9/cross/cross.csproj",
       "projectName": "cross",
-      "projectPath": "T:\\githubRepos\\cross\\cross.csproj",
-      "packagesPath": "C:\\Users\\alira\\.nuget\\packages\\",
-      "outputPath": "T:\\githubRepos\\cross\\obj\\",
+      "projectPath": "/home/sharku/Documents/Projects/CrossV9/cross/cross.csproj",
+      "packagesPath": "/home/sharku/.nuget/packages/",
+      "outputPath": "/home/sharku/Documents/Projects/CrossV9/cross/obj/",
       "projectStyle": "PackageReference",
-      "fallbackFolders": [
-        "C:\\Program Files (x86)\\Microsoft\\Xamarin\\NuGet\\"
-      ],
       "configFilePaths": [
-        "C:\\Users\\alira\\AppData\\Roaming\\NuGet\\NuGet.Config",
-        "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config",
-        "C:\\Program Files (x86)\\NuGet\\Config\\Xamarin.Offline.config"
+        "/home/sharku/.nuget/NuGet/NuGet.Config"
       ],
       "originalTargetFrameworks": [
         "net8.0"
       ],
       "sources": {
-        "C:\\Program Files (x86)\\Microsoft SDKs\\NuGetPackages\\": {},
-        "C:\\Users\\alira\\Desktop\\Techpology\\HtmlInterpreter_Lib\\bin\\Debug": {},
-        "T:\\cSharp\\TpdbSharp\\bin\\Debug\\net8.0": {},
         "https://api.nuget.org/v3/index.json": {}
       },
       "frameworks": {
@@ -835,11 +826,6 @@
         "warnAsError": [
           "NU1605"
         ]
-      },
-      "restoreAuditProperties": {
-        "enableAudit": "true",
-        "auditLevel": "low",
-        "auditMode": "direct"
       }
     },
     "frameworks": {
@@ -880,7 +866,7 @@
             "privateAssets": "all"
           }
         },
-        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.202/PortableRuntimeIdentifierGraph.json"
+        "runtimeIdentifierGraphPath": "/usr/lib/dotnet/sdk/8.0.112/PortableRuntimeIdentifierGraph.json"
       }
     }
   }
