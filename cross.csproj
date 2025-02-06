@@ -15,4 +15,8 @@
     </PackageReference>
   </ItemGroup>
 
+  <ItemGroup>
+    <Protobuf Include="Protos\CompressFile.proto" GrpcServices="Server" />
+  </ItemGroup>
+
 </Project>

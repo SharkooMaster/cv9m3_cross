@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package crossService;
+
+service FileService {
+  rpc ProcessFile(FileRequest) returns (FileResponse);
+}
+
+// FileRequest represents the file input.
+message FileRequest {
+  bytes file_content = 1;
+}
+
+message FileResponse {
+  bytes file_content = 1;
+}
