@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "dgSpecHash": "ECDqowrgHb5MzHCKtD/dEMB4wtUfiB3mWBO4ccDerKBC5qOWbLT3nrfvuJlyofNCsJSL1nh3rTvxQgp3Ri0Crw==",
+  "dgSpecHash": "iVfA4z5ueHAZnbxaqggZV8d4UwS2+8b2eNKNImEqCwMbJej8/8eDMdnBATW0dMoXJYaXCkDDsgol2Hazqal1Ag==",
   "success": true,
   "projectFilePath": "/home/sharku/Documents/Projects/CrossV9/cross/cross.csproj",
   "expectedPackageFiles": [
@@ -20,6 +20,7 @@
     "/home/sharku/.nuget/packages/microsoft.extensions.logging.abstractions/6.0.0/microsoft.extensions.logging.abstractions.6.0.0.nupkg.sha512",
     "/home/sharku/.nuget/packages/microsoft.extensions.options/6.0.0/microsoft.extensions.options.6.0.0.nupkg.sha512",
     "/home/sharku/.nuget/packages/microsoft.extensions.primitives/6.0.0/microsoft.extensions.primitives.6.0.0.nupkg.sha512",
+    "/home/sharku/.nuget/packages/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg.sha512",
     "/home/sharku/.nuget/packages/system.diagnostics.diagnosticsource/6.0.0/system.diagnostics.diagnosticsource.6.0.0.nupkg.sha512",
     "/home/sharku/.nuget/packages/system.runtime.compilerservices.unsafe/6.0.0/system.runtime.compilerservices.unsafe.6.0.0.nupkg.sha512"
   ],
