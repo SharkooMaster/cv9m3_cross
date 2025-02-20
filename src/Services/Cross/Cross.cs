@@ -31,6 +31,7 @@ public class CrossService : ICross
             request.QueryObjects.Add(qo);
         }
 
+        Console.WriteLine("Searching for chunks");
         QueryResponse response = await searchAllServiceClient.SearchAllAsync(request);
 
         // Compare results
