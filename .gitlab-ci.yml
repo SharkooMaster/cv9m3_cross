@@ -22,5 +22,6 @@ deploy:
     - echo "User $(whoami)"
     - kubectl get pods
     - kubectl set image deployment/cross-deployment cross=registry.gitlab.com/tpvdb/tpvdb/cross --record
+    - kubectl rollout restart deployment/cross-deployment
   only:
     - dev
