@@ -17,7 +17,6 @@ var app = builder.Build();
 
 app.UseRouting();
 
-app.MapGrpcService<SearchAllServiceClient>();
 app.MapGrpcService<CompressFileService>();
 
 app.MapGet("/", () => "Hello World!");
