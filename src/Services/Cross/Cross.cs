@@ -36,10 +36,7 @@ public class CrossService : ICross
 
         Console.WriteLine("Searching for chunks");
         QueryResponse response = await searchAllServiceClient.SearchAllAsync(request);
-
-        for (int i = 0; i < response.Results.Count; i++)
-        {
-        }
+        Console.WriteLine("Search complete");
 
         // Sort results
         List<List<QueryResponseObject>> chunk_results = new List<List<QueryResponseObject>>(vectors.Count);
