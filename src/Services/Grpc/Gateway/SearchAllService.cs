@@ -24,12 +24,12 @@ public class SearchAllServiceClient
         }
         catch (RpcException ex)
         {
-            AgnetaHandler.Log(2, $"gRPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
+            Console.WriteLine($"gRPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
             throw;
         }
         catch (Exception ex)
         {
-            AgnetaHandler.Log(2, $"[SearchAll] General error: {ex.Message}");
+            Console.WriteLine($"[SearchAll] General error: {ex.Message}");
             throw;
         }
     }
