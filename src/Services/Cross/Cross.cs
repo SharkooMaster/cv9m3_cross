@@ -78,6 +78,7 @@ public class CrossService : ICross
         }
 
         // Encode results
+        Console.WriteLine($"|Encode res|: final_res_len: ${final_results.Count}");
         List<M_EncodedResult> encoded_objects = new List<M_EncodedResult>();
         for (int i = 0; i < final_results.Count; i++)
         {
@@ -101,17 +102,19 @@ public class CrossService : ICross
         }
 
         // Add Dictionary and trimming
-        List<byte> output_bytes = new List<byte>();
-        output_bytes.AddRange(BitConverter.GetBytes((long)first_bytes.Count));
-        output_bytes.AddRange(BitConverter.GetBytes((long)error_bytes.Count));
-
-        output_bytes.AddRange(first_bytes);
-        output_bytes.AddRange(error_bytes);
-        output_bytes.AddRange(trimmedChunk);
+        Console.WriteLine($"|Add Dict|: first_bytes: {first_bytes.Count}, error_bytes: {error_bytes.Count}");
+        List<byte> output_bytes =
+        [
+            .. BitConverter.GetBytes((long)first_bytes.Count),
+            .. BitConverter.GetBytes((long)error_bytes.Count),
+            .. first_bytes,
+            .. error_bytes,
+            .. trimmedChunk,
+        ];
 
         // Return
         sw.Stop();
-        Console.WriteLine($"Total compression time: {sw.ElapsedMilliseconds / 1000}");
+        Console.WriteLine($"Total compression time: {sw.ElapsedMilliseconds}ms");
         return output_bytes.ToArray();
     }
 
