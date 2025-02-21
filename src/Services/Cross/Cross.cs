@@ -3,6 +3,7 @@ using Cross.Interfaces.Cross;
 using Cross.Utilities;
 using GatewayService;
 using Google.Protobuf;
+using Google.Protobuf.WellKnownTypes;
 
 namespace Cross.Services.Cross;
 
@@ -38,14 +39,79 @@ public class CrossService : ICross
 
         for (int i = 0; i < response.Results.Count; i++)
         {
+        }
+
+        // Sort results
+        List<List<QueryResponseObject>> chunk_results = new List<List<QueryResponseObject>>(vectors.Count);
+        for (int i = 0; i < response.Results.Count; i++)
+        {
             Console.WriteLine($"Response: {response.Results[i].Similarity*100}% : {response.Results[i].Id}/{response.Results[i].Index}");
+            chunk_results[(int)response.Results[i].Index].Add(response.Results[i]);
         }
 
         // Compare results
+        List<QueryResponseObject> final_results = new List<QueryResponseObject>(vectors.Count);
+        List<Dictionary<int, int>> final_error_results = new List<Dictionary<int, int>>(vectors.Count);
+        for (int i = 0; i < chunk_results.Count; i++)
+        {
+            if(chunk_results[i].Count == 0){ Console.WriteLine($"ERROR: Gateway didnt return a response for this index [{i}]"); }
+            else if(chunk_results[i].Count == 1)
+            {
+                final_results[i] = chunk_results[i][0];
+            }
+            else
+            {
+                Dictionary<int, int> error_encoding = new Dictionary<int, int>();
+                int _error_count = Globals.chunkSize;
+                int _best_index = -1;
+                for(int j = 0; j < chunk_results[i].Count; j++)
+                {
+                    Dictionary<int, int> temp_error_encoding = Misc.GetErrorEncoding(fileChunks[i], chunk_results[i][j].Chunk.ToByteArray());
+                    if(temp_error_encoding.Count < _error_count)
+                    {
+                        _best_index = j;
+                        error_encoding = temp_error_encoding;
+                    }
+                }
+                final_results[i] = chunk_results[i][_best_index];
+                final_error_results[i] = error_encoding;
+            }
+        }
+
         // Encode results
+        List<M_EncodedResult> encoded_objects = new List<M_EncodedResult>();
+        for (int i = 0; i < final_results.Count; i++)
+        {
+            encoded_objects.Add(new M_EncodedResult(){
+                bucket_id = final_results[i].Id,
+                row_id = final_results[i].IdPost,
+                error_encoding = final_error_results[i]
+            });
+        }
+
+        List<byte> first_bytes = new List<byte>();
+        List<byte> error_bytes = new List<byte>();
+        int error_bytes_offset = 0;
+        for (int i = 0; i < encoded_objects.Count; i++)
+        {
+            first_bytes.AddRange(BitConverter.GetBytes(encoded_objects[i].bucket_id));
+            first_bytes.AddRange(BitConverter.GetBytes(encoded_objects[i].row_id));
+            (byte[], int) _errors = Misc.GetErrorEncodingBytes(encoded_objects[i].error_encoding, error_bytes_offset);
+            error_bytes_offset = _errors.Item2;
+            error_bytes.AddRange(_errors.Item1);
+        }
+
         // Add Dictionary and trimming
+        List<byte> output_bytes = new List<byte>();
+        output_bytes.AddRange(BitConverter.GetBytes((long)first_bytes.Count));
+        output_bytes.AddRange(BitConverter.GetBytes((long)error_bytes.Count));
+
+        output_bytes.AddRange(first_bytes);
+        output_bytes.AddRange(error_bytes);
+        output_bytes.AddRange(trimmedChunk);
+
         // Return
-        return trimmedChunk;
+        return output_bytes.ToArray();
     }
 
     public async Task<byte[]> DecompressFile(byte[] _file)

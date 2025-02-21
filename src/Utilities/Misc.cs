@@ -112,4 +112,35 @@ static public class Misc
         return to_return;
     }
 
+    public static Dictionary<int, int> GetErrorEncoding(byte[] a, byte[] b)
+    {
+        Dictionary<int, int> to_return = new Dictionary<int, int>();
+        int last_append = 0;
+
+        for (int i = 0; i < a.Length; i++)
+        {
+            int dif = b[i] - a[i];
+            if(dif != 0)
+            {
+                to_return.Add(i - last_append, dif);
+                last_append = i;
+            }
+        }
+        return to_return;
+    }
+
+    public static (byte[], int) GetErrorEncodingBytes(Dictionary<int, int> a, int offset)
+    {
+        List<byte> to_return = new List<byte>();
+        int offset_return = offset;
+        int[] _keys = a.Keys.ToArray();
+        for (int i = 0; i < a.Count; i++)
+        {
+            to_return.AddRange(BitConverter.GetBytes(_keys[i] + offset));
+            to_return.AddRange(BitConverter.GetBytes((Int16)a[i]));
+            offset_return += _keys[i];
+        }
+        return (to_return.ToArray(), offset_return);
+    }
+
 }
