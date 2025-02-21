@@ -40,15 +40,21 @@ public class CrossService : ICross
         QueryResponse response = await searchAllServiceClient.SearchAllAsync(request);
         Console.WriteLine("Search complete");
 
-        // Sort results
-        List<List<QueryResponseObject>> chunk_results = new List<List<QueryResponseObject>>(vectors.Count);
         for (int i = 0; i < response.Results.Count; i++)
         {
             Console.WriteLine($"Response: {response.Results[i].Similarity*100}% : {response.Results[i].Id}/{response.Results[i].Index}");
+        }
+
+        // Sort results
+        Console.WriteLine($"|Sort res|: final_res_len: ${response.Results.Count}");
+        List<List<QueryResponseObject>> chunk_results = new List<List<QueryResponseObject>>(vectors.Count);
+        for (int i = 0; i < response.Results.Count; i++)
+        {
             chunk_results[(int)response.Results[i].Index].Add(response.Results[i]);
         }
 
         // Compare results
+        Console.WriteLine($"|Compare res|: final_res_len: ${chunk_results.Count}");
         List<QueryResponseObject> final_results = new List<QueryResponseObject>(vectors.Count);
         List<Dictionary<int, int>> final_error_results = new List<Dictionary<int, int>>(vectors.Count);
         for (int i = 0; i < chunk_results.Count; i++)
@@ -109,7 +115,7 @@ public class CrossService : ICross
             .. BitConverter.GetBytes((long)error_bytes.Count),
             .. first_bytes,
             .. error_bytes,
-            .. trimmedChunk,
+            .. trimmedChunk
         ];
 
         // Return
