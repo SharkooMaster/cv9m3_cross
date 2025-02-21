@@ -2,6 +2,7 @@
 using Cross.Interfaces.Cross;
 using Cross.Utilities;
 using GatewayService;
+using Google.Protobuf;
 
 namespace Cross.Services.Cross;
 
@@ -27,6 +28,7 @@ public class CrossService : ICross
         {
             QueryObject qo = new QueryObject() { BucketString = bitStrings[i] };
             qo.Vector.AddRange(vectors[i]);
+            qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
 
             request.QueryObjects.Add(qo);
         }
