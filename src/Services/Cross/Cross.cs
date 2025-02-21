@@ -1,4 +1,5 @@
 
+using System.Diagnostics;
 using Cross.Interfaces.Cross;
 using Cross.Utilities;
 using GatewayService;
@@ -12,6 +13,7 @@ public class CrossService : ICross
     SearchAllServiceClient searchAllServiceClient = new SearchAllServiceClient();
     public async Task<byte[]> CompressFile(byte[] _file)
     {
+        Stopwatch sw = Stopwatch.StartNew();
         // Divide into (N) chunks.
         List<byte[]> fileChunks = Misc.SplitFile(_file, Globals.chunkSize);
         byte[] trimmedChunk = fileChunks.Last();
@@ -108,6 +110,8 @@ public class CrossService : ICross
         output_bytes.AddRange(trimmedChunk);
 
         // Return
+        sw.Stop();
+        Console.WriteLine($"Total compression time: {sw.ElapsedMilliseconds / 1000}");
         return output_bytes.ToArray();
     }
 
