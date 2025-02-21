@@ -36,6 +36,11 @@ public class CrossService : ICross
         Console.WriteLine("Searching for chunks");
         QueryResponse response = await searchAllServiceClient.SearchAllAsync(request);
 
+        for (int i = 0; i < response.Results.Count; i++)
+        {
+            Console.WriteLine($"Response: {response.Results[i].Similarity*100}% : {response.Results[i].Id}/{response.Results[i].Index}");
+        }
+
         // Compare results
         // Encode results
         // Add Dictionary and trimming
