@@ -52,7 +52,7 @@ static public class Misc
         int nComponents = 64;
         int dataSize = Globals.chunkSize;
         float[,] randomProjection = new float[nComponents, dataSize];
-        Random random = new Random();
+        Random random = new Random(42);
     
         for (int row = 0; row < nComponents; row++)
         {
