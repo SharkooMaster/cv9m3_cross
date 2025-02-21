@@ -46,44 +46,50 @@ static public class Misc
         // Preallocate the results array.
         var results = new float[count][];
 
+        // Create a random projection matrix of size 64 x dataSize.
+        // For each call, we create a new projection matrix.
+        // (If you need to reuse the matrix across calls, consider caching it.)
+        int nComponents = 64;
+        int dataSize = Globals.chunkSize;
+        float[,] randomProjection = new float[nComponents, dataSize];
+        Random random = new Random();
+    
+        for (int row = 0; row < nComponents; row++)
+        {
+            for (int col = 0; col < dataSize; col++)
+            {
+                // Generates a value in the range [-0.5, 0.5)
+                randomProjection[row, col] = (float)(random.NextDouble() - 0.5);
+            }
+        }
+
         // Process each chunk in parallel.
         Parallel.For(0, count, i =>
         {
-            results[i] = Compute64ElementLSHVector(chunkList[i]);
+            results[i] = Compute64ElementLSHVector(chunkList[i], randomProjection);
         });
 
         return new List<float[]>(results);
     }
 
-    private static float[] Compute64ElementLSHVector(byte[] chunk)
+    private static float[] Compute64ElementLSHVector(byte[] chunk, float[,] randomProjection)
     {
-        const int vectorSize = 64;
-        float[] vector = new float[vectorSize];
-
-        // Return a zero vector if the chunk is null or empty.
-        if (chunk == null || chunk.Length == 0)
-            return vector;
-
-        // Determine the segment length. Use at least 1 byte per segment.
-        int segmentLength = Math.Max(1, chunk.Length / vectorSize);
-
-        for (int i = 0; i < vectorSize; i++)
+        const int nComponents = 64;
+        int dataSize = chunk.Length;
+    
+        // Project the data vector using the random projection matrix.
+        float[] lshVector = new float[nComponents];
+        for (int row = 0; row < nComponents; row++)
         {
-            int start = i * segmentLength;
-            // Ensure we don't exceed the chunk length.
-            int end = Math.Min(chunk.Length, start + segmentLength);
-
-            long sum = 0;
-            for (int j = start; j < end; j++)
+            float sum = 0;
+            for (int col = 0; col < dataSize; col++)
             {
-                sum += chunk[j];
+                sum += randomProjection[row, col] * chunk[col];
             }
-
-            int count = end - start;
-            vector[i] = count > 0 ? (float)sum / count : 0;
+            lshVector[row] = sum;
         }
-
-        return vector;
+    
+        return lshVector;
     }
 
     public static List<string> ComputeBitStringFromVectors(List<float[]> vectors)
