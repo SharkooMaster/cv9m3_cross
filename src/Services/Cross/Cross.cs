@@ -50,7 +50,7 @@ public class CrossService : ICross
         List<List<QueryResponseObject>> chunk_results = new List<List<QueryResponseObject>>(vectors.Count);
         for (int i = 0; i < response.Results.Count; i++)
         {
-            chunk_results[(int)response.Results[i].Index].Add(response.Results[i]);
+            chunk_results[Convert.ToInt32(response.Results[i].Index)].Add(response.Results[i]);
         }
 
         // Compare results
