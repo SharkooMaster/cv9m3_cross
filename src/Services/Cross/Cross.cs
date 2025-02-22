@@ -30,9 +30,10 @@ public class CrossService : ICross
         QueryRequest request = new QueryRequest();
         var tasks = new List<Task>();
         ConcurrentBag<QueryObject> request_objects = new ConcurrentBag<QueryObject>();
-        for (int i = 0; i < vectors.Count; i++)
+        for (int _i = 0; _i < vectors.Count; _i++)
         {
-            tasks.Add(Task.Run(async () => {
+            int i = _i;
+            tasks.Add(Task.Run(() => {
                 QueryObject qo = new QueryObject() { BucketString = bitStrings[i] };
                 qo.Vector.AddRange(vectors[i]);
                 qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
