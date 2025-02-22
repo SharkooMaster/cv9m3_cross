@@ -27,13 +27,30 @@ public class CrossService : ICross
 
         // Search
         QueryRequest request = new QueryRequest();
+        var tasks = new List<Task>();
         for (int i = 0; i < vectors.Count; i++)
         {
-            QueryObject qo = new QueryObject() { BucketString = bitStrings[i] };
-            qo.Vector.AddRange(vectors[i]);
-            qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
+            tasks.Add(Task.Run(async () => {
+                QueryObject qo = new QueryObject() { BucketString = bitStrings[i] };
+                qo.Vector.AddRange(vectors[i]);
+                qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
 
-            request.QueryObjects.Add(qo);
+                request.QueryObjects.Add(qo);
+
+                for (int j = 0; j < Globals.k - 1; j++)
+                {
+                    string bit_string_flipped = bitStrings[i];
+                    char[] charArray = bit_string_flipped.ToCharArray();
+                    charArray[j] = (charArray[j] == '0') ? '1' : '0';
+                    bit_string_flipped = new string(charArray);
+
+                    QueryObject _qo = new QueryObject() { BucketString = bit_string_flipped };
+                    _qo.Vector.AddRange(vectors[i]);
+                    _qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
+
+                    request.QueryObjects.Add(_qo);
+                }
+            }));
         }
 
         Console.WriteLine("Searching for chunks");
