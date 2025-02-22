@@ -143,4 +143,14 @@ static public class Misc
         return (to_return.ToArray(), offset_return);
     }
 
+    public static List<T> CreateList<T>(int count, Func<T> factory)
+    {
+        var list = new List<T>(count);
+        for (int i = 0; i < count; i++)
+        {
+            list.Add(factory());
+        }
+        return list;
+    }
+
 }

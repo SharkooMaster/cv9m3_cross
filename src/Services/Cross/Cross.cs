@@ -47,7 +47,7 @@ public class CrossService : ICross
 
         // Sort results
         Console.WriteLine($"|Sort res|: final_res_len: ${response.Results.Count}");
-        List<List<QueryResponseObject>> chunk_results = new List<List<QueryResponseObject>>(vectors.Count);
+        List<List<QueryResponseObject>> chunk_results = Misc.CreateList(vectors.Count, () => new List<QueryResponseObject>());
         for (int i = 0; i < response.Results.Count; i++)
         {
             Console.WriteLine($"index: {response.Results[i].Index}:{chunk_results.Count}");
@@ -56,8 +56,8 @@ public class CrossService : ICross
 
         // Compare results
         Console.WriteLine($"|Compare res|: final_res_len: ${chunk_results.Count}");
-        List<QueryResponseObject> final_results = new List<QueryResponseObject>(vectors.Count);
-        List<Dictionary<int, int>> final_error_results = new List<Dictionary<int, int>>(vectors.Count);
+        List<QueryResponseObject> final_results = Misc.CreateList(vectors.Count, () => new QueryResponseObject());
+        List<Dictionary<int, int>> final_error_results = Misc.CreateList(vectors.Count, () => new Dictionary<int, int>());
         for (int i = 0; i < chunk_results.Count; i++)
         {
             if(chunk_results[i].Count == 0){ Console.WriteLine($"ERROR: Gateway didnt return a response for this index [{i}]"); }
