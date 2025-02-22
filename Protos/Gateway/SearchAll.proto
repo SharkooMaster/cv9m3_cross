@@ -20,6 +20,7 @@ message QueryObject
     repeated float vector = 2;
     string bucketString = 3;
     bytes chunk = 4;
+    int32 index = 5;
 }
 
 message QueryResponseObject
