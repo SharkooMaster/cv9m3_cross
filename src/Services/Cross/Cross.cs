@@ -37,6 +37,7 @@ public class CrossService : ICross
                 QueryObject qo = new QueryObject() { BucketString = bitStrings[i] };
                 qo.Vector.AddRange(vectors[i]);
                 qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
+                qo.Index = i;
 
                 request_objects.Add(qo);
 
@@ -50,6 +51,7 @@ public class CrossService : ICross
                     QueryObject _qo = new QueryObject() { BucketString = bit_string_flipped };
                     _qo.Vector.AddRange(vectors[i]);
                     _qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
+                    _qo.Index = i;
 
                     request_objects.Add(_qo);
                 }
