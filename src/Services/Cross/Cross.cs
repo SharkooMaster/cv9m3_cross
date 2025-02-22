@@ -50,7 +50,7 @@ public class CrossService : ICross
         List<List<QueryResponseObject>> chunk_results = new List<List<QueryResponseObject>>(vectors.Count);
         for (int i = 0; i < response.Results.Count; i++)
         {
-            Console.WriteLine($"index: {response.Results[i].Index}");
+            Console.WriteLine($"index: {response.Results[i].Index}:{chunk_results.Count}");
             chunk_results[response.Results[i].Index].Add(response.Results[i]);
         }
 
