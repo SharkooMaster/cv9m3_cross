@@ -1,4 +1,5 @@
 
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Cross.Interfaces.Cross;
 using Cross.Utilities;
@@ -28,6 +29,7 @@ public class CrossService : ICross
         // Search
         QueryRequest request = new QueryRequest();
         var tasks = new List<Task>();
+        ConcurrentBag<QueryObject> request_objects = new ConcurrentBag<QueryObject>();
         for (int i = 0; i < vectors.Count; i++)
         {
             tasks.Add(Task.Run(async () => {
@@ -35,7 +37,7 @@ public class CrossService : ICross
                 qo.Vector.AddRange(vectors[i]);
                 qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
 
-                request.QueryObjects.Add(qo);
+                request_objects.Add(qo);
 
                 for (int j = 0; j < Globals.k - 1; j++)
                 {
@@ -48,10 +50,12 @@ public class CrossService : ICross
                     _qo.Vector.AddRange(vectors[i]);
                     _qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
 
-                    request.QueryObjects.Add(_qo);
+                    request_objects.Add(_qo);
                 }
             }));
         }
+        await Task.WhenAll(tasks);
+        request.QueryObjects.AddRange(request_objects);
 
         Console.WriteLine("Searching for chunks");
         QueryResponse response = await searchAllServiceClient.SearchAllAsync(request);
