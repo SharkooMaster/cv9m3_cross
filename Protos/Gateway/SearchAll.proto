@@ -28,5 +28,5 @@ message QueryResponseObject
     uint64 id_post = 2;
     float similarity = 3;
     bytes chunk = 4;
-    uint32 index = 5;
+    int32 index = 5;
 }
