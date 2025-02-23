@@ -12,7 +12,9 @@ public class SearchAllServiceClient
 
     public SearchAllServiceClient()
     {
-        var channel = GrpcChannel.ForAddress(Globals.GatewayLoadbalancer);
+        var channel = GrpcChannel.ForAddress(Globals.GatewayLoadbalancer, new GrpcChannelOptions{
+            MaxReceiveMessageSize = 1000*1024*1024
+        });
         _client = new GatewayService.GatewayService.GatewayServiceClient(channel);
     }
 
