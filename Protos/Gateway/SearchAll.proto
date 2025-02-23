@@ -21,6 +21,7 @@ message QueryObject
     string bucketString = 3;
     bytes chunk = 4;
     int32 index = 5;
+    bool isNeighbour = 6;
 }
 
 message QueryResponseObject

@@ -38,6 +38,7 @@ public class CrossService : ICross
                 qo.Vector.AddRange(vectors[i]);
                 qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
                 qo.Index = i;
+                qo.IsNeighbour = false;
 
                 request_objects.Add(qo);
 
@@ -52,6 +53,7 @@ public class CrossService : ICross
                     _qo.Vector.AddRange(vectors[i]);
                     _qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
                     _qo.Index = i;
+                    _qo.IsNeighbour = true;
 
                     request_objects.Add(_qo);
                 }
