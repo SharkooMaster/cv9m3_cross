@@ -29,11 +29,13 @@ public class CrossService : ICross
         // Search
         QueryRequest request = new QueryRequest();
         var tasks = new List<Task>();
-        ConcurrentBag<QueryObject> request_objects = new ConcurrentBag<QueryObject>();
+        QueryResponse response = new QueryResponse();
         for (int _i = 0; _i < vectors.Count; _i++)
         {
             int i = _i;
-            tasks.Add(Task.Run(() => {
+            tasks.Add(Task.Run(async () => {
+                List<QueryObject> request_objects = new List<QueryObject>();
+                QueryRequest _request = new QueryRequest();
                 QueryObject qo = new QueryObject() { BucketString = bitStrings[i] };
                 qo.Vector.AddRange(vectors[i]);
                 qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
@@ -57,14 +59,15 @@ public class CrossService : ICross
 
                     request_objects.Add(_qo);
                 }
+                _request.QueryObjects.AddRange(request_objects);
+
+                Console.WriteLine($"Searching for chunks {i}");
+                QueryResponse _response = await searchAllServiceClient.SearchAllAsync(_request);
+                Console.WriteLine("Search complete");
+                response.Results.AddRange(_response.Results);
             }));
         }
         await Task.WhenAll(tasks);
-        request.QueryObjects.AddRange(request_objects);
-
-        Console.WriteLine("Searching for chunks");
-        QueryResponse response = await searchAllServiceClient.SearchAllAsync(request);
-        Console.WriteLine("Search complete");
 
         for (int i = 0; i < response.Results.Count; i++)
         {
