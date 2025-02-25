@@ -3,7 +3,8 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddGrpc(options => {
-    options.MaxReceiveMessageSize = 1 * 1024 * 1024 * 1024;
+    options.MaxReceiveMessageSize = 1000 * 1024 * 1024;
+    options.MaxSendMessageSize = 1000 * 1024 * 1024;
 });
 
 // Configure Kestrel to allow HTTP/2 without TLS
