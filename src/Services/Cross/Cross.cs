@@ -27,28 +27,23 @@ public class CrossService : ICross
         List<string> bitStrings = Misc.ComputeBitStringFromVectors(vectors);
 
         // Search
-        QueryResponse response = new QueryResponse();
+        QueryRequest request = new QueryRequest();
         for (int i = 0; i < vectors.Count; i++)
         {
-            QueryRequest _request = new QueryRequest();
             QueryObject qo = new QueryObject() { BucketString = bitStrings[i] };
             qo.Vector.AddRange(vectors[i]);
             qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
             qo.Index = i;
             qo.IsNeighbour = false;
-            _request.QueryObjects.Add(qo);
-
-            Console.WriteLine($"Searching for chunks {i}");
-            QueryResponse _response = await searchAllServiceClient.SearchAllAsync(_request);
-            Console.WriteLine("Search complete");
-
-            response.Results.AddRange(_response.Results);
+            request.QueryObjects.Add(qo);
         }
-
-        for (int i = 0; i < response.Results.Count; i++)
-        {
-            Console.WriteLine($"Response: {response.Results[i].Similarity*100}% : {response.Results[i].Id}/{response.Results[i].Index}");
-        }
+        Console.WriteLine($"Searching for chunks");
+        Stopwatch sw_search = new Stopwatch();
+        sw_search.Start();
+        QueryResponse response = await searchAllServiceClient.SearchAllAsync(request);
+        sw_search.Stop();
+        request.QueryObjects.Clear(); // Clearing incase garbage collector misses it
+        Console.WriteLine($"Search complete in {sw.ElapsedMilliseconds}ms");
 
         // Sort results
         Console.WriteLine($"|Sort res|: final_res_len: ${response.Results.Count}");
