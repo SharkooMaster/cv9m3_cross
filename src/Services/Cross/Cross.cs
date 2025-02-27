@@ -44,23 +44,6 @@ public class CrossService : ICross
 
                 request_objects.Add(qo);
 
-                for (int j = 0; j < Globals.k - 1; j++)
-                {
-                    string bit_string_flipped = bitStrings[i];
-                    char[] charArray = bit_string_flipped.ToCharArray();
-                    charArray[j] = (charArray[j] == '0') ? '1' : '0';
-                    bit_string_flipped = new string(charArray);
-
-                    QueryObject _qo = new QueryObject() { BucketString = bit_string_flipped };
-                    _qo.Vector.AddRange(vectors[i]);
-                    _qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
-                    _qo.Index = i;
-                    _qo.IsNeighbour = true;
-
-                    request_objects.Add(_qo);
-                }
-                _request.QueryObjects.AddRange(request_objects);
-
                 Console.WriteLine($"Searching for chunks {i}");
                 QueryResponse _response = await searchAllServiceClient.SearchAllAsync(_request);
                 Console.WriteLine("Search complete");
