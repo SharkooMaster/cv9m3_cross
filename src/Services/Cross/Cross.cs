@@ -27,30 +27,23 @@ public class CrossService : ICross
         List<string> bitStrings = Misc.ComputeBitStringFromVectors(vectors);
 
         // Search
-        QueryRequest request = new QueryRequest();
-        var tasks = new List<Task>();
         QueryResponse response = new QueryResponse();
-        for (int _i = 0; _i < vectors.Count; _i++)
+        for (int i = 0; i < vectors.Count; i++)
         {
-            int i = _i;
-            tasks.Add(Task.Run(async () => {
-                List<QueryObject> request_objects = new List<QueryObject>();
-                QueryRequest _request = new QueryRequest();
-                QueryObject qo = new QueryObject() { BucketString = bitStrings[i] };
-                qo.Vector.AddRange(vectors[i]);
-                qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
-                qo.Index = i;
-                qo.IsNeighbour = false;
+            QueryRequest _request = new QueryRequest();
+            QueryObject qo = new QueryObject() { BucketString = bitStrings[i] };
+            qo.Vector.AddRange(vectors[i]);
+            qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
+            qo.Index = i;
+            qo.IsNeighbour = false;
+            _request.QueryObjects.Add(qo);
 
-                request_objects.Add(qo);
+            Console.WriteLine($"Searching for chunks {i}");
+            QueryResponse _response = await searchAllServiceClient.SearchAllAsync(_request);
+            Console.WriteLine("Search complete");
 
-                Console.WriteLine($"Searching for chunks {i}");
-                QueryResponse _response = await searchAllServiceClient.SearchAllAsync(_request);
-                Console.WriteLine("Search complete");
-                response.Results.AddRange(_response.Results);
-            }));
+            response.Results.AddRange(_response.Results);
         }
-        await Task.WhenAll(tasks);
 
         for (int i = 0; i < response.Results.Count; i++)
         {
