@@ -37,16 +37,16 @@ public class CrossService : ICross
             qo.IsNeighbour = false;
             request.QueryObjects.Add(qo);
         }
+
         Console.WriteLine($"Searching for chunks");
         Stopwatch sw_search = new Stopwatch();
         sw_search.Start();
         QueryResponse response = await searchAllServiceClient.SearchAllAsync(request);
         sw_search.Stop();
-        request.QueryObjects.Clear(); // Clearing incase garbage collector misses it
         Console.WriteLine($"Search complete in {sw.ElapsedMilliseconds}ms");
 
         // Sort results
-        Console.WriteLine($"|Sort res|: final_res_len: ${response.Results.Count}");
+        Console.WriteLine($"|Sort res|: final_res_len: {response.Results.Count}");
         List<List<QueryResponseObject>> chunk_results = Misc.CreateList(vectors.Count, () => new List<QueryResponseObject>());
         for (int i = 0; i < response.Results.Count; i++)
         {
@@ -55,7 +55,7 @@ public class CrossService : ICross
         }
 
         // Compare results
-        Console.WriteLine($"|Compare res|: final_res_len: ${chunk_results.Count}");
+        Console.WriteLine($"|Compare res|: final_res_len: {chunk_results.Count}");
         List<QueryResponseObject> final_results = Misc.CreateList(vectors.Count, () => new QueryResponseObject());
         List<Dictionary<int, int>> final_error_results = Misc.CreateList(vectors.Count, () => new Dictionary<int, int>());
         for (int i = 0; i < chunk_results.Count; i++)
@@ -85,7 +85,7 @@ public class CrossService : ICross
         }
 
         // Encode results
-        Console.WriteLine($"|Encode res|: final_res_len: ${final_results.Count}");
+        Console.WriteLine($"|Encode res|: final_res_len: {final_results.Count}");
         List<M_EncodedResult> encoded_objects = new List<M_EncodedResult>();
         for (int i = 0; i < final_results.Count; i++)
         {
