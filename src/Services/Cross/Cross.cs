@@ -11,7 +11,6 @@ namespace Cross.Services.Cross;
 
 public class CrossService : ICross
 {
-    SearchAllServiceClient searchAllServiceClient = new SearchAllServiceClient();
     public async Task<byte[]> CompressFile(byte[] _file)
     {
         Stopwatch sw = Stopwatch.StartNew();
@@ -41,7 +40,7 @@ public class CrossService : ICross
         Console.WriteLine($"Searching for chunks");
         Stopwatch sw_search = new Stopwatch();
         sw_search.Start();
-        QueryResponse response = await searchAllServiceClient.SearchAllAsync(request);
+        QueryResponse response = await Globals.searchAllServiceClient.SearchAllAsync(request);
         sw_search.Stop();
         Console.WriteLine($"Search complete in {sw.ElapsedMilliseconds}ms");
 
