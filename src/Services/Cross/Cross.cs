@@ -17,7 +17,7 @@ public class CrossService : ICross
     {
         // CLMS
         string headID = await ClmsHandler.RegisterHeadRoute();
-        await ClmsHandler.RegisterRoutePoint(headID);
+        await ClmsHandler.RegisterRoutePoint(headID, "Cross", "A1");
         await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
             level = "1", stepName = "Preprocessing", type = "step", message = "Starting compression process. Splitting file"
         });

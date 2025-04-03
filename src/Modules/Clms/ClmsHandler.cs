@@ -16,9 +16,9 @@ public static class ClmsHandler
         return await _instance.RegisterHeadRoute();
     }
 
-    public static async Task RegisterRoutePoint(string _headRouteID)
+    public static async Task RegisterRoutePoint(string _headRouteID, string _name, string _id)
     {
-        await _instance.RegisterRoutePoint(_headRouteID);
+        await _instance.RegisterRoutePoint(_headRouteID, _name, _id);
     }
 
     public static async Task SendRoutePoint(string _headRouteID)
