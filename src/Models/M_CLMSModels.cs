@@ -34,11 +34,11 @@ public class M_RoutePoint
 
 public class M_CLMSEvent
 {
-    public string? Level { get; set; }   // e.g. "1*", "2", "3" or "log", "warn", "error"
+    public string? level { get; set; }   // e.g. "1*", "2", "3" or "log", "warn", "error"
     public string? startTime { get; set; }
-    public string? StepName { get; set; }
-    public string? Type { get; set; }    // e.g. "step*", "forward", "response"
-    public string? Message { get; set; }
+    public string? stepName { get; set; }
+    public string? type { get; set; }    // e.g. "step*", "forward", "response"
+    public string? message { get; set; }
 
     // Monitoring
     public float? cpuUsage { get; set; }
