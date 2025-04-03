@@ -50,6 +50,6 @@ public class ClmsClientService : ICLMSClientService
 
     public async Task AddEventToRoutePoint(string _headRouteID, M_CLMSEvent clmsEvent)
     {
-        routePoints[_headRouteID].eventsObj.Add(clmsEvent);
+        routePoints[_headRouteID].Events.Add(clmsEvent);
     }
 }
