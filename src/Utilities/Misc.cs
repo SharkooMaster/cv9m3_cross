@@ -153,4 +153,45 @@ static public class Misc
         return list;
     }
 
+    public static double GetMemoryUsagePercentage()
+    {
+        double totalMemory = 0;
+        double freeMemory = 0;
+
+        var lines = File.ReadAllLines("/proc/meminfo");
+
+        foreach (var line in lines)
+        {
+            if (line.StartsWith("MemTotal:"))
+            {
+                totalMemory = ParseMemValue(line);
+            }
+            else if (line.StartsWith("MemAvailable:"))
+            {
+                freeMemory = ParseMemValue(line);
+                break;
+            }
+        }
+
+        double usedMemory = totalMemory - freeMemory;
+        return usedMemory / totalMemory;
+    }
+
+    private static double ParseMemValue(string line)
+    {
+        var parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+        return double.Parse(parts[1]) / 1024;
+    }
+
+    public static long GetAvailableMemory()
+    {
+        return GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+    }
+
+    public static double GetLoadAverage()
+    {
+        string[] parts = File.ReadAllText("/proc/loadavg").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        return double.Parse(parts[0]);
+    }
+
 }

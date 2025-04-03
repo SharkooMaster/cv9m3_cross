@@ -1,7 +1,9 @@
 
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using Cross.Interfaces.Cross;
+using Cross.Modules;
 using Cross.Utilities;
 using GatewayService;
 using Google.Protobuf;
@@ -13,6 +15,13 @@ public class CrossService : ICross
 {
     public async Task<byte[]> CompressFile(byte[] _file)
     {
+        // CLMS
+        string headID = await ClmsHandler.RegisterHeadRoute();
+        await ClmsHandler.RegisterRoutePoint(headID);
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
+            level = "1", stepName = "Preprocessing", type = "step", message = "Starting compression process. Splitting file"
+        });
+
         Stopwatch sw = Stopwatch.StartNew();
         // Divide into (N) chunks.
         List<byte[]> fileChunks = Misc.SplitFile(_file, Globals.chunkSize);
@@ -20,12 +29,21 @@ public class CrossService : ICross
         fileChunks.RemoveAt(fileChunks.Count - 1);
 
         // Vectorize
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
+            level = "1", stepName = "Preprocessing", type = "step", message = "Vectorizing chunks"
+        });
         List<float[]> vectors = Misc.Compute64ElementLSHVectors(fileChunks);
 
         // Extract bitstring
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
+            level = "1", stepName = "Preprocessing", type = "step", message = "Extracting (bucket id) bitstring"
+        });
         List<string> bitStrings = Misc.ComputeBitStringFromVectors(vectors);
 
         // Search
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
+            level = "1", stepName = "Preprocessing", type = "step", message = "Preparing query request"
+        });
         QueryRequest request = new QueryRequest();
         for (int i = 0; i < vectors.Count; i++)
         {
@@ -37,6 +55,9 @@ public class CrossService : ICross
             request.QueryObjects.Add(qo);
         }
 
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
+            level = "1", stepName = "Searching", type = "forward", message = "Sending search request"
+        });
         Console.WriteLine($"Searching for chunks");
         Stopwatch sw_search = new Stopwatch();
         sw_search.Start();
@@ -45,6 +66,9 @@ public class CrossService : ICross
         Console.WriteLine($"Search complete in {sw.ElapsedMilliseconds}ms");
 
         // Sort results
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
+            level = "1", stepName = "PostProcessing", type = "step", message = "Sorting results"
+        });
         Console.WriteLine($"|Sort res|: final_res_len: {response.Results.Count}");
         List<List<QueryResponseObject>> chunk_results = Misc.CreateList(vectors.Count, () => new List<QueryResponseObject>());
         for (int i = 0; i < response.Results.Count; i++)
@@ -54,6 +78,9 @@ public class CrossService : ICross
         }
 
         // Compare results
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
+            level = "1", stepName = "PostProcessing", type = "step", message = "Comparing results"
+        });
         Console.WriteLine($"|Compare res|: final_res_len: {chunk_results.Count}");
         List<QueryResponseObject> final_results = Misc.CreateList(vectors.Count, () => new QueryResponseObject());
         List<Dictionary<int, int>> final_error_results = Misc.CreateList(vectors.Count, () => new Dictionary<int, int>());
@@ -84,6 +111,9 @@ public class CrossService : ICross
         }
 
         // Encode results
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
+            level = "1", stepName = "Encoding", type = "step", message = "Encoding results"
+        });
         Console.WriteLine($"|Encode res|: final_res_len: {final_results.Count}");
         List<M_EncodedResult> encoded_objects = new List<M_EncodedResult>();
         for (int i = 0; i < final_results.Count; i++)
@@ -108,6 +138,9 @@ public class CrossService : ICross
         }
 
         // Add Dictionary and trimming
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
+            level = "1", stepName = "Encoding", type = "step", message = "Adding Dictionary and trimming"
+        });
         Console.WriteLine($"|Add Dict|: first_bytes: {first_bytes.Count}, error_bytes: {error_bytes.Count}");
         List<byte> output_bytes =
         [
@@ -119,6 +152,11 @@ public class CrossService : ICross
         ];
 
         // Return
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
+            level = "1", stepName = "Final", type = "step", message = "Returning compressed file"
+        });
+        await ClmsHandler.SendRoutePoint(headID);
+
         sw.Stop();
         Console.WriteLine($"Total compression time: {sw.ElapsedMilliseconds}ms");
         return output_bytes.ToArray();
