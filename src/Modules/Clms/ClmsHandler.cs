@@ -5,7 +5,7 @@ namespace Cross.Modules;
 
 public static class ClmsHandler
 {
-    private static ClmsClientService _instance;
+    public static ClmsClientService _instance;
     public static void SetClmsInstance(ClmsClientService _clmsClientService)
     {
         _instance = _clmsClientService;

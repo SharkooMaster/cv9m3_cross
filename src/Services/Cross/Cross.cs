@@ -155,6 +155,7 @@ public class CrossService : ICross
         await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
             level = "1", stepName = "Final", type = "step", message = "Returning compressed file"
         });
+        ClmsHandler._instance.routePoints[headID].Status = "Success";
         await ClmsHandler.SendRoutePoint(headID);
 
         sw.Stop();

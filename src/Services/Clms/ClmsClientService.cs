@@ -28,7 +28,7 @@ public class ClmsClientService : ICLMSClientService
 
     public async Task RegisterRoutePoint(string _headRouteID, string _name, string _id)
     {
-        if(!routePoints.TryAdd(_headRouteID, new M_RoutePoint() { HeadRouteID = _headRouteID, NodeName = _name, NodeID = _id}))
+        if(!routePoints.TryAdd(_headRouteID, new M_RoutePoint() { HeadRouteID = _headRouteID, NodeName = _name, NodeID = _id, Status = "Running"}))
         {
             Console.WriteLine("Failed to register RoutePoint");
         }
