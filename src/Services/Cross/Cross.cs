@@ -54,6 +54,7 @@ public class CrossService : ICross
             qo.IsNeighbour = false;
             request.QueryObjects.Add(qo);
         }
+        request.HeadRouteID = headID;
 
         await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
             level = "1", stepName = "Searching", type = "forward", message = "Sending search request"

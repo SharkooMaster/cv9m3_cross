@@ -8,6 +8,7 @@ service GatewayService {
 
 message QueryRequest {
     repeated QueryObject queryObjects = 1;
+    string HeadRouteID = 2;
 }
 
 message QueryResponse {
