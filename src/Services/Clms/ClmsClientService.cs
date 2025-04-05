@@ -41,6 +41,9 @@ public class ClmsClientService : ICLMSClientService
             string reqUri = $"{prefixURL}routetrace/point/new";
             var content = new StringContent(routePoints[_headRouteID].ToJson(), Encoding.UTF8, "application/json");
             await client.PostAsync(reqUri, content);
+
+            if(routePoints.TryRemove(_headRouteID, out M_RoutePoint? x)){}
+            else{ Console.WriteLine("Failed to remove route"); }
         }
         catch (Exception ex)
         {
