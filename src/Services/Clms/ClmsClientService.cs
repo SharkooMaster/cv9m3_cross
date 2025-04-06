@@ -53,6 +53,10 @@ public class ClmsClientService : ICLMSClientService
 
     public async Task AddEventToRoutePoint(string _headRouteID, M_CLMSEvent clmsEvent)
     {
+        if(!routePoints.ContainsKey(_headRouteID))
+        {
+            await RegisterRoutePoint(_headRouteID, "Cross", "A1");
+        }
         routePoints[_headRouteID].Events.Add(clmsEvent);
     }
 }
