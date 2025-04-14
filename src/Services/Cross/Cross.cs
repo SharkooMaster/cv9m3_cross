@@ -13,38 +13,52 @@ namespace Cross.Services.Cross;
 
 public class CrossService : ICross
 {
+    string headID = "";
+    List<byte[]> fileChunks = new List<byte[]>();
+    List<byte> trimmedChunk = new List<byte>();
+
+    private async Task initCLMS(string _name, string _id)
+    {
+        headID = await ClmsHandler.RegisterHeadRoute();
+        await ClmsHandler.RegisterRoutePoint(headID, _name, _id);
+    }
+
+    private async Task addEvent(string _step, string _message, string _type = "step", string _level = "1")
+    {
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
+            level = _level, stepName = _step, type = _type, message = _message
+        });
+    }
+
+    private void SplitChunks(byte[] _bytes, int _chunkSize)
+    {
+        fileChunks = Misc.SplitFile(_bytes, _chunkSize);
+        trimmedChunk.AddRange(fileChunks.Last());
+        fileChunks.RemoveAt(fileChunks.Count - 1);
+    }
+
     public async Task<byte[]> CompressFile(byte[] _file)
     {
         // CLMS
-        string headID = await ClmsHandler.RegisterHeadRoute();
-        await ClmsHandler.RegisterRoutePoint(headID, "Cross", "A1");
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "Preprocessing", type = "step", message = "Starting compression process. Splitting file"
-        });
+        await initCLMS("Cross", "A2");
+        await addEvent("Preprocessing", "Starting compression process. Splitting file");
 
         Stopwatch sw = Stopwatch.StartNew();
         // Divide into (N) chunks.
-        List<byte[]> fileChunks = Misc.SplitFile(_file, Globals.chunkSize);
-        byte[] trimmedChunk = fileChunks.Last();
-        fileChunks.RemoveAt(fileChunks.Count - 1);
+        SplitChunks(_file, Globals.chunkSize);
 
         // Vectorize
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "Preprocessing", type = "step", message = "Vectorizing chunks"
-        });
+        await addEvent("Preprocessing", "Vectorizing chunks");
         List<float[]> vectors = Misc.Compute64ElementLSHVectors(fileChunks);
 
         // Extract bitstring
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "Preprocessing", type = "step", message = "Extracting (bucket id) bitstring"
-        });
+        await addEvent("Preprocessing", "Extracting (bucket id) bitstring");
         List<string> bitStrings = Misc.ComputeBitStringFromVectors(vectors);
 
         // Search
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "Preprocessing", type = "step", message = "Preparing query request"
-        });
-        QueryRequest request = new QueryRequest();
+        await addEvent("Preprocessing", "Preparing query request");
+
+        List<QueryObject> queryObjects = new List<QueryObject>();
         for (int i = 0; i < vectors.Count; i++)
         {
             QueryObject qo = new QueryObject() { BucketString = bitStrings[i] };
@@ -52,30 +66,32 @@ public class CrossService : ICross
             qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
             qo.Index = i;
             qo.IsNeighbour = false;
-            request.QueryObjects.Add(qo);
+            queryObjects.Add(qo);
         }
-        request.HeadRouteID = headID;
 
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "Searching", type = "forward", message = "Sending search request"
+        await addEvent("Searching", "Sending search request");
+        ConcurrentBag<QueryResponseObject> queryResponseObjects = new ConcurrentBag<QueryResponseObject>();
+
+        ParallelOptions options = new () { MaxDegreeOfParallelism = 4 };
+        await Parallel.ForAsync(0, queryObjects.Count, options, async (i, ct) => {
+            QueryRequest request = new QueryRequest();
+            request.HeadRouteID = headID;
+            request.QueryObjects.Add(queryObjects[i]);
+
+            QueryResponse response = await Globals.searchAllServiceClient.SearchAllAsync(request);
+            for (int j = 0; j < response.Results.Count; j++)
+            {
+                queryResponseObjects.Add(response.Results[j]);
+            }
         });
-        Console.WriteLine($"Searching for chunks");
-        Stopwatch sw_search = new Stopwatch();
-        sw_search.Start();
-        QueryResponse response = await Globals.searchAllServiceClient.SearchAllAsync(request);
-        sw_search.Stop();
-        Console.WriteLine($"Search complete in {sw.ElapsedMilliseconds}ms");
 
         // Sort results
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "PostProcessing", type = "step", message = "Sorting results"
-        });
-        Console.WriteLine($"|Sort res|: final_res_len: {response.Results.Count}");
+        await addEvent("PostProcessing", "Sorting results");
+
         List<List<QueryResponseObject>> chunk_results = Misc.CreateList(vectors.Count, () => new List<QueryResponseObject>());
-        for (int i = 0; i < response.Results.Count; i++)
+        foreach (var responseObject in queryResponseObjects)
         {
-            Console.WriteLine($"index: {response.Results[i].Index}:{chunk_results.Count}");
-            chunk_results[response.Results[i].Index].Add(response.Results[i]);
+            chunk_results[responseObject.Index].Add(responseObject);
         }
 
         // Compare results
