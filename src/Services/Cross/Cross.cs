@@ -72,7 +72,7 @@ public class CrossService : ICross
         await addEvent("Searching", "Sending search request");
         ConcurrentBag<QueryResponseObject> queryResponseObjects = new ConcurrentBag<QueryResponseObject>();
 
-        ParallelOptions options = new () { MaxDegreeOfParallelism = 4 };
+        ParallelOptions options = new () { MaxDegreeOfParallelism = 14 };
         await Parallel.ForAsync(0, queryObjects.Count, options, async (i, ct) => {
             QueryRequest request = new QueryRequest();
             request.HeadRouteID = headID;
