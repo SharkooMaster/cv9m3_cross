@@ -17,6 +17,10 @@ builder.WebHost.ConfigureKestrel(options =>
     options.ListenAnyIP(5000, o => o.Protocols = HttpProtocols.Http2);
     options.ListenAnyIP(5001, o => o.Protocols = HttpProtocols.Http1);
     options.Limits.MaxRequestBodySize = 1024 * 1024 * 1024;
+    
+    options.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(10);
+    options.Limits.Http2.KeepAlivePingDelay = TimeSpan.FromSeconds(30);
+    options.Limits.Http2.KeepAlivePingTimeout = TimeSpan.FromSeconds(60);
 });
 
 builder.Services.AddEndpointsApiExplorer();
