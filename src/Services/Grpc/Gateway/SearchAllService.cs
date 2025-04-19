@@ -8,21 +8,19 @@ using System.Threading.Tasks;
 
 public class SearchAllServiceClient
 {
-    private readonly GatewayService.GatewayService.GatewayServiceClient _client;
-
     public SearchAllServiceClient()
     {
-        var channel = GrpcChannel.ForAddress(Globals.GatewayLoadbalancer, new GrpcChannelOptions{
-            MaxReceiveMessageSize = 1000*1024*1024,
-            MaxSendMessageSize = 1000*1024*1024
-        });
-        _client = new GatewayService.GatewayService.GatewayServiceClient(channel);
     }
 
     public async Task<QueryResponse> SearchAllAsync(QueryRequest request, CallOptions options = default)
     {
         try
         {
+            var _client = GrpcChannelFactory.GetClient(
+                ip: Globals.GatewayLoadbalancer,
+                chan => new GatewayService.GatewayService.GatewayServiceClient(chan),
+                port: "80"
+            );
             return await _client.SearchAllAsync(request, options);
         }
         catch (RpcException ex)

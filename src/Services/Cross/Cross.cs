@@ -180,8 +180,42 @@ public class CrossService : ICross
         return output_bytes.ToArray();
     }
 
-    public async Task<byte[]> DecompressFile(byte[] _file)
+    public async Task<byte[]> DecompressFile(byte[] file)
     {
+        const int LongSize = sizeof(long);
+        const int ULongSize = sizeof(ulong);
+        const int IntSize = sizeof(int);
+
+        if (file == null || file.Length < 2 * LongSize)
+            throw new ArgumentException("Input too short to contain sizes", nameof(file));
+
+        long refSize = BitConverter.ToInt64(file, 0);
+        long errSize = BitConverter.ToInt64(file, LongSize);
+
+        int refOffset = 2 * LongSize;
+        int errOffset = refOffset + (int)refSize;
+        if (file.Length < errOffset + errSize)
+            throw new ArgumentException("Declared sizes exceed file length", nameof(file));
+
+        var bucketRow = new Dictionary<ulong, ulong>();
+        for (int i = 0; i + 2 * ULongSize <= refSize; i += 2 * ULongSize)
+        {
+            ulong bucketId = BitConverter.ToUInt64(file, refOffset + i);
+            ulong rowId = BitConverter.ToUInt64(file, refOffset + i + ULongSize);
+            bucketRow[bucketId] = rowId;
+        }
+
+        var errorEncoding = new Dictionary<int, int>();
+        for (int i = 0; i + 2 * IntSize <= errSize; i += 2 * IntSize)
+        {
+            int index = BitConverter.ToInt32(file, errOffset + i);
+            int offset = BitConverter.ToInt32(file, errOffset + i + IntSize);
+            errorEncoding[index] = offset;
+        }
+
+        // Get chunks at bucket_id, row_id
+        // Correct using error_encodings
+        // Return
         return new byte[10];
     }
 }
