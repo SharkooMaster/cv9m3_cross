@@ -8,7 +8,8 @@ public static class Globals
 {
     public static int chunkSize = 1024;
     public static int k = 16;
-    public static string GatewayLoadbalancer = "192.168.50.241";
+    //public static string GatewayLoadbalancer = "192.168.50.241";
+    public static string GatewayLoadbalancer = "gateway-headless.default.svc.cluster.local";
     public static SearchAllServiceClient searchAllServiceClient = new SearchAllServiceClient();
 
     public static GrpcChannelOptions GRPC_OPTIONS = new GrpcChannelOptions
