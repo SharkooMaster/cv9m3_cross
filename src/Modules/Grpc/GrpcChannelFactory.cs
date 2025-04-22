@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.Net.Http;
 using Grpc.Net.Client;
 using Grpc.Net.Client.Configuration;
+using Grpc.Core;
 
 public static class GrpcChannelFactory
 {
@@ -46,7 +47,9 @@ public static class GrpcChannelFactory
         var options = new GrpcChannelOptions
         {
             HttpHandler = handler,
-            LoggerFactory = Globals.GRPC_OPTIONS.LoggerFactory
+            LoggerFactory = Globals.GRPC_OPTIONS.LoggerFactory,
+
+            Credentials = ChannelCredentials.Insecure
         };
 
         if (useRoundRobin)
