@@ -94,38 +94,75 @@ public class CrossService : ICross
             chunk_results[responseObject.Index].Add(responseObject);
         }
 
-        // Compare results
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "PostProcessing", type = "step", message = "Comparing results"
+        _ = ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
+        {
+            level = "1",
+            stepName = "PostProcessing",
+            type = "step",
+            message = "Comparing results"
         });
         Console.WriteLine($"|Compare res|: final_res_len: {chunk_results.Count}");
+
         List<QueryResponseObject> final_results = Misc.CreateList(vectors.Count, () => new QueryResponseObject());
         List<Dictionary<int, int>> final_error_results = Misc.CreateList(vectors.Count, () => new Dictionary<int, int>());
-        for (int i = 0; i < chunk_results.Count; i++)
+
+        var parallelOptions = new ParallelOptions
         {
-            if(chunk_results[i].Count == 0){ Console.WriteLine($"ERROR: Gateway didnt return a response for this index [{i}]"); }
-            else if(chunk_results[i].Count == 1)
+            MaxDegreeOfParallelism = Environment.ProcessorCount
+        };
+
+        await Parallel.ForEachAsync(
+            Enumerable.Range(0, chunk_results.Count),
+            parallelOptions,
+            (i, ct) =>
             {
-                final_results[i] = chunk_results[i][0];
-            }
-            else
-            {
-                Dictionary<int, int> error_encoding = new Dictionary<int, int>();
-                int _error_count = Globals.chunkSize;
-                int _best_index = -1;
-                for(int j = 0; j < chunk_results[i].Count; j++)
+                var candidates = chunk_results[i];
+
+                if (candidates.Count == 0)
                 {
-                    Dictionary<int, int> temp_error_encoding = Misc.GetErrorEncoding(fileChunks[i], chunk_results[i][j].Chunk.ToByteArray());
-                    if(temp_error_encoding.Count < _error_count)
-                    {
-                        _best_index = j;
-                        error_encoding = temp_error_encoding;
-                    }
+                    Console.WriteLine($"ERROR: Gateway didnt return a response for this index [{i}]");
                 }
-                final_results[i] = chunk_results[i][_best_index];
-                final_error_results[i] = error_encoding;
+                else if (candidates.Count == 1)
+                {
+                    final_results[i] = candidates[0];
+                }
+                else
+                {
+                    // 1) Pre-convert all ByteStrings to byte[]
+                    var chunkBytesArray = candidates
+                        .Select(r => r.Chunk.ToByteArray())
+                        .ToArray();
+
+                    // 2) First pass: find best by error COUNT only
+                    int bestErrorCount = Globals.chunkSize;
+                    int bestIndex = -1;
+                    for (int j = 0; j < chunkBytesArray.Length; j++)
+                    {
+                        var count = Misc.GetErrorEncoding(
+                            fileChunks[i],
+                            chunkBytesArray[j]
+                        ).Count;
+
+                        if (count < bestErrorCount)
+                        {
+                            bestErrorCount = count;
+                            bestIndex = j;
+                        }
+                    }
+
+                    // 3) Second pass: full encoding for the best candidate
+                    var bestEncoding = Misc.GetErrorEncoding(
+                        fileChunks[i],
+                        chunkBytesArray[bestIndex]
+                    );
+
+                    final_results[i] = candidates[bestIndex];
+                    final_error_results[i] = bestEncoding;
+                }
+
+                return ValueTask.CompletedTask;
             }
-        }
+        );
 
         // Encode results
         await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
