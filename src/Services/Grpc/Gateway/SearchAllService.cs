@@ -19,7 +19,8 @@ public class SearchAllServiceClient
             var _client = GrpcChannelFactory.GetClient(
                 target: Globals.GatewayLoadbalancer,
                 ctor: ch => new GatewayService.GatewayService.GatewayServiceClient(ch),
-                roundRobin: true
+                roundRobin: true,
+                port: 5000
             );
             return await _client.SearchAllAsync(request, options);
         }

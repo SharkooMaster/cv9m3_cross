@@ -174,7 +174,6 @@ public class CrossService : ICross
         {
             encoded_objects.Add(new M_EncodedResult(){
                 bucket_id = final_results[i].Id,
-                row_id = final_results[i].IdPost,
                 error_encoding = final_error_results[i]
             });
         }
@@ -185,7 +184,6 @@ public class CrossService : ICross
         for (int i = 0; i < encoded_objects.Count; i++)
         {
             first_bytes.AddRange(BitConverter.GetBytes(encoded_objects[i].bucket_id));
-            first_bytes.AddRange(BitConverter.GetBytes(encoded_objects[i].row_id));
             (byte[], int) _errors = Misc.GetErrorEncodingBytes(encoded_objects[i].error_encoding, error_bytes_offset);
             error_bytes_offset = _errors.Item2;
             error_bytes.AddRange(_errors.Item1);
