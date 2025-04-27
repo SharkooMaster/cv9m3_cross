@@ -8,7 +8,7 @@ public class ClmsClientService : ICLMSClientService
 {
     public ConcurrentDictionary<string, M_RoutePoint> routePoints = new ConcurrentDictionary<string, M_RoutePoint>();
     private readonly HttpClient client = new HttpClient();
-    public string prefixURL = "http://clms-loadbalancer.cross-test.svc.local.cluster.local/";
+    public string prefixURL = "http://192.168.50.246/";
 
     public async Task<string> RegisterHeadRoute()
     {
