@@ -86,7 +86,7 @@ public class CrossService : ICross
         });
 
         // Sort results
-        await addEvent("PostProcessing", "Sorting results");
+        await addEvent("PostProcessing", $"Sorting results {DateTime.Now.ToString("HH:mm:ss tt")}");
 
         List<List<QueryResponseObject>> chunk_results = Misc.CreateList(vectors.Count, () => new List<QueryResponseObject>());
         foreach (var responseObject in queryResponseObjects)
@@ -99,7 +99,7 @@ public class CrossService : ICross
             level = "1",
             stepName = "PostProcessing",
             type = "step",
-            message = "Comparing results"
+            message = $"Comparing results {DateTime.Now.ToString("HH:mm:ss tt")}"
         });
         Console.WriteLine($"|Compare res|: final_res_len: {chunk_results.Count}");
 
