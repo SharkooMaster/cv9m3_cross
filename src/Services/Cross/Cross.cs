@@ -69,7 +69,7 @@ public class CrossService : ICross
             queryObjects.Add(qo);
         }
 
-        await addEvent("Searching", "Sending search request");
+        await addEvent("Searching", $"Sending search request {DateTime.Now.ToString("HH:mm:ss tt")}");
         ConcurrentBag<QueryResponseObject> queryResponseObjects = new ConcurrentBag<QueryResponseObject>();
 
         ParallelOptions options = new () { MaxDegreeOfParallelism = 14 };
