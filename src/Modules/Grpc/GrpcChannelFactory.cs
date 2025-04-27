@@ -47,7 +47,7 @@ public static class GrpcChannelFactory
         var options = new GrpcChannelOptions
         {
             HttpHandler = handler,
-            LoggerFactory = Globals.GRPC_OPTIONS.LoggerFactory,
+            // LoggerFactory = Globals.GRPC_OPTIONS.LoggerFactory,
 
             Credentials = ChannelCredentials.Insecure
         };

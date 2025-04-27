@@ -21,11 +21,11 @@ public static class Globals
             KeepAlivePingDelay = TimeSpan.FromSeconds(30),
             KeepAlivePingTimeout = TimeSpan.FromSeconds(10)
         },
-        LoggerFactory = LoggerFactory.Create(lb =>
+/*         LoggerFactory = LoggerFactory.Create(lb =>
         {
             lb.AddConsole();
             lb.SetMinimumLevel(LogLevel.Debug);
-        }),
+        }), */
         ServiceConfig = new Grpc.Net.Client.Configuration.ServiceConfig()
         {
             MethodConfigs =
