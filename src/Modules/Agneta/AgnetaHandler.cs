@@ -35,6 +35,7 @@ public static class AgnetaHandler
 
     public static async Task Log(int _level, string _message)
     {
+        return;
         if(_instance != null)
         {
             LogMessage _log = new LogMessage();
@@ -65,6 +66,7 @@ public static class AgnetaHandler
 
     public static async Task Close()
     {
+        return;
         await _instance.SendCloseAsync();
     }
 }
