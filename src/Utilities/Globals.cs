@@ -6,7 +6,7 @@ namespace Cross.Utilities;
 
 public static class Globals
 {
-    public static int chunkSize = 1024;
+    public static int chunkSize = 5120;
     public static int k = 16;
     //public static string GatewayLoadbalancer = "192.168.50.241";
     public static string GatewayLoadbalancer = "gateway-headless.cross-test.svc.cluster.local";
