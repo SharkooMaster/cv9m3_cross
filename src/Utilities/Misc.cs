@@ -176,6 +176,22 @@ static public class Misc
         double usedMemory = totalMemory - freeMemory;
         return usedMemory / totalMemory;
     }
+    
+    public static List<List<T>> SplitToN<T>(List<T> values, int size)
+    {
+        if(size <= 0)
+        {
+            throw new ArgumentException("Chunk size must be greater than 0.", nameof(size));
+        }
+        
+        var result = new List<List<T>>();
+        for (int i = 0; i < values.Count; i += size)
+        {
+            var chunk = values.GetRange(i, Math.Min(size, values.Count - i));
+            result.Add(chunk);
+        }
+        return result;
+    }
 
     private static double ParseMemValue(string line)
     {
