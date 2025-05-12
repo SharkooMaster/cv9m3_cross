@@ -135,7 +135,7 @@ public class CrossService : ICross
                     for (int j = 0; j < chunkBytesArray.Length; j++)
                     {
                         var count = Misc.GetErrorEncoding(
-                            fileChunks[i],
+                            fileChunks[chunk_results[i][0].Index],
                             chunkBytesArray[j]
                         ).Count;
 
