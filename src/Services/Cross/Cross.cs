@@ -82,21 +82,11 @@ public class CrossService : ICross
         });
 
         // Sort results
-        await addEvent("PostProcessing", $"Sorting results {DateTime.Now.ToString("HH:mm:ss tt")}");
-
         List<List<QueryResponseObject>> chunk_results = Misc.CreateList(vectors.Count, () => new List<QueryResponseObject>());
         foreach (var responseObject in queryResponseObjects)
         {
             chunk_results[responseObject.Index].Add(responseObject);
         }
-
-        _ = ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
-        {
-            level = "1",
-            stepName = "PostProcessing",
-            type = "step",
-            message = $"Comparing results {DateTime.Now.ToString("HH:mm:ss tt")}"
-        });
         Console.WriteLine($"|Compare res|: final_res_len: {chunk_results.Count}");
 
         List<QueryResponseObject> final_results = Misc.CreateList(vectors.Count, () => new QueryResponseObject());
@@ -148,7 +138,7 @@ public class CrossService : ICross
 
                     // 3) Second pass: full encoding for the best candidate
                     var bestEncoding = Misc.GetErrorEncoding(
-                        fileChunks[i],
+                        fileChunks[chunk_results[i][0].Index],
                         chunkBytesArray[bestIndex]
                     );
 
@@ -161,9 +151,6 @@ public class CrossService : ICross
         );
 
         // Encode results
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "Encoding", type = "step", message = "Encoding results"
-        });
         Console.WriteLine($"|Encode res|: final_res_len: {final_results.Count}");
         List<M_EncodedResult> encoded_objects = new List<M_EncodedResult>();
         for (int i = 0; i < final_results.Count; i++)
@@ -186,9 +173,6 @@ public class CrossService : ICross
         }
 
         // Add Dictionary and trimming
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "Encoding", type = "step", message = "Adding Dictionary and trimming"
-        });
         Console.WriteLine($"|Add Dict|: first_bytes: {first_bytes.Count}, error_bytes: {error_bytes.Count}");
         List<byte> output_bytes =
         [
@@ -200,12 +184,6 @@ public class CrossService : ICross
         ];
 
         // Return
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "Final", type = "step", message = "Returning compressed file"
-        });
-        ClmsHandler._instance.routePoints[headID].Status = "Success";
-        await ClmsHandler.SendRoutePoint(headID);
-
         sw.Stop();
         Console.WriteLine($"Total compression time: {sw.ElapsedMilliseconds}ms");
         return output_bytes.ToArray();
