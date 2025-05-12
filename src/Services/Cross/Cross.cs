@@ -110,7 +110,7 @@ public class CrossService : ICross
                 }
                 else if (candidates.Count == 1)
                 {
-                    final_results[i] = candidates[0];
+                    final_results[chunk_results[i][0].Index] = candidates[0];
                 }
                 else
                 {
@@ -142,8 +142,8 @@ public class CrossService : ICross
                         chunkBytesArray[bestIndex]
                     );
 
-                    final_results[i] = candidates[bestIndex];
-                    final_error_results[i] = bestEncoding;
+                    final_results[chunk_results[i][0].Index] = candidates[bestIndex];
+                    final_error_results[chunk_results[i][0].Index] = bestEncoding;
                 }
 
                 return ValueTask.CompletedTask;
