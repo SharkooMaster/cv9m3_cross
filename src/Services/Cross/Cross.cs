@@ -85,7 +85,7 @@ public class CrossService : ICross
         List<List<QueryResponseObject>> chunk_results = Misc.CreateList(vectors.Count, () => new List<QueryResponseObject>());
         foreach (var responseObject in queryResponseObjects)
         {
-            chunk_results[responseObject.Index].Add(responseObject);
+            chunk_results[responseObject.I].Add(responseObject);
         }
         Console.WriteLine($"|Compare res|: final_res_len: {chunk_results.Count}");
 

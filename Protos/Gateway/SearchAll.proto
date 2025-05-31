@@ -31,4 +31,6 @@ message QueryResponseObject
     float similarity = 3;
     bytes chunk = 4;
     int32 index = 5;
+    int32 i = 6;
 }
+
