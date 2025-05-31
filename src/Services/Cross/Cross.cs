@@ -86,6 +86,7 @@ public class CrossService : ICross
         foreach (var responseObject in queryResponseObjects)
         {
             chunk_results[responseObject.I].Add(responseObject);
+            Console.WriteLine($"chunl_res: {responseObject.I}, {responseObject.Id}, {responseObject.Index}");
         }
         Console.WriteLine($"|Compare res|: final_res_len: {chunk_results.Count}");
 
