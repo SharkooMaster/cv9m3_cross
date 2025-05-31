@@ -111,7 +111,7 @@ public class CrossService : ICross
                 }
                 else if (candidates.Count == 1)
                 {
-                    final_results[chunk_results[i][0].Index] = candidates[0];
+                    final_results[chunk_results[i][0].I] = candidates[0];
                 }
                 else
                 {
@@ -126,7 +126,7 @@ public class CrossService : ICross
                     for (int j = 0; j < chunkBytesArray.Length; j++)
                     {
                         var count = Misc.GetErrorEncoding(
-                            fileChunks[chunk_results[i][0].Index],
+                            fileChunks[chunk_results[i][0].I],
                             chunkBytesArray[j]
                         ).Count;
 
@@ -139,12 +139,12 @@ public class CrossService : ICross
 
                     // 3) Second pass: full encoding for the best candidate
                     var bestEncoding = Misc.GetErrorEncoding(
-                        fileChunks[chunk_results[i][0].Index],
+                        fileChunks[chunk_results[i][0].I],
                         chunkBytesArray[bestIndex]
                     );
 
-                    final_results[chunk_results[i][0].Index] = candidates[bestIndex];
-                    final_error_results[chunk_results[i][0].Index] = bestEncoding;
+                    final_results[chunk_results[i][0].I] = candidates[bestIndex];
+                    final_error_results[chunk_results[i][0].I] = bestEncoding;
                 }
 
                 return ValueTask.CompletedTask;
@@ -158,6 +158,7 @@ public class CrossService : ICross
         {
             encoded_objects.Add(new M_EncodedResult(){
                 bucket_id = final_results[i].Id,
+                row_id = final_results[i].I,
                 error_encoding = final_error_results[i]
             });
         }
@@ -168,6 +169,7 @@ public class CrossService : ICross
         for (int i = 0; i < encoded_objects.Count; i++)
         {
             first_bytes.AddRange(BitConverter.GetBytes(encoded_objects[i].bucket_id));
+            first_bytes.AddRange(BitConverter.GetBytes(encoded_objects[i].row_id));
             (byte[], int) _errors = Misc.GetErrorEncodingBytes(encoded_objects[i].error_encoding, error_bytes_offset);
             error_bytes_offset = _errors.Item2;
             error_bytes.AddRange(_errors.Item1);
