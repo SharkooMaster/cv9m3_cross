@@ -158,7 +158,7 @@ public class CrossService : ICross
         {
             encoded_objects.Add(new M_EncodedResult(){
                 bucket_id = final_results[i].Id,
-                row_id = final_results[i].I,
+                row_id = (ulong)final_results[i].I,
                 error_encoding = final_error_results[i]
             });
         }
