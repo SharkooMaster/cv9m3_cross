@@ -36,7 +36,7 @@ public static class Globals
                     RetryPolicy = new RetryPolicy
                     {
                         MaxAttempts = 4,
-                        InitialBackoff = TimeSpan.FromMilliseconds(100),
+                        InitialBackoff = TimeSpan.FromMilliseconds(200),
                         MaxBackoff = TimeSpan.FromSeconds(1),
                         BackoffMultiplier = 2,
                         RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable, Grpc.Core.StatusCode.ResourceExhausted}

@@ -11,26 +11,24 @@ message QueryRequest {
     string HeadRouteID = 2;
 }
 
+message QueryObject
+{
+    int32 index = 1;
+    repeated float vector = 2;
+    string bucketString = 3;
+    bytes chunk = 4;
+}
+
 message QueryResponse {
     repeated QueryResponseObject results = 2;
 }
 
-message QueryObject
-{
-    uint32 id = 1;
-    repeated float vector = 2;
-    string bucketString = 3;
-    bytes chunk = 4;
-    int32 index = 5;
-    bool isNeighbour = 6;
-}
-
 message QueryResponseObject
 {
-    uint64 id = 1;
+    uint64 bucket_id = 1;
+    uint64 bucket_key = 2;
     float similarity = 3;
     bytes chunk = 4;
     int32 index = 5;
-    int32 i = 6;
 }
 

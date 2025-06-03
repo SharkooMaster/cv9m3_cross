@@ -14,8 +14,6 @@ namespace Cross.Services.Cross;
 public class CrossService : ICross
 {
     string headID = "";
-    List<byte[]> fileChunks = new List<byte[]>();
-    List<byte> trimmedChunk = new List<byte>();
 
     private async Task initCLMS(string _name, string _id)
     {
@@ -30,17 +28,60 @@ public class CrossService : ICross
         });
     }
 
-    private void SplitChunks(byte[] _bytes, int _chunkSize)
+    private (List<byte[]>, List<byte>) SplitChunks(byte[] _bytes, int _chunkSize)
     {
-        fileChunks = Misc.SplitFile(_bytes, _chunkSize);
-        trimmedChunk.AddRange(fileChunks.Last());
-        fileChunks.RemoveAt(fileChunks.Count - 1);
+        List<byte[]> toRet = Misc.SplitFile(_bytes, _chunkSize);
+        List<byte> trimmedChunk = new List<byte>();
+
+        trimmedChunk.AddRange(toRet.Last());
+        toRet.RemoveAt(toRet.Count - 1);
+
+        return (toRet, trimmedChunk);
+    }
+
+    private List<QueryObject> GetQueryObjects(List<byte[]> _fileChunks, List<float[]> _vectors, List<string> _bitStrings)
+    {
+        List<QueryObject> toRet = new List<QueryObject>();
+        for(int i = 0; i < _fileChunks.Count; i++)
+        {
+            QueryObject toAdd = new QueryObject()
+            {
+                Index = i,
+                BucketString = _bitStrings[i],
+                Chunk = ByteString.CopyFrom(_fileChunks[i])
+            };
+            toAdd.Vector.AddRange(_vectors[i]);
+
+            toRet.Add(toAdd);
+        }
+        return toRet;
+    }
+
+    public List<QueryObject[]> BatchQueries(List<QueryObject> _queries, int _size)
+    {
+        if (_size <= 0) 
+            throw new ArgumentException("Batch size must be > 0", nameof(_size));
+
+        var toRet = new List<QueryObject[]>();
+        int total = _queries.Count;
+        // number of batches = ceil(total / _size)
+        int batchCount = (total + _size - 1) / _size;
+
+        for (int i = 0; i < batchCount; i++)
+        {
+            int start = i * _size;
+            // for the last batch, the remaining count might be less than _size
+            int count = Math.Min(_size, total - start);
+            toRet.Add(_queries.GetRange(start, count).ToArray());
+        }
+
+        return toRet;
     }
 
     public async Task<byte[]> CompressFile(byte[] _file)
     {
         // Divide into (N) chunks
-        SplitChunks(_file, Globals.chunkSize);
+        (List<byte[]> fileChunks, List<byte> trimmedChunk) = SplitChunks(_file, Globals.chunkSize);
 
         // Vectorize
         await addEvent("Preprocessing", "Vectorizing chunks");
@@ -52,144 +93,29 @@ public class CrossService : ICross
 
         // Search
         Stopwatch sw = Stopwatch.StartNew();
+        // - Prepare queries
+        List<QueryObject> queries = GetQueryObjects(fileChunks, vectors, bitStrings);
 
-        List<QueryObject> queryObjects = new List<QueryObject>();
-        for (int i = 0; i < vectors.Count; i++)
+        // - Batch queries
+        List<QueryObject[]> batches = BatchQueries(queries, 10);
+
+        // - Perform searches
+        ConcurrentBag<QueryResponseObject> queryResults = new ConcurrentBag<QueryResponseObject>();
+        await Parallel.ForAsync(0, batches.Count, new ParallelOptions(), async (i, ct) =>
         {
-            QueryObject qo = new QueryObject() { BucketString = bitStrings[i] };
-            qo.Vector.AddRange(vectors[i]);
-            qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
-            qo.Index = i;
-            qo.IsNeighbour = false;
-            queryObjects.Add(qo);
-        }
+            QueryRequest req = new QueryRequest();
+            req.QueryObjects.AddRange(batches[i]);
 
-        const int batchSizePerGateway = 10;
-        List<List<QueryObject>> batchPerGateway = Misc.SplitToN(queryObjects, batchSizePerGateway);
-
-        ConcurrentBag<QueryResponseObject> queryResponseObjects = new ConcurrentBag<QueryResponseObject>();
-        ParallelOptions options = new ();
-        await Parallel.ForAsync(0, batchPerGateway.Count, options, async (i, ct) => {
-            QueryRequest request = new QueryRequest();
-            request.HeadRouteID = headID;
-            request.QueryObjects.AddRange(batchPerGateway[i]);
-
-            QueryResponse response = await Globals.searchAllServiceClient.SearchAllAsync(request);
-            for (int j = 0; j < response.Results.Count; j++)
+            QueryResponse response = await Globals.searchAllServiceClient.SearchAllAsync(req);
+            for(int j = 0; j > response.Results.Count; j++)
             {
-                queryResponseObjects.Add(response.Results[j]);
+                queryResults.Add(response.Results[j]);
             }
         });
-
-        // Sort results
-        List<List<QueryResponseObject>> chunk_results = Misc.CreateList(vectors.Count, () => new List<QueryResponseObject>());
-        foreach (var responseObject in queryResponseObjects)
-        {
-            chunk_results[responseObject.I].Add(responseObject);
-            Console.WriteLine($"chunl_res: {responseObject.I}, {responseObject.Id}, {responseObject.Index}");
-        }
-        Console.WriteLine($"|Compare res|: final_res_len: {chunk_results.Count}");
-
-        List<QueryResponseObject> final_results = Misc.CreateList(vectors.Count, () => new QueryResponseObject());
-        List<Dictionary<int, int>> final_error_results = Misc.CreateList(vectors.Count, () => new Dictionary<int, int>());
-
-        var parallelOptions = new ParallelOptions
-        {
-            MaxDegreeOfParallelism = Environment.ProcessorCount
-        };
-
-        await Parallel.ForEachAsync(
-            Enumerable.Range(0, chunk_results.Count),
-            parallelOptions,
-            (i, ct) =>
-            {
-                var candidates = chunk_results[i];
-
-                if (candidates.Count == 0)
-                {
-                    Console.WriteLine($"ERROR: Gateway didnt return a response for this index [{i}]");
-                }
-                else if (candidates.Count == 1)
-                {
-                    final_results[chunk_results[i][0].I] = candidates[0];
-                }
-                else
-                {
-                    // 1) Pre-convert all ByteStrings to byte[]
-                    var chunkBytesArray = candidates
-                        .Select(r => r.Chunk.ToByteArray())
-                        .ToArray();
-
-                    // 2) First pass: find best by error COUNT only
-                    int bestErrorCount = Globals.chunkSize;
-                    int bestIndex = -1;
-                    for (int j = 0; j < chunkBytesArray.Length; j++)
-                    {
-                        var count = Misc.GetErrorEncoding(
-                            fileChunks[chunk_results[i][0].I],
-                            chunkBytesArray[j]
-                        ).Count;
-
-                        if (count < bestErrorCount)
-                        {
-                            bestErrorCount = count;
-                            bestIndex = j;
-                        }
-                    }
-
-                    // 3) Second pass: full encoding for the best candidate
-                    var bestEncoding = Misc.GetErrorEncoding(
-                        fileChunks[chunk_results[i][0].I],
-                        chunkBytesArray[bestIndex]
-                    );
-
-                    final_results[chunk_results[i][0].I] = candidates[bestIndex];
-                    final_error_results[chunk_results[i][0].I] = bestEncoding;
-                }
-
-                return ValueTask.CompletedTask;
-            }
-        );
-
-        // Encode results
-        Console.WriteLine($"|Encode res|: final_res_len: {final_results.Count}");
-        List<M_EncodedResult> encoded_objects = new List<M_EncodedResult>();
-        for (int i = 0; i < final_results.Count; i++)
-        {
-            encoded_objects.Add(new M_EncodedResult(){
-                bucket_id = final_results[i].Id,
-                row_id = (ulong)final_results[i].I,
-                error_encoding = final_error_results[i]
-            });
-        }
-
-        List<byte> first_bytes = new List<byte>();
-        List<byte> error_bytes = new List<byte>();
-        int error_bytes_offset = 0;
-        for (int i = 0; i < encoded_objects.Count; i++)
-        {
-            first_bytes.AddRange(BitConverter.GetBytes(encoded_objects[i].bucket_id));
-            first_bytes.AddRange(BitConverter.GetBytes(encoded_objects[i].row_id));
-            (byte[], int) _errors = Misc.GetErrorEncodingBytes(encoded_objects[i].error_encoding, error_bytes_offset);
-            error_bytes_offset = _errors.Item2;
-            error_bytes.AddRange(_errors.Item1);
-        }
-
-        // Add Dictionary and trimming
-        Console.WriteLine($"|Add Dict|: first_bytes: {first_bytes.Count}, error_bytes: {error_bytes.Count}");
-        List<byte> output_bytes =
-        [
-            .. BitConverter.GetBytes((long)first_bytes.Count),
-            .. BitConverter.GetBytes((long)error_bytes.Count),
-            .. first_bytes,
-            .. error_bytes,
-            .. trimmedChunk
-        ];
 
         // Return
         sw.Stop();
         Console.WriteLine($"Total compression time: {sw.ElapsedMilliseconds}ms");
-        return output_bytes.ToArray();
     }
 
     public async Task<byte[]> _CompressFile(byte[] _file)
