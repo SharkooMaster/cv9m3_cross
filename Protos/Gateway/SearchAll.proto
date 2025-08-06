@@ -20,7 +20,7 @@ message QueryObject
 }
 
 message QueryResponse {
-    repeated QueryResponseObject results = 2;
+    repeated QueryResponseObject results = 1;
 }
 
 message QueryResponseObject
@@ -30,5 +30,5 @@ message QueryResponseObject
     float similarity = 3;
     bytes chunk = 4;
     int32 index = 5;
+    bool duplicate = 6;
 }
-

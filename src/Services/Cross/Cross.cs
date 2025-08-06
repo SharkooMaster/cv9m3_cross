@@ -104,18 +104,65 @@ public class CrossService : ICross
         await Parallel.ForAsync(0, batches.Count, new ParallelOptions(), async (i, ct) =>
         {
             QueryRequest req = new QueryRequest();
-            req.QueryObjects.AddRange(batches[i]);
+            req.QueryObjects.AddRange(batches[i]); // Insert batch
 
+            // Execute Search
             QueryResponse response = await Globals.searchAllServiceClient.SearchAllAsync(req);
-            for(int j = 0; j > response.Results.Count; j++)
+            for (int j = 0; j > response.Results.Count; j++)
             {
-                queryResults.Add(response.Results[j]);
+                queryResults.Add(response.Results[j]); // Combine results
+                Console.WriteLine($"{response.Results[j].Index}, sim: {response.Results[j].Similarity}");
             }
         });
+
+        // - Sort by index
+        List<QueryResponseObject> sorted = new List<QueryResponseObject>(queryResults.Count);
+        foreach (QueryResponseObject queryResponseObject in queryResults)
+        {
+            sorted[queryResponseObject.Index] = queryResponseObject;
+        }
+
+        // - Error encoding and encode references
+        int offset = 0;
+        List<byte> references = new List<byte>();
+        List<byte> errorEncoding = new List<byte>();
+        for (int i = 0; i < sorted.Count; i++)
+        {
+            if (sorted[i] == null)
+            {
+                Console.WriteLine($"ERROR: Gateway didn't return a response for index [{i}]");
+                continue;
+            }
+
+            // Encode reference
+            references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
+            references.AddRange(BitConverter.GetBytes(sorted[i].BucketKey));
+
+            // Get error encoding
+            if (!sorted[i].Duplicate)
+            {
+                Dictionary<int, int> errorEncodingDict = Misc.GetErrorEncoding(fileChunks[i], sorted[i].Chunk.ToByteArray());
+                (byte[], int) errorBytes = Misc.GetErrorEncodingBytes(errorEncodingDict, offset);
+
+                offset = errorBytes.Item2;
+                errorEncoding.AddRange(errorBytes.Item1);
+            }
+            else
+            {
+                offset += Globals.chunkSize; // Skip encoding for duplicates
+            }
+        }
+
+        // - Encode results
+        List<byte> toReturn = new List<byte>();
+        toReturn.AddRange(references);
+        toReturn.AddRange(errorEncoding);
+        toReturn.AddRange(trimmedChunk);
 
         // Return
         sw.Stop();
         Console.WriteLine($"Total compression time: {sw.ElapsedMilliseconds}ms");
+        return toReturn.ToArray();
     }
 
     public async Task<byte[]> _CompressFile(byte[] _file)
