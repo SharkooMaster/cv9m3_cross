@@ -2,6 +2,8 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Collections.Generic;
+using System.Threading;
 using Cross.Interfaces.Cross;
 using Cross.Modules;
 using Cross.Utilities;
@@ -91,35 +93,42 @@ public class CrossService : ICross
         await addEvent("Preprocessing", "Extracting (bucket id) bitstring");
         List<string> bitStrings = Misc.ComputeBitStringFromVectors(vectors);
 
-        // Search
+        // Search using streaming for better performance
         Stopwatch sw = Stopwatch.StartNew();
         // - Prepare queries
         List<QueryObject> queries = GetQueryObjects(fileChunks, vectors, bitStrings);
 
-        // - Batch queries
-        List<QueryObject[]> batches = BatchQueries(queries, 10);
-
-        // - Perform searches
-        ConcurrentBag<QueryResponseObject> queryResults = new ConcurrentBag<QueryResponseObject>();
-        await Parallel.ForAsync(0, batches.Count, new ParallelOptions(), async (i, ct) =>
+        // - Stream queries and collect results
+        Dictionary<int, QueryResponseObject> queryResults = new Dictionary<int, QueryResponseObject>();
+        
+        // Create async enumerable of queries
+        async IAsyncEnumerable<QueryObject> StreamQueries()
         {
-            QueryRequest req = new QueryRequest();
-            req.QueryObjects.AddRange(batches[i]); // Insert batch
-
-            // Execute Search
-            QueryResponse response = await Globals.searchAllServiceClient.SearchAllAsync(req);
-            for (int j = 0; j > response.Results.Count; j++)
+            for (int i = 0; i < queries.Count; i++)
             {
-                queryResults.Add(response.Results[j]); // Combine results
-                Console.WriteLine($"{response.Results[j].Index}, sim: {response.Results[j].Similarity}");
+                yield return queries[i];
             }
-        });
+        }
 
-        // - Sort by index
-        List<QueryResponseObject> sorted = new List<QueryResponseObject>(queryResults.Count);
-        foreach (QueryResponseObject queryResponseObject in queryResults)
+        // Stream queries to Gateway and receive results
+        await foreach (var response in Globals.searchAllServiceClient.SearchAllStreamAsync(StreamQueries()))
         {
-            sorted[queryResponseObject.Index] = queryResponseObject;
+            queryResults[response.Index] = response;
+            Console.WriteLine($"{response.Index}, sim: {response.Similarity}");
+        }
+
+        // - Sort by index (ensure all indices are present)
+        List<QueryResponseObject?> sorted = new List<QueryResponseObject?>(queries.Count);
+        for (int i = 0; i < queries.Count; i++)
+        {
+            if (queryResults.TryGetValue(i, out var result))
+            {
+                sorted.Add(result);
+            }
+            else
+            {
+                sorted.Add(null); // Will be handled in error check below
+            }
         }
 
         // - Error encoding and encode references
@@ -165,6 +174,12 @@ public class CrossService : ICross
         return toReturn.ToArray();
     }
 
+    public async Task<byte[]> DecompressFile(byte[] file)
+    {
+        // TODO: Implement decompression
+        throw new NotImplementedException("Decompression not yet implemented");
+    }
+
     public async Task<byte[]> _CompressFile(byte[] _file)
     {
         // CLMS
@@ -173,7 +188,7 @@ public class CrossService : ICross
 
         Stopwatch sw = Stopwatch.StartNew();
         // Divide into (N) chunks.
-        SplitChunks(_file, Globals.chunkSize);
+        (List<byte[]> fileChunks, List<byte> trimmedChunk) = SplitChunks(_file, Globals.chunkSize);
 
         // Vectorize
         await addEvent("Preprocessing", "Vectorizing chunks");
@@ -193,15 +208,15 @@ public class CrossService : ICross
             qo.Vector.AddRange(vectors[i]);
             qo.Chunk = ByteString.CopyFrom(fileChunks[i]);
             qo.Index = i;
-            qo.IsNeighbour = false;
             queryObjects.Add(qo);
         }
 
         await addEvent("Searching", $"Sending search request {DateTime.Now.ToString("HH:mm:ss tt")}");
         ConcurrentBag<QueryResponseObject> queryResponseObjects = new ConcurrentBag<QueryResponseObject>();
 
-        ParallelOptions options = new ();
-        await Parallel.ForAsync(0, queryObjects.Count, options, async (i, ct) => {
+        ParallelOptions options = new();
+        await Parallel.ForAsync(0, queryObjects.Count, options, async (i, ct) =>
+        {
             QueryRequest request = new QueryRequest();
             request.HeadRouteID = headID;
             request.QueryObjects.Add(queryObjects[i]);
@@ -293,15 +308,20 @@ public class CrossService : ICross
         );
 
         // Encode results
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "Encoding", type = "step", message = "Encoding results"
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
+        {
+            level = "1",
+            stepName = "Encoding",
+            type = "step",
+            message = "Encoding results"
         });
         Console.WriteLine($"|Encode res|: final_res_len: {final_results.Count}");
         List<M_EncodedResult> encoded_objects = new List<M_EncodedResult>();
         for (int i = 0; i < final_results.Count; i++)
         {
-            encoded_objects.Add(new M_EncodedResult(){
-                bucket_id = final_results[i].Id,
+            encoded_objects.Add(new M_EncodedResult()
+            {
+                bucket_id = final_results[i].BucketId,
                 error_encoding = final_error_results[i]
             });
         }
@@ -318,8 +338,12 @@ public class CrossService : ICross
         }
 
         // Add Dictionary and trimming
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "Encoding", type = "step", message = "Adding Dictionary and trimming"
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
+        {
+            level = "1",
+            stepName = "Encoding",
+            type = "step",
+            message = "Adding Dictionary and trimming"
         });
         Console.WriteLine($"|Add Dict|: first_bytes: {first_bytes.Count}, error_bytes: {error_bytes.Count}");
         List<byte> output_bytes =
@@ -332,8 +356,12 @@ public class CrossService : ICross
         ];
 
         // Return
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
-            level = "1", stepName = "Final", type = "step", message = "Returning compressed file"
+        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
+        {
+            level = "1",
+            stepName = "Final",
+            type = "step",
+            message = "Returning compressed file"
         });
         ClmsHandler._instance.routePoints[headID].Status = "Success";
         await ClmsHandler.SendRoutePoint(headID);
@@ -343,7 +371,7 @@ public class CrossService : ICross
         return output_bytes.ToArray();
     }
 
-    public async Task<byte[]> DecompressFile(byte[] file)
+    public async Task<byte[]> _DecompressFile(byte[] file)
     {
         const int LongSize = sizeof(long);
         const int ULongSize = sizeof(ulong);

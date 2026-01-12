@@ -4,6 +4,7 @@ package gatewayService;
 
 service GatewayService {
   rpc SearchAll(QueryRequest) returns (QueryResponse);
+  rpc SearchAllStream(stream QueryObject) returns (stream QueryResponseObject);
 }
 
 message QueryRequest {
