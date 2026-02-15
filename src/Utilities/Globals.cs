@@ -1,6 +1,7 @@
 
 using Grpc.Net.Client;
 using Grpc.Net.Client.Configuration;
+using System;
 
 namespace Cross.Utilities;
 
@@ -9,42 +10,102 @@ public static class Globals
     public static int chunkSize = 5120;
     public static int k = 16;
     //public static string GatewayLoadbalancer = "192.168.50.241";
-    public static string GatewayLoadbalancer = "gateway";
+    // Allow running outside Kubernetes/Docker by overriding via env var.
+    // Examples:
+    // - GATEWAY_LOADBALANCER=localhost
+    // - GATEWAY_LOADBALANCER=127.0.0.1
+    // - GATEWAY_LOADBALANCER=gateway (docker-compose / k8s service)
+    public static string GatewayLoadbalancer = Environment.GetEnvironmentVariable("GATEWAY_LOADBALANCER") ?? "gateway";
+    // Used by decompression pipeline to resolve chunks by (bucketId, bucketIndex).
+    public static string AgentsLoadbalancer = Environment.GetEnvironmentVariable("AGENTS_LOADBALANCER") ?? "agent-1";
     public static SearchAllServiceClient searchAllServiceClient = new SearchAllServiceClient();
 
-    public static GrpcChannelOptions GRPC_OPTIONS = new GrpcChannelOptions
+    // LOCAL MODE: Reduce retries in local mode (local network is reliable)
+    // Note: gRPC requires MaxAttempts > 1, so ALWAYS return at least 2
+    private static int GetMaxRetryAttempts()
     {
-        HttpHandler = new SocketsHttpHandler()
+        // CRITICAL: gRPC requires MaxAttempts > 1, so ALWAYS return at least 2
+        // In local mode, use 2; in distributed mode, use 4
+        try
         {
-            EnableMultipleHttp2Connections = true,
-            PooledConnectionIdleTimeout = Timeout.InfiniteTimeSpan,
-            KeepAlivePingDelay = TimeSpan.FromSeconds(30),
-            KeepAlivePingTimeout = TimeSpan.FromSeconds(10)
-        },
-/*         LoggerFactory = LoggerFactory.Create(lb =>
-        {
-            lb.AddConsole();
-            lb.SetMinimumLevel(LogLevel.Debug);
-        }), */
-        ServiceConfig = new Grpc.Net.Client.Configuration.ServiceConfig()
-        {
-            MethodConfigs =
+            bool isLocal = LocalModeDetector.IsLocalMode();
+            int attempts = isLocal ? 2 : 4;
+            // Safety check: ensure we never return 1
+            if (attempts <= 1)
             {
-                new Grpc.Net.Client.Configuration.MethodConfig
+                Console.WriteLine($"[Cross Globals] WARNING: GetMaxRetryAttempts returned {attempts}, forcing to 2");
+                attempts = 2;
+            }
+            Console.WriteLine($"[Cross Globals] GetMaxRetryAttempts: isLocal={isLocal}, returning {attempts}");
+            return attempts;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Cross Globals] ERROR in GetMaxRetryAttempts: {ex.Message}, defaulting to 2");
+            return 2; // Safe default
+        }
+    }
+
+    private static GrpcChannelOptions? _grpcOptions = null;
+    private static readonly object _grpcOptionsLock = new object();
+
+    public static GrpcChannelOptions GRPC_OPTIONS
+    {
+        get
+        {
+            if (_grpcOptions == null)
+            {
+                lock (_grpcOptionsLock)
                 {
-                    Names = { MethodName.Default },
-                    RetryPolicy = new RetryPolicy
+                    if (_grpcOptions == null)
                     {
-                        MaxAttempts = 4,
-                        InitialBackoff = TimeSpan.FromMilliseconds(200),
-                        MaxBackoff = TimeSpan.FromSeconds(1),
-                        BackoffMultiplier = 2,
-                        RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable, Grpc.Core.StatusCode.ResourceExhausted}
+                        int retryAttempts = GetMaxRetryAttempts();
+                        byte maxAttempts = (byte)Math.Max(2, retryAttempts); // CRITICAL: Always >= 2
+                        Console.WriteLine($"[Cross Globals] Creating GRPC_OPTIONS with MaxAttempts={maxAttempts} (from GetMaxRetryAttempts={retryAttempts})");
+                        
+                        _grpcOptions = new GrpcChannelOptions
+                        {
+                            HttpHandler = new SocketsHttpHandler()
+                            {
+                                EnableMultipleHttp2Connections = true,
+                                PooledConnectionIdleTimeout = Timeout.InfiniteTimeSpan,
+                                KeepAlivePingDelay = TimeSpan.FromSeconds(30),
+                                KeepAlivePingTimeout = TimeSpan.FromSeconds(10)
+                            },
+                            ServiceConfig = new Grpc.Net.Client.Configuration.ServiceConfig()
+                            {
+                                MethodConfigs =
+                                {
+                                    new Grpc.Net.Client.Configuration.MethodConfig
+                                    {
+                                        Names = { MethodName.Default },
+                                        RetryPolicy = new RetryPolicy
+                                        {
+                                            MaxAttempts = maxAttempts, // Use validated byte value
+                                            InitialBackoff = TimeSpan.FromMilliseconds(200),
+                                            MaxBackoff = TimeSpan.FromSeconds(1),
+                                            BackoffMultiplier = 2,
+                                            RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable, Grpc.Core.StatusCode.ResourceExhausted}
+                                        }
+                                    }
+                                }
+                            },
+                            MaxReceiveMessageSize = 1000 * 1024 * 1024,
+                            MaxSendMessageSize = 1000 * 1024 * 1024
+                        };
+                        
+                        // Final validation
+                        var createdMaxAttempts = _grpcOptions.ServiceConfig.MethodConfigs[0].RetryPolicy?.MaxAttempts;
+                        if (createdMaxAttempts == null || createdMaxAttempts.Value <= 1)
+                        {
+                            Console.WriteLine($"[Cross Globals] ERROR: Created retry policy has MaxAttempts={createdMaxAttempts}, this will fail!");
+                            throw new InvalidOperationException($"Retry policy MaxAttempts must be > 1, but got {createdMaxAttempts}");
+                        }
+                        Console.WriteLine($"[Cross Globals] ✅ GRPC_OPTIONS created successfully with MaxAttempts={createdMaxAttempts.Value}");
                     }
                 }
             }
-        },
-        MaxReceiveMessageSize = 1000 * 1024 * 1024,
-        MaxSendMessageSize = 1000 * 1024 * 1024
-    };
+            return _grpcOptions;
+        }
+    }
 }

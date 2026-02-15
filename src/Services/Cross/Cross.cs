@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Collections.Generic;
 using System.Threading;
+using System.Text;
 using Cross.Interfaces.Cross;
 using Cross.Modules;
 using Cross.Utilities;
@@ -11,11 +12,16 @@ using GatewayService;
 using Google.Protobuf;
 using Google.Protobuf.WellKnownTypes;
 
+using Cross.Services.Cache;
+
 namespace Cross.Services.Cross;
 
 public class CrossService : ICross
 {
+    private const string EncodingVersion = "v1.0.0";
     string headID = "";
+    private static readonly SearchCacheService _searchCache = new SearchCacheService(maxCacheSize: 10000);
+    private readonly global::Cross.Services.Grpc.Agent.ChunkReferenceServiceClient _chunkReferenceClient = new();
 
     private async Task initCLMS(string _name, string _id)
     {
@@ -25,6 +31,11 @@ public class CrossService : ICross
 
     private async Task addEvent(string _step, string _message, string _type = "step", string _level = "1")
     {
+        // Skip CLMS events when running in local mode (ClmsHandler not initialized)
+        if (ClmsHandler._instance == null || string.IsNullOrEmpty(headID))
+        {
+            return;
+        }
         await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent(){
             level = _level, stepName = _step, type = _type, message = _message
         });
@@ -35,10 +46,60 @@ public class CrossService : ICross
         List<byte[]> toRet = Misc.SplitFile(_bytes, _chunkSize);
         List<byte> trimmedChunk = new List<byte>();
 
-        trimmedChunk.AddRange(toRet.Last());
-        toRet.RemoveAt(toRet.Count - 1);
+        if (toRet.Count > 0 && toRet[^1].Length < _chunkSize)
+        {
+            trimmedChunk.AddRange(toRet[^1]);
+            toRet.RemoveAt(toRet.Count - 1);
+        }
 
         return (toRet, trimmedChunk);
+    }
+
+    private static byte[] BuildCompressedPayload(
+        string version,
+        byte[] references,
+        byte[] errorDictionary,
+        byte[] trimChunk)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+
+        var versionBytes = Encoding.UTF8.GetBytes(version);
+        bw.Write(versionBytes.Length);
+        bw.Write(versionBytes);
+        bw.Write(references.Length);
+        bw.Write(errorDictionary.Length);
+        bw.Write(references);
+        bw.Write(errorDictionary);
+        bw.Write(trimChunk);
+        bw.Flush();
+
+        return ms.ToArray();
+    }
+
+    private static (string Version, int ReferencesLength, int ErrorLength, int PayloadStart) ParseHeader(ReadOnlySpan<byte> payload)
+    {
+        const int IntSize = sizeof(int);
+        if (payload.Length < IntSize * 3)
+            throw new InvalidDataException("Compressed payload too short for header.");
+
+        int offset = 0;
+        int versionLen = BitConverter.ToInt32(payload.Slice(offset, IntSize));
+        offset += IntSize;
+        if (versionLen <= 0 || payload.Length < offset + versionLen + (IntSize * 2))
+            throw new InvalidDataException("Invalid encoding version header.");
+
+        string version = Encoding.UTF8.GetString(payload.Slice(offset, versionLen));
+        offset += versionLen;
+        int referencesLength = BitConverter.ToInt32(payload.Slice(offset, IntSize));
+        offset += IntSize;
+        int errorLength = BitConverter.ToInt32(payload.Slice(offset, IntSize));
+        offset += IntSize;
+
+        if (referencesLength < 0 || errorLength < 0)
+            throw new InvalidDataException("Negative section length in compressed payload.");
+
+        return (version, referencesLength, errorLength, offset);
     }
 
     private List<QueryObject> GetQueryObjects(List<byte[]> _fileChunks, List<float[]> _vectors, List<string> _bitStrings)
@@ -80,7 +141,8 @@ public class CrossService : ICross
         return toRet;
     }
 
-    public async Task<byte[]> CompressFile(byte[] _file)
+    // Local/in-process helper: returns compressed bytes plus per-file reference stats
+    public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks)> CompressFileWithStats(byte[] _file)
     {
         // Divide into (N) chunks
         (List<byte[]> fileChunks, List<byte> trimmedChunk) = SplitChunks(_file, Globals.chunkSize);
@@ -93,28 +155,62 @@ public class CrossService : ICross
         await addEvent("Preprocessing", "Extracting (bucket id) bitstring");
         List<string> bitStrings = Misc.ComputeBitStringFromVectors(vectors);
 
-        // Search using streaming for better performance
+        // Search using streaming for better performance with caching
         Stopwatch sw = Stopwatch.StartNew();
         // - Prepare queries
         List<QueryObject> queries = GetQueryObjects(fileChunks, vectors, bitStrings);
 
-        // - Stream queries and collect results
+        // - Check cache and prepare queries to send
         Dictionary<int, QueryResponseObject> queryResults = new Dictionary<int, QueryResponseObject>();
+        List<QueryObject> queriesToSend = new List<QueryObject>();
+        List<int> queryIndices = new List<int>();
         
-        // Create async enumerable of queries
-        async IAsyncEnumerable<QueryObject> StreamQueries()
+        // Check cache for each query
+        for (int i = 0; i < queries.Count; i++)
         {
-            for (int i = 0; i < queries.Count; i++)
+            var query = queries[i];
+            var cached = _searchCache.GetCachedResult(query.Vector.ToArray(), query.BucketString);
+            if (cached != null)
             {
-                yield return queries[i];
+                // Use cached result
+                queryResults[i] = cached;
+                Console.WriteLine($"{i}, sim: {cached.Similarity} (CACHED)");
+            }
+            else
+            {
+                // Need to search
+                queriesToSend.Add(query);
+                queryIndices.Add(i);
             }
         }
 
-        // Stream queries to Gateway and receive results
-        await foreach (var response in Globals.searchAllServiceClient.SearchAllStreamAsync(StreamQueries()))
+        // Create async enumerable of queries that need searching
+        async IAsyncEnumerable<QueryObject> StreamQueries()
         {
-            queryResults[response.Index] = response;
-            Console.WriteLine($"{response.Index}, sim: {response.Similarity}");
+            for (int i = 0; i < queriesToSend.Count; i++)
+            {
+                yield return queriesToSend[i];
+            }
+        }
+
+        // Stream queries to Gateway and receive results (only for non-cached)
+        if (queriesToSend.Count > 0)
+        {
+            Console.WriteLine($"[Cross] Sending {queriesToSend.Count} queries to Gateway for search");
+            await foreach (var response in Globals.searchAllServiceClient.SearchAllStreamAsync(StreamQueries()))
+            {
+                // IMPORTANT: Gateway streams results as they complete (out of order).
+                // Always use response.Index to map back to the original chunk index.
+                int originalIndex = response.Index;
+                queryResults[originalIndex] = response;
+
+                // Cache using the original query inputs (vector + bucket string) for this index.
+                var query = queries[originalIndex];
+                _searchCache.CacheResult(query.Vector.ToArray(), query.BucketString, response);
+
+                Console.WriteLine($"[Cross] Query {originalIndex}: sim={response.Similarity:F3}, Duplicate={response.Duplicate}, Chunk.Length={response.Chunk?.Length ?? 0}");
+            }
+            Console.WriteLine($"[Cross] Received {queryResults.Count} responses from Gateway");
         }
 
         // - Sort by index (ensure all indices are present)
@@ -131,53 +227,185 @@ public class CrossService : ICross
             }
         }
 
-        // - Error encoding and encode references
-        int offset = 0;
-        List<byte> references = new List<byte>();
-        List<byte> errorEncoding = new List<byte>();
+        // Stats: "references found" = chunks that re-used an existing base (Gateway marks Duplicate=true for those)
+        int referencesFound = sorted.Count(r => r != null && r.Duplicate);
+        int totalChunks = sorted.Count;
+
+        // Encode references and per-chunk error dictionary.
+        var references = new List<byte>(sorted.Count * (sizeof(ulong) * 2));
+        var perChunkErrors = new List<List<(int key, int value)>>(sorted.Count);
         for (int i = 0; i < sorted.Count; i++)
         {
             if (sorted[i] == null)
             {
-                Console.WriteLine($"ERROR: Gateway didn't return a response for index [{i}]");
-                continue;
+                Console.WriteLine($"ERROR: Gateway didn't return a response for index [{i}] - creating default response to save chunk");
+                // Create a default response that indicates this chunk needs to be saved
+                // This ensures compression can continue even if search fails
+                sorted[i] = new QueryResponseObject()
+                {
+                    BucketId = 0,
+                    BucketKey = 0,
+                    Similarity = 0,
+                    Chunk = ByteString.CopyFrom(fileChunks[i]), // Use original chunk
+                    Index = i,
+                    Duplicate = false // Not a duplicate, needs to be saved
+                };
             }
 
             // Encode reference
             references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
             references.AddRange(BitConverter.GetBytes(sorted[i].BucketKey));
 
-            // Get error encoding
-            if (!sorted[i].Duplicate)
+            // Always compute byte-diff patch after selecting a base chunk.
+            // If reference is invalid (0,0), use zero-base so decompression remains lossless.
+            if (sorted[i].BucketId == 0 && sorted[i].BucketKey == 0)
             {
-                Dictionary<int, int> errorEncodingDict = Misc.GetErrorEncoding(fileChunks[i], sorted[i].Chunk.ToByteArray());
-                (byte[], int) errorBytes = Misc.GetErrorEncodingBytes(errorEncodingDict, offset);
-
-                offset = errorBytes.Item2;
-                errorEncoding.AddRange(errorBytes.Item1);
+                var zeroBase = new byte[fileChunks[i].Length];
+                perChunkErrors.Add(Misc.GetErrorEncoding(fileChunks[i], zeroBase));
+            }
+            else if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
+            {
+                perChunkErrors.Add(Misc.GetErrorEncoding(fileChunks[i], sorted[i].Chunk.ToByteArray()));
             }
             else
             {
-                offset += Globals.chunkSize; // Skip encoding for duplicates
+                var zeroBase = new byte[fileChunks[i].Length];
+                perChunkErrors.Add(Misc.GetErrorEncoding(fileChunks[i], zeroBase));
             }
         }
 
-        // - Encode results
-        List<byte> toReturn = new List<byte>();
-        toReturn.AddRange(references);
-        toReturn.AddRange(errorEncoding);
-        toReturn.AddRange(trimmedChunk);
+        // Error dictionary layout:
+        // <int chunkCount><int pairCount><int deltaIndex><short delta>... repeated per chunk
+        byte[] errorDictionaryBytes;
+        using (var errorMs = new MemoryStream())
+        using (var errorWriter = new BinaryWriter(errorMs, Encoding.UTF8, leaveOpen: true))
+        {
+            errorWriter.Write(perChunkErrors.Count);
+            foreach (var patch in perChunkErrors)
+            {
+                errorWriter.Write(patch.Count);
+                foreach (var pair in patch)
+                {
+                    errorWriter.Write(pair.key);
+                    errorWriter.Write((short)pair.value);
+                }
+            }
+            errorWriter.Flush();
+            errorDictionaryBytes = errorMs.ToArray();
+        }
+
+        byte[] toReturn = BuildCompressedPayload(
+            EncodingVersion,
+            references.ToArray(),
+            errorDictionaryBytes,
+            trimmedChunk.ToArray());
 
         // Return
         sw.Stop();
-        Console.WriteLine($"Total compression time: {sw.ElapsedMilliseconds}ms");
-        return toReturn.ToArray();
+        Console.WriteLine($"[Cross] Total compression time: {sw.ElapsedMilliseconds}ms, output size: {toReturn.Length} bytes");
+        return (toReturn, referencesFound, totalChunks);
+    }
+
+    public async Task<byte[]> CompressFile(byte[] _file)
+    {
+        var res = await CompressFileWithStats(_file);
+        return res.CompressedBytes;
     }
 
     public async Task<byte[]> DecompressFile(byte[] file)
     {
-        // TODO: Implement decompression
-        throw new NotImplementedException("Decompression not yet implemented");
+        if (file == null || file.Length == 0)
+            throw new ArgumentException("Compressed input is empty.", nameof(file));
+
+        var header = ParseHeader(file);
+        if (!string.Equals(header.Version, EncodingVersion, StringComparison.Ordinal))
+            throw new InvalidDataException($"Unsupported encoding version '{header.Version}'.");
+
+        int referencesOffset = header.PayloadStart;
+        int errorOffset = referencesOffset + header.ReferencesLength;
+        int trimOffset = errorOffset + header.ErrorLength;
+
+        if (trimOffset > file.Length)
+            throw new InvalidDataException("Compressed payload section lengths exceed file size.");
+        if (header.ReferencesLength % (sizeof(ulong) * 2) != 0)
+            throw new InvalidDataException("Reference section length is invalid.");
+
+        int chunkCount = header.ReferencesLength / (sizeof(ulong) * 2);
+        var references = new (ulong BucketId, ulong BucketIndex)[chunkCount];
+        for (int i = 0; i < chunkCount; i++)
+        {
+            int off = referencesOffset + (i * sizeof(ulong) * 2);
+            ulong bucketId = BitConverter.ToUInt64(file, off);
+            ulong bucketIndex = BitConverter.ToUInt64(file, off + sizeof(ulong));
+            references[i] = (bucketId, bucketIndex);
+        }
+
+        var patches = new List<List<(int key, short delta)>>(chunkCount);
+        using (var errorMs = new MemoryStream(file, errorOffset, header.ErrorLength, writable: false))
+        using (var reader = new BinaryReader(errorMs, Encoding.UTF8, leaveOpen: true))
+        {
+            int encodedChunkCount = reader.ReadInt32();
+            if (encodedChunkCount != chunkCount)
+                throw new InvalidDataException($"Error dictionary chunk count mismatch. refs={chunkCount}, errors={encodedChunkCount}");
+
+            for (int i = 0; i < encodedChunkCount; i++)
+            {
+                int pairCount = reader.ReadInt32();
+                if (pairCount < 0)
+                    throw new InvalidDataException("Invalid negative patch pair count.");
+
+                var list = new List<(int key, short delta)>(pairCount);
+                for (int j = 0; j < pairCount; j++)
+                {
+                    int key = reader.ReadInt32();
+                    short delta = reader.ReadInt16();
+                    list.Add((key, delta));
+                }
+                patches.Add(list);
+            }
+        }
+
+        using var output = new MemoryStream(chunkCount * Globals.chunkSize + (file.Length - trimOffset));
+        for (int i = 0; i < chunkCount; i++)
+        {
+            byte[] baseChunk;
+            var reference = references[i];
+            if (reference.BucketId == 0 && reference.BucketIndex == 0)
+            {
+                baseChunk = new byte[Globals.chunkSize];
+            }
+            else
+            {
+                baseChunk = await _chunkReferenceClient.GetChunkByReferenceAsync(reference.BucketId, reference.BucketIndex)
+                    ?? throw new InvalidDataException($"Missing base chunk for reference ({reference.BucketId}, {reference.BucketIndex}).");
+            }
+
+            if (baseChunk.Length != Globals.chunkSize)
+                throw new InvalidDataException($"Base chunk length {baseChunk.Length} differs from chunk size {Globals.chunkSize} for chunk {i}.");
+
+            int cursor = 0;
+            foreach (var (deltaIndex, deltaValue) in patches[i])
+            {
+                cursor += deltaIndex;
+                if (cursor < 0 || cursor >= baseChunk.Length)
+                    throw new InvalidDataException($"Patch index out of range at chunk {i}, cursor {cursor}.");
+
+                int patched = baseChunk[cursor] + deltaValue;
+                if (patched < 0 || patched > 255)
+                    throw new InvalidDataException($"Patched byte out of range at chunk {i}, index {cursor}.");
+                baseChunk[cursor] = (byte)patched;
+            }
+
+            await output.WriteAsync(baseChunk);
+        }
+
+        // Final trim chunk (if any) is appended verbatim.
+        if (trimOffset < file.Length)
+        {
+            await output.WriteAsync(file.AsMemory(trimOffset, file.Length - trimOffset));
+        }
+
+        return output.ToArray();
     }
 
     public async Task<byte[]> _CompressFile(byte[] _file)
@@ -214,7 +442,13 @@ public class CrossService : ICross
         await addEvent("Searching", $"Sending search request {DateTime.Now.ToString("HH:mm:ss tt")}");
         ConcurrentBag<QueryResponseObject> queryResponseObjects = new ConcurrentBag<QueryResponseObject>();
 
-        ParallelOptions options = new();
+        // DYNAMIC: Adjust parallelism based on current CPU and memory usage
+        int baseParallelism = (int)(Environment.ProcessorCount * 0.75);
+        int optimalParallelism = DynamicResourceManager.GetOptimalParallelism(baseParallelism);
+        ParallelOptions options = new ParallelOptions() 
+        { 
+            MaxDegreeOfParallelism = Math.Max(1, optimalParallelism)
+        };
         await Parallel.ForAsync(0, queryObjects.Count, options, async (i, ct) =>
         {
             QueryRequest request = new QueryRequest();
@@ -237,26 +471,32 @@ public class CrossService : ICross
             chunk_results[responseObject.Index].Add(responseObject);
         }
 
-        _ = ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
+        if (ClmsHandler._instance != null && !string.IsNullOrEmpty(headID))
         {
-            level = "1",
-            stepName = "PostProcessing",
-            type = "step",
-            message = $"Comparing results {DateTime.Now.ToString("HH:mm:ss tt")}"
-        });
+            _ = ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
+            {
+                level = "1",
+                stepName = "PostProcessing",
+                type = "step",
+                message = $"Comparing results {DateTime.Now.ToString("HH:mm:ss tt")}"
+            });
+        }
         Console.WriteLine($"|Compare res|: final_res_len: {chunk_results.Count}");
 
         List<QueryResponseObject> final_results = Misc.CreateList(vectors.Count, () => new QueryResponseObject());
-        List<Dictionary<int, int>> final_error_results = Misc.CreateList(vectors.Count, () => new Dictionary<int, int>());
+        List<List<(int key, int value)>> final_error_results = Misc.CreateList(vectors.Count, () => new List<(int, int)>());
 
-        var parallelOptions = new ParallelOptions
+        // DYNAMIC: Adjust parallelism based on current CPU and memory usage
+        int baseParallelism2 = (int)(Environment.ProcessorCount * 0.75);
+        int optimalParallelism2 = DynamicResourceManager.GetOptimalParallelism(baseParallelism2);
+        var parallelOptions2 = new ParallelOptions
         {
-            MaxDegreeOfParallelism = Environment.ProcessorCount
+            MaxDegreeOfParallelism = Math.Max(1, optimalParallelism2)
         };
 
         await Parallel.ForEachAsync(
             Enumerable.Range(0, chunk_results.Count),
-            parallelOptions,
+            parallelOptions2,
             (i, ct) =>
             {
                 var candidates = chunk_results[i];
@@ -308,13 +548,16 @@ public class CrossService : ICross
         );
 
         // Encode results
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
+        if (ClmsHandler._instance != null && !string.IsNullOrEmpty(headID))
         {
-            level = "1",
-            stepName = "Encoding",
-            type = "step",
-            message = "Encoding results"
-        });
+            await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
+            {
+                level = "1",
+                stepName = "Encoding",
+                type = "step",
+                message = "Encoding results"
+            });
+        }
         Console.WriteLine($"|Encode res|: final_res_len: {final_results.Count}");
         List<M_EncodedResult> encoded_objects = new List<M_EncodedResult>();
         for (int i = 0; i < final_results.Count; i++)
@@ -338,13 +581,16 @@ public class CrossService : ICross
         }
 
         // Add Dictionary and trimming
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
+        if (ClmsHandler._instance != null && !string.IsNullOrEmpty(headID))
         {
-            level = "1",
-            stepName = "Encoding",
-            type = "step",
-            message = "Adding Dictionary and trimming"
-        });
+            await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
+            {
+                level = "1",
+                stepName = "Encoding",
+                type = "step",
+                message = "Adding Dictionary and trimming"
+            });
+        }
         Console.WriteLine($"|Add Dict|: first_bytes: {first_bytes.Count}, error_bytes: {error_bytes.Count}");
         List<byte> output_bytes =
         [
@@ -356,15 +602,18 @@ public class CrossService : ICross
         ];
 
         // Return
-        await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
+        if (ClmsHandler._instance != null && !string.IsNullOrEmpty(headID))
         {
-            level = "1",
-            stepName = "Final",
-            type = "step",
-            message = "Returning compressed file"
-        });
-        ClmsHandler._instance.routePoints[headID].Status = "Success";
-        await ClmsHandler.SendRoutePoint(headID);
+            await ClmsHandler.AddEventToRoutePoint(headID, new M_CLMSEvent()
+            {
+                level = "1",
+                stepName = "Final",
+                type = "step",
+                message = "Returning compressed file"
+            });
+            ClmsHandler._instance.routePoints[headID].Status = "Success";
+            await ClmsHandler.SendRoutePoint(headID);
+        }
 
         sw.Stop();
         Console.WriteLine($"Total compression time: {sw.ElapsedMilliseconds}ms");

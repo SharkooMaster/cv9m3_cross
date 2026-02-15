@@ -2,6 +2,7 @@
 using Cross.Utilities;
 using System;
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Net.Http;
 using Grpc.Net.Client;
 using Grpc.Net.Client.Configuration;
@@ -52,14 +53,60 @@ public static class GrpcChannelFactory
             Credentials = ChannelCredentials.Insecure
         };
 
+        // Get the retry policy from Globals, ensuring MaxAttempts >= 2
+        var sourceConfig = Globals.GRPC_OPTIONS.ServiceConfig;
+        byte maxAttempts = 2; // Safe default - CRITICAL: gRPC requires > 1
+        
+        // Extract max attempts from source config
+        if (sourceConfig?.MethodConfigs != null)
+        {
+            foreach (var mc in sourceConfig.MethodConfigs)
+            {
+                if (mc?.RetryPolicy != null && mc.RetryPolicy.MaxAttempts.HasValue)
+                {
+                    byte sourceMaxAttempts = (byte)mc.RetryPolicy.MaxAttempts.Value;
+                    if (sourceMaxAttempts <= 1)
+                    {
+                        Console.WriteLine($"[GrpcChannelFactory] ERROR: Source MaxAttempts={sourceMaxAttempts} is <= 1, forcing to 2");
+                        maxAttempts = 2;
+                    }
+                    else
+                    {
+                        maxAttempts = sourceMaxAttempts;
+                    }
+                    Console.WriteLine($"[GrpcChannelFactory] Using MaxAttempts={maxAttempts} for channel to {uri}");
+                    break;
+                }
+            }
+        }
+        
+        // Final safety check - this should never happen, but just in case
+        if (maxAttempts <= 1)
+        {
+            Console.WriteLine($"[GrpcChannelFactory] CRITICAL ERROR: maxAttempts={maxAttempts} is <= 1, forcing to 2");
+            maxAttempts = 2;
+        }
+
         if (useRoundRobin)
         {
             // Start with a clean ServiceConfig
             var sc = new ServiceConfig();
 
-            // Copy over your retry + backoff method configs
-            foreach (var mc in Globals.GRPC_OPTIONS.ServiceConfig.MethodConfigs)
-                sc.MethodConfigs.Add(mc);
+            // Create a new MethodConfig with validated retry policy
+            var sourceRetryPolicy = (sourceConfig?.MethodConfigs?.Count > 0) ? sourceConfig.MethodConfigs[0]?.RetryPolicy : null;
+            var newMethodConfig = new Grpc.Net.Client.Configuration.MethodConfig
+            {
+                Names = { MethodName.Default },
+                RetryPolicy = new RetryPolicy
+                {
+                    MaxAttempts = maxAttempts, // Use validated value
+                    InitialBackoff = sourceRetryPolicy?.InitialBackoff ?? TimeSpan.FromMilliseconds(200),
+                    MaxBackoff = sourceRetryPolicy?.MaxBackoff ?? TimeSpan.FromSeconds(1),
+                    BackoffMultiplier = sourceRetryPolicy?.BackoffMultiplier ?? 2,
+                    RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable, Grpc.Core.StatusCode.ResourceExhausted }
+                }
+            };
+            sc.MethodConfigs.Add(newMethodConfig);
 
             // Now add the round‑robin balancer
             sc.LoadBalancingConfigs.Add(new RoundRobinConfig());
@@ -68,11 +115,34 @@ public static class GrpcChannelFactory
         }
         else
         {
-            // Just use your existing policy
-            options.ServiceConfig = Globals.GRPC_OPTIONS.ServiceConfig;
+            // Create a new ServiceConfig with validated retry policy
+            var sc = new ServiceConfig();
+            var sourceRetryPolicy = (sourceConfig?.MethodConfigs?.Count > 0) ? sourceConfig.MethodConfigs[0]?.RetryPolicy : null;
+            var newMethodConfig = new Grpc.Net.Client.Configuration.MethodConfig
+            {
+                Names = { MethodName.Default },
+                RetryPolicy = new RetryPolicy
+                {
+                    MaxAttempts = maxAttempts, // Use validated value
+                    InitialBackoff = sourceRetryPolicy?.InitialBackoff ?? TimeSpan.FromMilliseconds(200),
+                    MaxBackoff = sourceRetryPolicy?.MaxBackoff ?? TimeSpan.FromSeconds(1),
+                    BackoffMultiplier = sourceRetryPolicy?.BackoffMultiplier ?? 2,
+                    RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable, Grpc.Core.StatusCode.ResourceExhausted }
+                }
+            };
+            sc.MethodConfigs.Add(newMethodConfig);
+            options.ServiceConfig = sc;
         }
 
-        Console.WriteLine($"### Opening channel to {uri} (RR={useRoundRobin}) ###");
+        // Final validation before creating channel
+        var finalRetryPolicy = options.ServiceConfig?.MethodConfigs?.FirstOrDefault()?.RetryPolicy;
+        if (finalRetryPolicy?.MaxAttempts != null && finalRetryPolicy.MaxAttempts.Value <= 1)
+        {
+            Console.WriteLine($"[GrpcChannelFactory] CRITICAL: Final retry policy has MaxAttempts={finalRetryPolicy.MaxAttempts.Value}, this will fail!");
+            throw new InvalidOperationException($"Cannot create channel: Retry policy MaxAttempts must be > 1, but got {finalRetryPolicy.MaxAttempts.Value}");
+        }
+        
+        Console.WriteLine($"### Opening channel to {uri} (RR={useRoundRobin}, MaxAttempts={finalRetryPolicy?.MaxAttempts ?? (byte?)null}) ###");
         return GrpcChannel.ForAddress(uri, options);
     }
 

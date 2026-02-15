@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+service ChunkReferenceService
+{
+    rpc GetChunkByReference (GetChunkByReference_Req) returns (GetChunkByReference_Res);
+}
+
+message GetChunkByReference_Req
+{
+    uint64 bucket_id = 1;
+    uint64 bucket_index = 2;
+}
+
+message GetChunkByReference_Res
+{
+    bool found = 1;
+    bytes chunk = 2;
+}
+

@@ -1,10 +1,15 @@
 
-using Microsoft.AspNetCore.Routing.Constraints;
+using System.Numerics;
 
 namespace Cross.Utilities;
 
 static public class Misc
 {
+    // Cached projection matrix to avoid recreation on every call
+    private static float[,]? _cachedProjection = null;
+    private static readonly object _projectionLock = new object();
+    private static int _cachedChunkSize = 0;
+
     static public List<byte[]> SplitFile(byte[] source, int chunkSize)
     {
         if (source == null)
@@ -19,9 +24,9 @@ static public class Misc
 
         for (int i = 0; i < totalChunks; i++)
         {
-            byte[] chunk = new byte[chunkSize];
-            Buffer.BlockCopy(source, i * chunkSize, chunk, 0, chunkSize);
-            chunks.Add(chunk);
+            byte[] ownedChunk = new byte[chunkSize];
+            Buffer.BlockCopy(source, i * chunkSize, ownedChunk, 0, chunkSize);
+            chunks.Add(ownedChunk);
         }
 
         if (remainingBytes > 0)
@@ -46,25 +51,19 @@ static public class Misc
         // Preallocate the results array.
         var results = new float[count][];
 
-        // Create a random projection matrix of size 64 x dataSize.
-        // For each call, we create a new projection matrix.
-        // (If you need to reuse the matrix across calls, consider caching it.)
+        // Get or create cached projection matrix (thread-safe)
         int nComponents = 64;
         int dataSize = Globals.chunkSize;
-        float[,] randomProjection = new float[nComponents, dataSize];
-        Random random = new Random(42);
-    
-        for (int row = 0; row < nComponents; row++)
-        {
-            for (int col = 0; col < dataSize; col++)
-            {
-                // Generates a value in the range [-0.5, 0.5)
-                randomProjection[row, col] = (float)(random.NextDouble() - 0.5);
-            }
-        }
+        float[,] randomProjection = GetOrCreateProjectionMatrix(nComponents, dataSize);
 
-        // Process each chunk in parallel.
-        Parallel.For(0, count, i =>
+        // DYNAMIC: Adjust parallelism based on current CPU and memory usage
+        int baseParallelism = (int)(Environment.ProcessorCount * 0.75);
+        int optimalParallelism = DynamicResourceManager.GetOptimalParallelism(baseParallelism);
+        var parallelOptions = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = Math.Max(1, optimalParallelism)
+        };
+        Parallel.For(0, count, parallelOptions, i =>
         {
             results[i] = Compute64ElementLSHVector(chunkList[i], randomProjection);
         });
@@ -72,6 +71,42 @@ static public class Misc
         return new List<float[]>(results);
     }
 
+    /// <summary>
+    /// Gets or creates a cached projection matrix. Thread-safe initialization.
+    /// This avoids recreating the matrix on every compression call.
+    /// </summary>
+    private static float[,] GetOrCreateProjectionMatrix(int nComponents, int dataSize)
+    {
+        // Check if we need to recreate the cache (chunk size changed)
+        if (_cachedProjection == null || _cachedChunkSize != dataSize)
+        {
+            lock (_projectionLock)
+            {
+                // Double-check after acquiring lock
+                if (_cachedProjection == null || _cachedChunkSize != dataSize)
+                {
+                    Console.WriteLine($"[Misc] Creating cached projection matrix: {nComponents}x{dataSize}");
+                    _cachedProjection = new float[nComponents, dataSize];
+                    Random random = new Random(42); // Fixed seed for determinism
+    
+                    for (int row = 0; row < nComponents; row++)
+                    {
+                        for (int col = 0; col < dataSize; col++)
+                        {
+                            // Generates a value in the range [-0.5, 0.5)
+                            _cachedProjection[row, col] = (float)(random.NextDouble() - 0.5);
+                        }
+                    }
+                    _cachedChunkSize = dataSize;
+                    Console.WriteLine($"[Misc] Projection matrix cached successfully");
+                }
+            }
+        }
+
+        return _cachedProjection;
+    }
+
+    // OPTIMIZATION: SIMD-accelerated LSH projection for faster vectorization
     private static float[] Compute64ElementLSHVector(byte[] chunk, float[,] randomProjection)
     {
         const int nComponents = 64;
@@ -79,23 +114,86 @@ static public class Misc
     
         // Project the data vector using the random projection matrix.
         float[] lshVector = new float[nComponents];
+        
+        // OPTIMIZATION: Use SIMD when available for faster matrix multiplication
+        int vectorSize = Vector<float>.Count;
+        bool useSimd = Vector.IsHardwareAccelerated && dataSize >= vectorSize;
+        
         for (int row = 0; row < nComponents; row++)
         {
             float sum = 0;
-            for (int col = 0; col < dataSize; col++)
+            
+            if (useSimd)
             {
-                sum += randomProjection[row, col] * chunk[col];
+                // SIMD-accelerated loop for faster computation
+                Vector<float> sumVec = Vector<float>.Zero;
+                int col = 0;
+                
+                // Process in SIMD chunks
+                for (; col <= dataSize - vectorSize; col += vectorSize)
+                {
+                    // Load chunk bytes as float vector (need to convert byte to float)
+                    float[] chunkFloats = new float[vectorSize];
+                    float[] projFloats = new float[vectorSize];
+                    
+                    for (int j = 0; j < vectorSize; j++)
+                    {
+                        chunkFloats[j] = (float)chunk[col + j];
+                        projFloats[j] = randomProjection[row, col + j];
+                    }
+                    
+                    var chunkVec = new Vector<float>(chunkFloats);
+                    var projVec = new Vector<float>(projFloats);
+                    
+                    sumVec += chunkVec * projVec;
+                }
+                
+                // Horizontal sum of SIMD vector
+                sum = HorizontalSum(sumVec);
+                
+                // Handle remainder sequentially
+                for (; col < dataSize; col++)
+                {
+                    sum += randomProjection[row, col] * chunk[col];
+                }
             }
+            else
+            {
+                // Fallback: Sequential computation
+                for (int col = 0; col < dataSize; col++)
+                {
+                    sum += randomProjection[row, col] * chunk[col];
+                }
+            }
+            
             lshVector[row] = sum;
         }
     
         return lshVector;
     }
+    
+    // OPTIMIZATION: Efficient horizontal sum for SIMD vectors
+    private static float HorizontalSum(Vector<float> vec)
+    {
+        float sum = 0.0f;
+        for (int i = 0; i < Vector<float>.Count; i++)
+        {
+            sum += vec[i];
+        }
+        return sum;
+    }
 
     public static List<string> ComputeBitStringFromVectors(List<float[]> vectors)
     {
         var results = new string[vectors.Count];
-        Parallel.For(0, vectors.Count, i => {
+        // DYNAMIC: Adjust parallelism based on current CPU and memory usage
+        int baseParallelism = (int)(Environment.ProcessorCount * 0.75);
+        int optimalParallelism = DynamicResourceManager.GetOptimalParallelism(baseParallelism);
+        var parallelOptions = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = Math.Max(1, optimalParallelism)
+        };
+        Parallel.For(0, vectors.Count, parallelOptions, i => {
             results[i] = ComputeBitStringFromVector(vectors[i]);
         });
 
@@ -104,41 +202,45 @@ static public class Misc
 
     private static string ComputeBitStringFromVector(float[] vector)
     {
-        string to_return = "";
+        char[] chars = new char[vector.Length];
         for (int i = 0; i < vector.Length; i++)
         {
-            to_return += (vector[i] < 0) ? "0" : "1";
+            chars[i] = vector[i] < 0 ? '0' : '1';
         }
-        return to_return;
+        return new string(chars);
     }
 
-    public static Dictionary<int, int> GetErrorEncoding(byte[] a, byte[] b)
+    public static List<(int key, int value)> GetErrorEncoding(byte[] a, byte[] b)
     {
-        Dictionary<int, int> to_return = new Dictionary<int, int>();
+        List<(int key, int value)> to_return = new List<(int, int)>();
         int last_append = 0;
 
         for (int i = 0; i < a.Length; i++)
         {
-            int dif = b[i] - a[i];
+            // Delta should represent how much to add to BASE to get ORIGINAL:
+            // original = base + delta  =>  delta = original - base
+            int dif = a[i] - b[i];
             if(dif != 0)
             {
-                to_return.Add(i - last_append, dif);
+                int key = i - last_append;
+                // Allow duplicate keys - use List to store multiple entries with same key
+                // Example: {1:1, 1:255, 2:1, 2:20} means from 1 byte distance, corrections are 1 and 255, etc.
+                to_return.Add((key, dif));
                 last_append = i;
             }
         }
         return to_return;
     }
 
-    public static (byte[], int) GetErrorEncodingBytes(Dictionary<int, int> a, int offset)
+    public static (byte[], int) GetErrorEncodingBytes(List<(int key, int value)> a, int offset)
     {
         List<byte> to_return = new List<byte>();
         int offset_return = offset;
-        int[] _keys = a.Keys.ToArray();
         for (int i = 0; i < a.Count; i++)
         {
-            to_return.AddRange(BitConverter.GetBytes(_keys[i] + offset));
-            to_return.AddRange(BitConverter.GetBytes((Int16)a[i]));
-            offset_return += _keys[i];
+            to_return.AddRange(BitConverter.GetBytes(a[i].key + offset));
+            to_return.AddRange(BitConverter.GetBytes((Int16)a[i].value));
+            offset_return += a[i].key;
         }
         return (to_return.ToArray(), offset_return);
     }

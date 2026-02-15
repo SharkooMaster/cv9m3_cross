@@ -4,6 +4,9 @@ package crossService;
 
 service FileService {
   rpc ProcessFile(FileRequest) returns (FileResponse);
+  rpc DecompressFile(FileRequest) returns (FileResponse);
+  // Chunked streaming API for large files (avoids huge single messages).
+  rpc ProcessFileStream(stream FileUploadRequest) returns (stream FileUploadResponse);
 }
 
 // FileRequest represents the file input.
@@ -13,4 +16,46 @@ message FileRequest {
 
 message FileResponse {
   bytes file_content = 1;
+}
+
+message FileMetadata {
+  string file_name = 1;
+  uint64 original_size = 2;
+  uint32 chunk_size = 3;
+  // Optional: 32-byte SHA-256 of original file. If empty, server won't validate.
+  bytes sha256 = 4;
+}
+
+message FileChunk {
+  uint32 seq = 1;
+  bytes data = 2;
+  bool eof = 3;
+}
+
+message FileUploadRequest {
+  oneof payload {
+    FileMetadata metadata = 1;
+    FileChunk chunk = 2;
+  }
+}
+
+message CompressionStats {
+  uint64 original_size = 1;
+  uint64 compressed_size = 2;
+  uint32 references_found = 3;
+  uint32 total_chunks = 4;
+  // 32-byte SHA-256 of compressed bytes.
+  bytes compressed_sha256 = 5;
+}
+
+message Error {
+  string message = 1;
+}
+
+message FileUploadResponse {
+  oneof payload {
+    CompressionStats stats = 1;
+    FileChunk chunk = 2;
+    Error error = 3;
+  }
 }
