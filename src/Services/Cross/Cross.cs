@@ -204,9 +204,13 @@ public class CrossService : ICross
                 int originalIndex = response.Index;
                 queryResults[originalIndex] = response;
 
-                // Cache using the original query inputs (vector + bucket string) for this index.
-                var query = queries[originalIndex];
-                _searchCache.CacheResult(query.Vector.ToArray(), query.BucketString, response);
+                // Cache only valid responses. Fallback/error responses (0,0) can poison cache and
+                // repeatedly force bad bases on subsequent chunks/files.
+                if (!(response.BucketId == 0 && response.BucketKey == 0))
+                {
+                    var query = queries[originalIndex];
+                    _searchCache.CacheResult(query.Vector.ToArray(), query.BucketString, response);
+                }
 
                 Console.WriteLine($"[Cross] Query {originalIndex}: sim={response.Similarity:F3}, Duplicate={response.Duplicate}, Chunk.Length={response.Chunk?.Length ?? 0}");
             }
