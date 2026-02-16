@@ -1,4 +1,5 @@
 using Grpc.Core;
+using Cross.Utilities;
 
 namespace Cross.Services.Grpc.Agent;
 
@@ -19,7 +20,7 @@ public class ChunkReferenceServiceClient
             var client = GrpcChannelFactory.GetClient(
                 target: agentTarget,
                 ctor: chan => new ChunkReferenceService.ChunkReferenceServiceClient(chan),
-                roundRobin: false,
+                roundRobin: LocalModeDetector.IsLocalMode(),
                 port: 5000
             );
 
