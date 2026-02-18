@@ -1,6 +1,9 @@
 using Cross.Modules;
 using Cross.Services.Clms;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Trace;
+using Cross.Utilities;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -8,6 +11,31 @@ builder.Services.AddGrpc(options => {
     options.MaxReceiveMessageSize = 1000 * 1024 * 1024;
     options.MaxSendMessageSize = 1000 * 1024 * 1024;
 });
+
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing =>
+    {
+        tracing
+            .SetResourceBuilder(Observability.CreateResourceBuilder())
+            .AddSource("CrossV9.Cross")
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation()
+            .AddOtlpExporter(otlp =>
+            {
+                otlp.Endpoint = new Uri(Observability.GetOtlpEndpoint());
+                otlp.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.Grpc;
+            });
+    })
+    .WithMetrics(metrics =>
+    {
+        metrics
+            .SetResourceBuilder(Observability.CreateResourceBuilder())
+            .AddMeter("CrossV9.Cross")
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation()
+            .AddRuntimeInstrumentation()
+            .AddPrometheusExporter();
+    });
 
 ConfigureServices(builder.Services);
 
@@ -31,6 +59,7 @@ var clmsClientService = app.Services.GetRequiredService<ClmsClientService>();
 ClmsHandler.SetClmsInstance(clmsClientService);
 
 app.UseRouting();
+app.MapPrometheusScrapingEndpoint("/metrics");
 
 app.MapGrpcService<CompressFileService>();
 

@@ -144,16 +144,39 @@ public class CrossService : ICross
     // Local/in-process helper: returns compressed bytes plus per-file reference stats
     public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks)> CompressFileWithStats(byte[] _file)
     {
+        using var rootSpan = Observability.StartStage("CompressFileWithStats");
         // Divide into (N) chunks
-        (List<byte[]> fileChunks, List<byte> trimmedChunk) = SplitChunks(_file, Globals.chunkSize);
+        List<byte[]> fileChunks;
+        List<byte> trimmedChunk;
+        {
+            using var stage = Observability.StartStage("SplitChunks");
+            var swStage = Stopwatch.StartNew();
+            (fileChunks, trimmedChunk) = SplitChunks(_file, Globals.chunkSize);
+            swStage.Stop();
+            Observability.RecordStage("SplitChunks", swStage.Elapsed.TotalMilliseconds, ("chunk_count", fileChunks.Count));
+        }
 
         // Vectorize
-        await addEvent("Preprocessing", "Vectorizing chunks");
-        List<float[]> vectors = Misc.Compute64ElementLSHVectors(fileChunks);
+        List<float[]> vectors;
+        {
+            using var stage = Observability.StartStage("Vectorize");
+            var swStage = Stopwatch.StartNew();
+            await addEvent("Preprocessing", "Vectorizing chunks");
+            vectors = Misc.Compute64ElementLSHVectors(fileChunks);
+            swStage.Stop();
+            Observability.RecordStage("Vectorize", swStage.Elapsed.TotalMilliseconds, ("chunk_count", vectors.Count));
+        }
 
         // Extract bitstring
-        await addEvent("Preprocessing", "Extracting (bucket id) bitstring");
-        List<string> bitStrings = Misc.ComputeBitStringFromVectors(vectors);
+        List<string> bitStrings;
+        {
+            using var stage = Observability.StartStage("ExtractBucketKeys");
+            var swStage = Stopwatch.StartNew();
+            await addEvent("Preprocessing", "Extracting (bucket id) bitstring");
+            bitStrings = Misc.ComputeBitStringFromVectors(vectors);
+            swStage.Stop();
+            Observability.RecordStage("ExtractBucketKeys", swStage.Elapsed.TotalMilliseconds, ("bucket_count", bitStrings.Count));
+        }
 
         // Search using streaming for better performance with caching
         Stopwatch sw = Stopwatch.StartNew();
@@ -196,6 +219,8 @@ public class CrossService : ICross
         // Stream queries to Gateway and receive results (only for non-cached)
         if (queriesToSend.Count > 0)
         {
+            using var stage = Observability.StartStage("SearchBuckets");
+            var swStage = Stopwatch.StartNew();
             Console.WriteLine($"[Cross] Sending {queriesToSend.Count} queries to Gateway for search");
             await foreach (var response in Globals.searchAllServiceClient.SearchAllStreamAsync(StreamQueries()))
             {
@@ -215,6 +240,8 @@ public class CrossService : ICross
                 Console.WriteLine($"[Cross] Query {originalIndex}: sim={response.Similarity:F3}, Duplicate={response.Duplicate}, Chunk.Length={response.Chunk?.Length ?? 0}");
             }
             Console.WriteLine($"[Cross] Received {queryResults.Count} responses from Gateway");
+            swStage.Stop();
+            Observability.RecordStage("SearchBuckets", swStage.Elapsed.TotalMilliseconds, ("query_count", queriesToSend.Count));
         }
 
         // - Sort by index (ensure all indices are present)
@@ -238,44 +265,50 @@ public class CrossService : ICross
         // Encode references and per-chunk error dictionary.
         var references = new List<byte>(sorted.Count * (sizeof(ulong) * 2));
         var perChunkErrors = new List<List<(int key, int value)>>(sorted.Count);
-        for (int i = 0; i < sorted.Count; i++)
         {
-            if (sorted[i] == null)
+            using var stage = Observability.StartStage("DiffEncode");
+            var swStage = Stopwatch.StartNew();
+            for (int i = 0; i < sorted.Count; i++)
             {
-                Console.WriteLine($"ERROR: Gateway didn't return a response for index [{i}] - creating default response to save chunk");
-                // Create a default response that indicates this chunk needs to be saved
-                // This ensures compression can continue even if search fails
-                sorted[i] = new QueryResponseObject()
+                if (sorted[i] == null)
                 {
-                    BucketId = 0,
-                    BucketKey = 0,
-                    Similarity = 0,
-                    Chunk = ByteString.CopyFrom(fileChunks[i]), // Use original chunk
-                    Index = i,
-                    Duplicate = false // Not a duplicate, needs to be saved
-                };
-            }
+                    Console.WriteLine($"ERROR: Gateway didn't return a response for index [{i}] - creating default response to save chunk");
+                    // Create a default response that indicates this chunk needs to be saved
+                    // This ensures compression can continue even if search fails
+                    sorted[i] = new QueryResponseObject()
+                    {
+                        BucketId = 0,
+                        BucketKey = 0,
+                        Similarity = 0,
+                        Chunk = ByteString.CopyFrom(fileChunks[i]), // Use original chunk
+                        Index = i,
+                        Duplicate = false // Not a duplicate, needs to be saved
+                    };
+                }
 
-            // Encode reference
-            references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
-            references.AddRange(BitConverter.GetBytes(sorted[i].BucketKey));
+                // Encode reference
+                references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
+                references.AddRange(BitConverter.GetBytes(sorted[i].BucketKey));
 
-            // Always compute byte-diff patch after selecting a base chunk.
-            // If reference is invalid (0,0), use zero-base so decompression remains lossless.
-            if (sorted[i].BucketId == 0 && sorted[i].BucketKey == 0)
-            {
-                var zeroBase = new byte[fileChunks[i].Length];
-                perChunkErrors.Add(Misc.GetErrorEncoding(fileChunks[i], zeroBase));
+                // Always compute byte-diff patch after selecting a base chunk.
+                // If reference is invalid (0,0), use zero-base so decompression remains lossless.
+                if (sorted[i].BucketId == 0 && sorted[i].BucketKey == 0)
+                {
+                    var zeroBase = new byte[fileChunks[i].Length];
+                    perChunkErrors.Add(Misc.GetErrorEncoding(fileChunks[i], zeroBase));
+                }
+                else if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
+                {
+                    perChunkErrors.Add(Misc.GetErrorEncoding(fileChunks[i], sorted[i].Chunk.ToByteArray()));
+                }
+                else
+                {
+                    var zeroBase = new byte[fileChunks[i].Length];
+                    perChunkErrors.Add(Misc.GetErrorEncoding(fileChunks[i], zeroBase));
+                }
             }
-            else if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
-            {
-                perChunkErrors.Add(Misc.GetErrorEncoding(fileChunks[i], sorted[i].Chunk.ToByteArray()));
-            }
-            else
-            {
-                var zeroBase = new byte[fileChunks[i].Length];
-                perChunkErrors.Add(Misc.GetErrorEncoding(fileChunks[i], zeroBase));
-            }
+            swStage.Stop();
+            Observability.RecordStage("DiffEncode", swStage.Elapsed.TotalMilliseconds, ("chunk_count", sorted.Count));
         }
 
         // Error dictionary layout:
@@ -298,11 +331,18 @@ public class CrossService : ICross
             errorDictionaryBytes = errorMs.ToArray();
         }
 
-        byte[] toReturn = BuildCompressedPayload(
-            EncodingVersion,
-            references.ToArray(),
-            errorDictionaryBytes,
-            trimmedChunk.ToArray());
+        byte[] toReturn;
+        {
+            using var stage = Observability.StartStage("Serialize");
+            var swStage = Stopwatch.StartNew();
+            toReturn = BuildCompressedPayload(
+                EncodingVersion,
+                references.ToArray(),
+                errorDictionaryBytes,
+                trimmedChunk.ToArray());
+            swStage.Stop();
+            Observability.RecordStage("Serialize", swStage.Elapsed.TotalMilliseconds, ("output_bytes", toReturn.Length));
+        }
 
         // Return
         sw.Stop();
@@ -318,10 +358,14 @@ public class CrossService : ICross
 
     public async Task<byte[]> DecompressFile(byte[] file)
     {
+        using var rootSpan = Observability.StartStage("DecompressFile");
         if (file == null || file.Length == 0)
             throw new ArgumentException("Compressed input is empty.", nameof(file));
 
+        var parseSw = Stopwatch.StartNew();
         var header = ParseHeader(file);
+        parseSw.Stop();
+        Observability.RecordStage("Deserialize", parseSw.Elapsed.TotalMilliseconds);
         if (!string.Equals(header.Version, EncodingVersion, StringComparison.Ordinal))
             throw new InvalidDataException($"Unsupported encoding version '{header.Version}'.");
 
@@ -370,6 +414,7 @@ public class CrossService : ICross
         }
 
         using var output = new MemoryStream(chunkCount * Globals.chunkSize + (file.Length - trimOffset));
+        var applySw = Stopwatch.StartNew();
         for (int i = 0; i < chunkCount; i++)
         {
             byte[] baseChunk;
@@ -408,6 +453,8 @@ public class CrossService : ICross
         {
             await output.WriteAsync(file.AsMemory(trimOffset, file.Length - trimOffset));
         }
+        applySw.Stop();
+        Observability.RecordStage("ApplyPatchAndEgress", applySw.Elapsed.TotalMilliseconds, ("chunk_count", chunkCount));
 
         return output.ToArray();
     }
