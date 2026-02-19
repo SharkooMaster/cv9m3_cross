@@ -260,8 +260,9 @@ public class CrossService : ICross
             }
         }
 
-        // Stats: "references found" = chunks that re-used an existing base (Gateway marks Duplicate=true for those)
-        int referencesFound = sorted.Count(r => r != null && r.Duplicate);
+        // Stats: "references found" = chunks that re-used an existing base (not newly stored chunks).
+        // Count only when Duplicate=true AND similarity < 1.0 (excludes newly stored chunks where similarity=1.0).
+        int referencesFound = sorted.Count(r => r != null && r.Duplicate && r.Similarity < 1.0f);
         int totalChunks = sorted.Count;
         int nullCount = sorted.Count(r => r == null);
         int zeroIdCount = sorted.Count(r => r != null && r.BucketId == 0 && r.BucketKey == 0);
