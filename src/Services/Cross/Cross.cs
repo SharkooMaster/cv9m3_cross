@@ -541,12 +541,13 @@ public class CrossService : ICross
         await addEvent("Searching", $"Sending search request {DateTime.Now.ToString("HH:mm:ss tt")}");
         ConcurrentBag<QueryResponseObject> queryResponseObjects = new ConcurrentBag<QueryResponseObject>();
 
-        // DYNAMIC: Adjust parallelism based on current CPU and memory usage
-        int baseParallelism = (int)(Environment.ProcessorCount * 0.75);
+        // OPTIMIZED: Use full CPU cores for parallel chunk processing
+        // With 152 cores available, we can process many chunks in parallel
+        int baseParallelism = Environment.ProcessorCount; // Use all cores
         int optimalParallelism = DynamicResourceManager.GetOptimalParallelism(baseParallelism);
         ParallelOptions options = new ParallelOptions() 
         { 
-            MaxDegreeOfParallelism = Math.Max(1, optimalParallelism)
+            MaxDegreeOfParallelism = Math.Max(50, optimalParallelism) // Higher minimum for throughput
         };
         await Parallel.ForAsync(0, queryObjects.Count, options, async (i, ct) =>
         {
