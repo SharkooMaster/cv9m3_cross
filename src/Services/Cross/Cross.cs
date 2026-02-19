@@ -309,8 +309,16 @@ public class CrossService : ICross
                     zeroRefCount++;
                 }
 
+                // Fast path: Duplicate=true means base == original (gateway stored this chunk).
+                // Diff is guaranteed empty — skip the byte-by-byte comparison entirely.
+                if (sorted[i].Duplicate && sorted[i].BucketId != 0)
+                {
+                    perChunkPatches.Add(new List<(int key, int value)>());
+                    emptyDiffCount++;
+                    continue;
+                }
+
                 // Compute diff: original chunk vs base chunk from server.
-                // - If base == original (newly stored): diff is EMPTY (0 entries) → 4 bytes
                 // - If base is similar (found reference): diff has entries for differing bytes
                 // - If BucketId == 0 (store failed): diff against zeros (degraded but decompressible)
                 byte[] baseChunk;
