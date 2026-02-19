@@ -18,9 +18,9 @@ namespace Cross.Services.Cross;
 
 public class CrossService : ICross
 {
-    // v2.0.0: Adds raw-embed mode (pairCount == -1) to prevent output expansion.
-    // When diff would be larger than the raw chunk, the chunk is embedded verbatim.
-    private const string EncodingVersion = "v2.0.0";
+    // v1.0.0: Diff-only format. Chunks live on the server, compressed file has only references + patches.
+    // When base == original (newly stored chunk), patch list is empty → ~20 bytes per chunk.
+    private const string EncodingVersion = "v1.0.0";
     string headID = "";
     private static readonly SearchCacheService _searchCache = new SearchCacheService(maxCacheSize: 10000);
     private readonly global::Cross.Services.Grpc.Agent.ChunkReferenceServiceClient _chunkReferenceClient = new();
@@ -270,15 +270,13 @@ public class CrossService : ICross
         Console.WriteLine($"[Cross] Chunk stats: total={totalChunks} refs_found={referencesFound} valid_ref={validRefCount} zero_ref={zeroIdCount} null={nullCount} empty_chunk_with_ref={emptyChunkRefs}");
 
         // Encode references and per-chunk error dictionary.
-        // v2.0.0: Uses raw-embed mode (pairCount == -1) when diff is larger than raw chunk.
+        // Diff-only format: chunks live on the server, compressed file has only references + diff patches.
+        // When base == original (newly stored chunk), diff is EMPTY → ~20 bytes per chunk.
         var references = new List<byte>(sorted.Count * (sizeof(ulong) * 2));
-        // Each entry: null = raw embed, non-null = diff patches
-        var perChunkPatches = new List<List<(int key, int value)>?>(sorted.Count);
-        var perChunkRawEmbed = new List<byte[]?>(sorted.Count);
-        int rawEmbedCount = 0;
+        var perChunkPatches = new List<List<(int key, int value)>>(sorted.Count);
         int diffCount = 0;
+        int emptyDiffCount = 0;
         int zeroRefCount = 0;
-        int emptyChunkCount = 0;
         {
             using var stage = Observability.StartStage("DiffEncode");
             var swStage = Stopwatch.StartNew();
@@ -286,78 +284,66 @@ public class CrossService : ICross
             {
                 if (sorted[i] == null)
                 {
-                    Console.WriteLine($"[DiffEncode] WARN: No response for chunk [{i}] — embedding raw");
+                    // This should NEVER happen — every chunk must get a response from the gateway.
+                    // If it does, the gateway stream broke. Log loudly but produce a zero-base diff
+                    // so the file is at least structurally valid (decompression will fetch a zero array).
+                    Console.WriteLine($"[DiffEncode] ERROR: No response for chunk [{i}] — store/search pipeline broke!");
                     sorted[i] = new QueryResponseObject()
                     {
                         BucketId = 0,
                         BucketKey = 0,
                         Similarity = 0,
-                        Chunk = ByteString.CopyFrom(fileChunks[i]),
+                        Chunk = ByteString.CopyFrom(new byte[Globals.chunkSize]),
                         Index = i,
                         Duplicate = false
                     };
                 }
 
-                // Encode reference
+                // Encode reference (bucketId, bucketKey) — always 16 bytes
                 references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
                 references.AddRange(BitConverter.GetBytes(sorted[i].BucketKey));
 
-                bool useRawEmbed = false;
-
                 if (sorted[i].BucketId == 0 && sorted[i].BucketKey == 0)
                 {
-                    // No valid reference — raw embed is always better than diffing against zeros.
-                    useRawEmbed = true;
+                    Console.WriteLine($"[DiffEncode] WARN: Chunk [{i}] has BucketId=0 — store failed, diff against zeros");
                     zeroRefCount++;
                 }
-                else if (sorted[i].Chunk == null || sorted[i].Chunk.Length == 0)
+
+                // Compute diff: original chunk vs base chunk from server.
+                // - If base == original (newly stored): diff is EMPTY (0 entries) → 4 bytes
+                // - If base is similar (found reference): diff has entries for differing bytes
+                // - If BucketId == 0 (store failed): diff against zeros (degraded but decompressible)
+                byte[] baseChunk;
+                if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
                 {
-                    // Reference exists but chunk data is missing — raw embed.
-                    useRawEmbed = true;
-                    emptyChunkCount++;
+                    baseChunk = sorted[i].Chunk.ToByteArray();
                 }
                 else
                 {
-                    // Valid reference with chunk data — compute diff and compare cost.
-                    var baseChunk = sorted[i].Chunk.ToByteArray();
-                    var diff = Misc.GetErrorEncoding(fileChunks[i], baseChunk);
-                    int diffCost = diff.Count * 6; // 4 bytes key + 2 bytes delta per entry
-                    int rawCost = fileChunks[i].Length;
-
-                    if (diffCost > rawCost)
-                    {
-                        // Diff is bigger than raw — embed raw to prevent expansion.
-                        useRawEmbed = true;
-                    }
-                    else
-                    {
-                        // Diff is smaller — use it.
-                        perChunkPatches.Add(diff);
-                        perChunkRawEmbed.Add(null);
-                        diffCount++;
-                        continue;
-                    }
+                    // Missing chunk data — diff against zeros as fallback
+                    baseChunk = new byte[Globals.chunkSize];
+                    if (sorted[i].BucketId != 0)
+                        Console.WriteLine($"[DiffEncode] WARN: Chunk [{i}] has BucketId={sorted[i].BucketId} but no chunk data — diff against zeros");
                 }
 
-                if (useRawEmbed)
-                {
-                    perChunkPatches.Add(null); // sentinel: this chunk uses raw embed
-                    perChunkRawEmbed.Add(fileChunks[i]);
-                    rawEmbedCount++;
-                }
+                var diff = Misc.GetErrorEncoding(fileChunks[i], baseChunk);
+                perChunkPatches.Add(diff);
+
+                if (diff.Count == 0)
+                    emptyDiffCount++;
+                else
+                    diffCount++;
             }
             swStage.Stop();
             Observability.RecordStage("DiffEncode", swStage.Elapsed.TotalMilliseconds,
-                ("chunk_count", sorted.Count), ("raw_embed", rawEmbedCount), ("diff", diffCount),
-                ("zero_ref", zeroRefCount), ("empty_chunk", emptyChunkCount));
-            Console.WriteLine($"[DiffEncode] chunks={sorted.Count} raw_embed={rawEmbedCount} diff={diffCount} zero_ref={zeroRefCount} empty_chunk={emptyChunkCount}");
+                ("chunk_count", sorted.Count), ("empty_diff", emptyDiffCount), ("non_empty_diff", diffCount),
+                ("zero_ref", zeroRefCount));
+            Console.WriteLine($"[DiffEncode] chunks={sorted.Count} empty_diff={emptyDiffCount} non_empty_diff={diffCount} zero_ref={zeroRefCount}");
         }
 
-        // Error dictionary layout (v2.0.0):
+        // Error dictionary layout (v1.0.0 — diff only):
         // <int chunkCount>
-        // Per chunk:
-        //   pairCount == -1  →  raw embed: next chunkSize bytes are the raw chunk
-        //   pairCount >= 0   →  diff mode: <int deltaIndex><short delta> × pairCount
+        // Per chunk: <int pairCount> then <int deltaIndex><short delta> × pairCount
         byte[] errorDictionaryBytes;
         using (var errorMs = new MemoryStream())
         using (var errorWriter = new BinaryWriter(errorMs, Encoding.UTF8, leaveOpen: true))
@@ -365,22 +351,12 @@ public class CrossService : ICross
             errorWriter.Write(sorted.Count);
             for (int i = 0; i < sorted.Count; i++)
             {
-                if (perChunkPatches[i] == null)
+                var patch = perChunkPatches[i];
+                errorWriter.Write(patch.Count); // 0 for empty diff (base == original)
+                foreach (var pair in patch)
                 {
-                    // Raw embed mode: write sentinel + raw bytes
-                    errorWriter.Write(-1); // pairCount = -1
-                    errorWriter.Write(perChunkRawEmbed[i]!);
-                }
-                else
-                {
-                    // Diff mode: write patch list
-                    var patch = perChunkPatches[i]!;
-                    errorWriter.Write(patch.Count);
-                    foreach (var pair in patch)
-                    {
-                        errorWriter.Write(pair.key);
-                        errorWriter.Write((short)pair.value);
-                    }
+                    errorWriter.Write(pair.key);
+                    errorWriter.Write((short)pair.value);
                 }
             }
             errorWriter.Flush();
@@ -423,10 +399,8 @@ public class CrossService : ICross
         parseSw.Stop();
         Observability.RecordStage("Deserialize", parseSw.Elapsed.TotalMilliseconds);
 
-        // Support both v1.0.0 (diff-only) and v2.0.0 (diff + raw-embed)
-        bool supportsRawEmbed = string.Equals(header.Version, "v2.0.0", StringComparison.Ordinal);
-        if (!supportsRawEmbed && !string.Equals(header.Version, "v1.0.0", StringComparison.Ordinal))
-            throw new InvalidDataException($"Unsupported encoding version '{header.Version}'.");
+        if (!string.Equals(header.Version, "v1.0.0", StringComparison.Ordinal))
+            throw new InvalidDataException($"Unsupported encoding version '{header.Version}'. Expected v1.0.0.");
 
         int referencesOffset = header.PayloadStart;
         int errorOffset = referencesOffset + header.ReferencesLength;
@@ -447,9 +421,9 @@ public class CrossService : ICross
             references[i] = (bucketId, bucketIndex);
         }
 
-        // Parse error dictionary — supports both diff patches and raw-embed chunks.
-        // Per chunk: pairCount == -1 → raw embed (next chunkSize bytes), pairCount >= 0 → diff patches.
-        var chunkData = new (bool isRaw, byte[]? rawBytes, List<(int key, short delta)>? patches)[chunkCount];
+        // Parse error dictionary (v1.0.0 — diff only).
+        // Per chunk: <int pairCount> then <int deltaIndex><short delta> × pairCount
+        var chunkPatches = new List<(int key, short delta)>[chunkCount];
         using (var errorMs = new MemoryStream(file, errorOffset, header.ErrorLength, writable: false))
         using (var reader = new BinaryReader(errorMs, Encoding.UTF8, leaveOpen: true))
         {
@@ -460,31 +434,17 @@ public class CrossService : ICross
             for (int i = 0; i < encodedChunkCount; i++)
             {
                 int pairCount = reader.ReadInt32();
-
-                if (pairCount == -1 && supportsRawEmbed)
-                {
-                    // Raw-embed mode: read chunkSize bytes directly.
-                    byte[] raw = reader.ReadBytes(Globals.chunkSize);
-                    if (raw.Length != Globals.chunkSize)
-                        throw new InvalidDataException($"Raw embed chunk {i}: expected {Globals.chunkSize} bytes, got {raw.Length}.");
-                    chunkData[i] = (true, raw, null);
-                }
-                else if (pairCount < 0)
-                {
+                if (pairCount < 0)
                     throw new InvalidDataException($"Invalid negative patch pair count ({pairCount}) at chunk {i}.");
-                }
-                else
+
+                var list = new List<(int key, short delta)>(pairCount);
+                for (int j = 0; j < pairCount; j++)
                 {
-                    // Diff mode: read patch entries.
-                    var list = new List<(int key, short delta)>(pairCount);
-                    for (int j = 0; j < pairCount; j++)
-                    {
-                        int key = reader.ReadInt32();
-                        short delta = reader.ReadInt16();
-                        list.Add((key, delta));
-                    }
-                    chunkData[i] = (false, null, list);
+                    int key = reader.ReadInt32();
+                    short delta = reader.ReadInt16();
+                    list.Add((key, delta));
                 }
+                chunkPatches[i] = list;
             }
         }
 
@@ -492,18 +452,12 @@ public class CrossService : ICross
         var applySw = Stopwatch.StartNew();
         for (int i = 0; i < chunkCount; i++)
         {
-            if (chunkData[i].isRaw)
-            {
-                // Raw-embed: write bytes directly, no base chunk needed.
-                await output.WriteAsync(chunkData[i].rawBytes!);
-                continue;
-            }
-
-            // Diff mode: fetch base chunk and apply patches.
+            // Fetch base chunk from server using the reference.
             byte[] baseChunk;
             var reference = references[i];
             if (reference.BucketId == 0 && reference.BucketIndex == 0)
             {
+                // Store failed during compression — zero-base fallback (diff reconstructs from zeros).
                 baseChunk = new byte[Globals.chunkSize];
             }
             else
@@ -515,8 +469,10 @@ public class CrossService : ICross
             if (baseChunk.Length != Globals.chunkSize)
                 throw new InvalidDataException($"Base chunk length {baseChunk.Length} differs from chunk size {Globals.chunkSize} for chunk {i}.");
 
+            // Apply diff patches to reconstruct original chunk.
+            // Empty patch list (pairCount == 0) means base == original → just write the base.
             int cursor = 0;
-            foreach (var (deltaIndex, deltaValue) in chunkData[i].patches!)
+            foreach (var (deltaIndex, deltaValue) in chunkPatches[i])
             {
                 cursor += deltaIndex;
                 if (cursor < 0 || cursor >= baseChunk.Length)
