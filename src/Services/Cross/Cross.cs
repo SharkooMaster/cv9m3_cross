@@ -56,6 +56,19 @@ public class CrossService : ICross
             toRet.RemoveAt(toRet.Count - 1);
         }
 
+        // CRITICAL: Validate all chunks are full-size - empty chunks should NEVER exist
+        for (int i = 0; i < toRet.Count; i++)
+        {
+            if (toRet[i] == null || toRet[i].Length == 0)
+            {
+                throw new InvalidOperationException($"FATAL: SplitFile returned empty chunk at index {i}. This should NEVER happen.");
+            }
+            if (toRet[i].Length != _chunkSize)
+            {
+                throw new InvalidOperationException($"FATAL: SplitFile returned chunk at index {i} with size {toRet[i].Length}, expected {_chunkSize}. Trim chunks should have been removed.");
+            }
+        }
+
         return (toRet, trimmedChunk);
     }
 
@@ -193,6 +206,15 @@ public class CrossService : ICross
         Dictionary<int, byte[]> chunkMap = new Dictionary<int, byte[]>();
         for (int i = 0; i < fileChunks.Count; i++)
         {
+            // CRITICAL: All chunks in fileChunks should be full-size (5120 bytes) - trim chunk was removed
+            if (fileChunks[i] == null || fileChunks[i].Length == 0)
+            {
+                throw new InvalidOperationException($"FATAL: Empty chunk at index {i} in fileChunks. This should NEVER happen - all chunks should be full-size (5120 bytes). Trim chunks are handled separately.");
+            }
+            if (fileChunks[i].Length != Globals.chunkSize)
+            {
+                throw new InvalidOperationException($"FATAL: Chunk at index {i} has size {fileChunks[i].Length}, expected {Globals.chunkSize}. Trim chunks should have been removed by SplitChunks.");
+            }
             chunkMap[i] = fileChunks[i];
         }
 
@@ -281,8 +303,31 @@ public class CrossService : ICross
             var chunksToStore = new List<(int index, QueryResponseObject response, byte[] chunk, string targetAgent, float[] vector, string bucketString)>();
             for (int i = 0; i < sorted.Count; i++)
             {
-                if (sorted[i] != null && sorted[i].NeedToStore && chunkMap.TryGetValue(i, out var chunkBytes))
+                if (sorted[i] != null && sorted[i].NeedToStore)
                 {
+                    // CRITICAL: chunkMap MUST have the chunk - if not, it's a bug
+                    if (!chunkMap.TryGetValue(i, out var chunkBytes))
+                    {
+                        throw new InvalidOperationException($"FATAL: chunkMap missing entry for index {i}. Expected {fileChunks.Count} chunks, got {sorted.Count} responses.");
+                    }
+                    
+                    // CRITICAL: Chunk bytes MUST be valid - this should NEVER be empty
+                    if (chunkBytes == null || chunkBytes.Length == 0)
+                    {
+                        throw new InvalidOperationException($"FATAL: Empty chunk at index {i} in chunkMap. This should NEVER happen - all chunks should be full-size (5120 bytes).");
+                    }
+                    
+                    if (chunkBytes.Length != Globals.chunkSize)
+                    {
+                        throw new InvalidOperationException($"FATAL: Chunk at index {i} has size {chunkBytes.Length}, expected {Globals.chunkSize}. Trim chunks should have been removed.");
+                    }
+                    
+                    // Validate target agent is set
+                    if (string.IsNullOrWhiteSpace(sorted[i].TargetAgent))
+                    {
+                        throw new InvalidOperationException($"FATAL: TargetAgent is empty for chunk at index {i}. Gateway should always set TargetAgent when NeedToStore=true.");
+                    }
+                    
                     chunksToStore.Add((
                         i,
                         sorted[i],
@@ -316,6 +361,18 @@ public class CrossService : ICross
                             HeadRouteID = ""
                         };
                         storeReq.Vector.AddRange(item.vector);
+                        
+                        // CRITICAL: Chunk bytes MUST be valid - this should NEVER be empty
+                        if (item.chunk == null || item.chunk.Length == 0)
+                        {
+                            throw new InvalidOperationException($"FATAL: Empty chunk at index {item.index} when storing. This should NEVER happen - all chunks should be full-size (5120 bytes).");
+                        }
+                        
+                        if (item.chunk.Length != Globals.chunkSize)
+                        {
+                            throw new InvalidOperationException($"FATAL: Chunk at index {item.index} has size {item.chunk.Length}, expected {Globals.chunkSize} when storing.");
+                        }
+                        
                         storeReq.Chunk = ByteString.CopyFrom(item.chunk);
                         
                         var callOptions = new CallOptions(
