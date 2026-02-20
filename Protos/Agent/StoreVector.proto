@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+import "google/protobuf/empty.proto";
+
+service StoreVector
+{
+    rpc Store (StoreVector_Req) returns (StoreVector_Res);
+}
+
+message StoreVector_Req
+{
+    string bitstring = 1;
+    repeated float vector = 2;
+    bytes chunk = 3;
+    string targetIp = 4;
+    string headRouteID = 5;
+}
+
+message StoreVector_Res
+{
+    uint64 id = 1;
+    uint64 index = 2;
+}

@@ -27,6 +27,7 @@
 
     <Protobuf Include="Protos\Gateway\SearchAll.proto" GrpcServices="Client" />
     <Protobuf Include="Protos\Agent\GetChunkByReference.proto" GrpcServices="Client" />
+    <Protobuf Include="Protos\Agent\StoreVector.proto" GrpcServices="Client" />
   </ItemGroup>
 
 </Project>

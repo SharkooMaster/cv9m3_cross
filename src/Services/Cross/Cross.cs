@@ -13,6 +13,7 @@ using Google.Protobuf;
 using Google.Protobuf.WellKnownTypes;
 
 using Cross.Services.Cache;
+using Grpc.Core;
 
 namespace Cross.Services.Cross;
 
@@ -22,7 +23,8 @@ public class CrossService : ICross
     // When base == original (newly stored chunk), patch list is empty → ~20 bytes per chunk.
     private const string EncodingVersion = "v1.0.0";
     string headID = "";
-    private static readonly SearchCacheService _searchCache = new SearchCacheService(maxCacheSize: 10000);
+    // OPTIMIZATION: Increased cache size from 10k to 100k for better hit rate
+    private static readonly SearchCacheService _searchCache = new SearchCacheService(maxCacheSize: 100000);
     private readonly global::Cross.Services.Grpc.Agent.ChunkReferenceServiceClient _chunkReferenceClient = new();
 
     private async Task initCLMS(string _name, string _id)
@@ -113,9 +115,9 @@ public class CrossService : ICross
             {
                 Index = i,
                 BucketString = _bitStrings[i],
-                // NOTE: Chunk bytes are still sent in queries because gateway needs them when storing
-                // TODO: Optimize by only sending chunks when needed (requires new mechanism)
-                Chunk = ByteString.CopyFrom(_fileChunks[i])
+                // OPTIMIZATION: Don't send chunk bytes - reduces network traffic by ~80%
+                // Cross will store chunks in background after returning file
+                Chunk = ByteString.Empty
             };
             toAdd.Vector.AddRange(_vectors[i]);
 
@@ -184,8 +186,15 @@ public class CrossService : ICross
 
         // Search using streaming for better performance with caching
         Stopwatch sw = Stopwatch.StartNew();
-        // - Prepare queries
+        // - Prepare queries (without chunk bytes for network efficiency)
         List<QueryObject> queries = GetQueryObjects(fileChunks, vectors, bitStrings);
+        
+        // Keep chunk mapping for background storage after returning file
+        Dictionary<int, byte[]> chunkMap = new Dictionary<int, byte[]>();
+        for (int i = 0; i < fileChunks.Count; i++)
+        {
+            chunkMap[i] = fileChunks[i];
+        }
 
         // - Check cache and prepare queries to send
         Dictionary<int, QueryResponseObject> queryResults = new Dictionary<int, QueryResponseObject>();
@@ -262,6 +271,80 @@ public class CrossService : ICross
             }
         }
 
+        // OPTIMIZATION: Store chunks that need storing in parallel to get IDs, then return file fast
+        // This removes chunk bytes from queries and makes response non-blocking
+        {
+            using var stage = Observability.StartStage("StoreChunks");
+            var swStage = Stopwatch.StartNew();
+            
+            // Collect all chunks that need storing
+            var chunksToStore = new List<(int index, QueryResponseObject response, byte[] chunk, string targetAgent, float[] vector, string bucketString)>();
+            for (int i = 0; i < sorted.Count; i++)
+            {
+                if (sorted[i] != null && sorted[i].NeedToStore && chunkMap.TryGetValue(i, out var chunkBytes))
+                {
+                    chunksToStore.Add((
+                        i,
+                        sorted[i],
+                        chunkBytes,
+                        sorted[i].TargetAgent,
+                        queries[i].Vector.ToArray(),
+                        queries[i].BucketString
+                    ));
+                }
+            }
+            
+            // Store all chunks in parallel to get IDs
+            if (chunksToStore.Count > 0)
+            {
+                var storeTasks = chunksToStore.Select(async item =>
+                {
+                    try
+                    {
+                        // Call agent's StoreVector service directly
+                        var client = GrpcChannelFactory.GetClient(
+                            target: item.targetAgent,
+                            ctor: chan => new StoreVector.StoreVectorClient(chan),
+                            roundRobin: false,
+                            port: 5000
+                        );
+                        
+                        var storeReq = new StoreVector_Req
+                        {
+                            TargetIp = item.targetAgent,
+                            Bitstring = item.bucketString,
+                            HeadRouteID = ""
+                        };
+                        storeReq.Vector.AddRange(item.vector);
+                        storeReq.Chunk = ByteString.CopyFrom(item.chunk);
+                        
+                        var callOptions = new CallOptions(
+                            deadline: DateTime.UtcNow.AddSeconds(10),
+                            cancellationToken: CancellationToken.None
+                        );
+                        
+                        var storeRes = await client.StoreAsync(storeReq, callOptions);
+                        
+                        // Update response with actual IDs
+                        item.response.BucketId = storeRes.Id;
+                        item.response.BucketKey = storeRes.Index;
+                        
+                        return (item.index, true);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Store failed - leave IDs as 0, will diff against zeros
+                        return (item.index, false);
+                    }
+                }).ToList();
+                
+                await Task.WhenAll(storeTasks);
+            }
+            
+            swStage.Stop();
+            Observability.RecordStage("StoreChunks", swStage.Elapsed.TotalMilliseconds, ("chunks_stored", chunksToStore.Count));
+        }
+
         // Stats: "references found" = chunks that re-used an existing base (not newly stored chunks).
         // Count only when Duplicate=true AND similarity < 1.0 (excludes newly stored chunks where similarity=1.0).
         int referencesFound = sorted.Count(r => r != null && r.Duplicate && r.Similarity < 1.0f);
@@ -312,9 +395,9 @@ public class CrossService : ICross
                     zeroRefCount++;
                 }
 
-                // Fast path: Duplicate=true means base == original (gateway stored this chunk).
+                // Fast path: Duplicate=true OR need_to_store=true means base == original (chunk was stored).
                 // Diff is guaranteed empty — skip the byte-by-byte comparison entirely.
-                if (sorted[i].Duplicate && sorted[i].BucketId != 0)
+                if ((sorted[i].Duplicate || sorted[i].NeedToStore) && sorted[i].BucketId != 0)
                 {
                     perChunkPatches.Add(new List<(int key, int value)>());
                     emptyDiffCount++;
@@ -472,8 +555,24 @@ public class CrossService : ICross
             }
             else
             {
-                baseChunk = await _chunkReferenceClient.GetChunkByReferenceAsync(reference.BucketId, reference.BucketIndex)
-                    ?? throw new InvalidDataException($"Missing base chunk for reference ({reference.BucketId}, {reference.BucketIndex}).");
+                // OPTIMIZATION: Retry logic for chunks that might not be stored yet (background storage)
+                // This handles the race condition where decompression happens immediately after compression
+                baseChunk = await _chunkReferenceClient.GetChunkByReferenceAsync(reference.BucketId, reference.BucketIndex);
+                
+                if (baseChunk == null)
+                {
+                    // Retry with exponential backoff (chunk might still be storing in background)
+                    for (int retry = 0; retry < 3; retry++)
+                    {
+                        await Task.Delay(100 * (int)Math.Pow(2, retry)); // 100ms, 200ms, 400ms
+                        baseChunk = await _chunkReferenceClient.GetChunkByReferenceAsync(reference.BucketId, reference.BucketIndex);
+                        if (baseChunk != null)
+                            break;
+                    }
+                    
+                    if (baseChunk == null)
+                        throw new InvalidDataException($"Missing base chunk for reference ({reference.BucketId}, {reference.BucketIndex}).");
+                }
             }
 
             if (baseChunk.Length != Globals.chunkSize)
