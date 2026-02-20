@@ -989,23 +989,32 @@ public class CrossService : ICross
                 var refCopy = reference;
                 fetchTasks[i] = Task.Run(async () =>
                 {
-                    byte[]? chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                    // During decompression, we don't know which agent owns the chunk.
+                    // Query all agents in parallel and take the first successful result.
+                    byte[]? chunk = await _chunkReferenceClient.GetChunkByReferenceFromAnyAgentAsync(
                         refCopy.BucketId, refCopy.BucketIndex);
 
                     if (chunk == null)
                     {
-                        // Retry with exponential backoff
-                        for (int retry = 0; retry < 3; retry++)
-                        {
-                            await Task.Delay(100 * (int)Math.Pow(2, retry));
-                            chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
-                                refCopy.BucketId, refCopy.BucketIndex);
-                            if (chunk != null) break;
-                        }
-                        if (chunk == null)
-                            throw new InvalidDataException(
-                                $"Missing base chunk for reference ({refCopy.BucketId}, {refCopy.BucketIndex}).");
+                        // Retry once with a short delay (chunk might still be storing in background)
+                        await Task.Delay(200);
+                        chunk = await _chunkReferenceClient.GetChunkByReferenceFromAnyAgentAsync(
+                            refCopy.BucketId, refCopy.BucketIndex);
                     }
+
+                    if (chunk == null)
+                    {
+                        throw new InvalidDataException(
+                            $"Missing base chunk for reference ({refCopy.BucketId}, {refCopy.BucketIndex}). " +
+                            $"All agents were queried but none had this chunk.");
+                    }
+
+                    if (chunk.Length != Globals.chunkSize)
+                    {
+                        throw new InvalidDataException(
+                            $"Base chunk for reference ({refCopy.BucketId}, {refCopy.BucketIndex}) has length {chunk.Length}, expected {Globals.chunkSize}.");
+                    }
+
                     baseChunks[idx] = chunk;
                 });
             }
