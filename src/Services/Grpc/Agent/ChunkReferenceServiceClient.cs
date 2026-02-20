@@ -55,9 +55,9 @@ public class ChunkReferenceServiceClient
     }
 
     /// <summary>
-    /// Try all agents in parallel to find a chunk by reference.
-    /// Used during decompression when we don't know which agent owns the chunk.
-    /// Returns the first successful result, or null if all agents fail.
+    /// Decompression fallback: when target ownership is unknown, query all agents in parallel
+    /// and return the first successful chunk. This guarantees correctness when references
+    /// don't carry TargetAgent metadata.
     /// </summary>
     public async Task<byte[]?> GetChunkByReferenceFromAnyAgentAsync(
         ulong bucketId,
@@ -66,42 +66,32 @@ public class ChunkReferenceServiceClient
     {
         var agents = RendezvousRouter.GetAgents();
         if (agents.Length == 0)
-            return null;
-
-        // Query all agents in parallel, return first successful result
-        var tasks = agents.Select(async agent =>
         {
-            try
+            return await GetChunkByReferenceAsync(bucketId, bucketIndex, null, ct);
+        }
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var tasks = new List<Task<byte[]?>>(agents.Length);
+
+        foreach (var agent in agents)
+        {
+            tasks.Add(GetChunkByReferenceAsync(bucketId, bucketIndex, agent, linkedCts.Token));
+        }
+
+        while (tasks.Count > 0)
+        {
+            var completed = await Task.WhenAny(tasks);
+            tasks.Remove(completed);
+
+            var chunk = await completed;
+            if (chunk != null && chunk.Length > 0)
             {
-                var client = GrpcChannelFactory.GetClient(
-                    target: agent,
-                    ctor: chan => new ChunkReferenceService.ChunkReferenceServiceClient(chan),
-                    roundRobin: false,
-                    port: 5000);
-
-                var req = new GetChunkByReference_Req
-                {
-                    BucketId = bucketId,
-                    BucketIndex = bucketIndex
-                };
-
-                var res = await client.GetChunkByReferenceAsync(
-                    req,
-                    deadline: DateTime.UtcNow.AddSeconds(5), // Shorter timeout for parallel queries
-                    cancellationToken: ct);
-
-                if (res.Found && res.Chunk != null && res.Chunk.Length > 0)
-                {
-                    return res.Chunk.ToByteArray();
-                }
+                linkedCts.Cancel(); // best-effort cancel remaining calls
+                return chunk;
             }
-            catch { /* Try next agent */ }
-            return null;
-        }).ToList();
+        }
 
-        // Wait for all tasks, return first non-null result
-        var results = await Task.WhenAll(tasks);
-        return results.FirstOrDefault(r => r != null);
+        return null;
     }
 }
 
