@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+service SearchVector
+{
+    rpc Get (SearchVector_Req) returns (SearchVector_Result);
+    rpc BatchGet (BatchSearchVector_Req) returns (BatchSearchVector_Result);
+}
+
+message SearchVector_Req
+{
+    int32 index = 1;
+
+    repeated float vector = 2;
+    repeated string bitstrings = 3;
+
+    float minimum_similarity = 4;
+    int32 k = 5;
+}
+
+message SearchVectorObject
+{
+    uint64 bucket_id = 1;
+    int64 bucket_key = 2;
+
+    float similarity = 3;
+    bytes chunk = 4;
+
+    int32 index = 5;
+}
+
+message SearchVector_Result
+{
+    repeated SearchVectorObject results = 1;
+    bool save = 2;
+}
+
+message BatchSearchVector_Req
+{
+    repeated SearchVector_Req queries = 1;
+}
+
+message BatchSearchVector_Result
+{
+    repeated SearchVector_Result results = 1;
+}

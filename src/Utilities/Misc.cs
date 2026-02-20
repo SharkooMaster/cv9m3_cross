@@ -56,14 +56,8 @@ static public class Misc
         int dataSize = Globals.chunkSize;
         float[,] randomProjection = GetOrCreateProjectionMatrix(nComponents, dataSize);
 
-        // DYNAMIC: Adjust parallelism based on current CPU and memory usage
-        int baseParallelism = (int)(Environment.ProcessorCount * 0.75);
-        int optimalParallelism = DynamicResourceManager.GetOptimalParallelism(baseParallelism);
-        var parallelOptions = new ParallelOptions
-        {
-            MaxDegreeOfParallelism = Math.Max(1, optimalParallelism)
-        };
-        Parallel.For(0, count, parallelOptions, i =>
+        // Uncapped parallelism — vectorization is pure CPU, no I/O
+        Parallel.For(0, count, new ParallelOptions { MaxDegreeOfParallelism = -1 }, i =>
         {
             results[i] = Compute64ElementLSHVector(chunkList[i], randomProjection);
         });
@@ -106,94 +100,49 @@ static public class Misc
         return _cachedProjection;
     }
 
-    // OPTIMIZATION: SIMD-accelerated LSH projection for faster vectorization
+    // Thread-local pre-converted chunk floats to avoid per-call allocation
+    [ThreadStatic] private static float[]? _tlsChunkFloats;
+
+    /// <summary>
+    /// LSH projection: 64 × chunkSize matrix multiply.
+    /// Zero allocations in the hot loop — pre-converts chunk bytes to floats once,
+    /// then uses a flat projection array for cache-friendly sequential access.
+    /// </summary>
     private static float[] Compute64ElementLSHVector(byte[] chunk, float[,] randomProjection)
     {
         const int nComponents = 64;
         int dataSize = chunk.Length;
-    
-        // Project the data vector using the random projection matrix.
+
+        // Pre-convert bytes → floats ONCE (reuse thread-local buffer)
+        if (_tlsChunkFloats == null || _tlsChunkFloats.Length < dataSize)
+            _tlsChunkFloats = new float[dataSize];
+
+        var chunkFloats = _tlsChunkFloats;
+        for (int i = 0; i < dataSize; i++)
+            chunkFloats[i] = chunk[i];
+
         float[] lshVector = new float[nComponents];
-        
-        // OPTIMIZATION: Use SIMD when available for faster matrix multiplication
-        int vectorSize = Vector<float>.Count;
-        bool useSimd = Vector.IsHardwareAccelerated && dataSize >= vectorSize;
-        
+
         for (int row = 0; row < nComponents; row++)
         {
-            float sum = 0;
-            
-            if (useSimd)
+            float sum = 0f;
+            // Sequential multiply-add — compiler auto-vectorizes this with /O2.
+            // The 2D array indexing is row-major so randomProjection[row, col] is
+            // sequential in memory for a given row → cache-friendly.
+            for (int col = 0; col < dataSize; col++)
             {
-                // SIMD-accelerated loop for faster computation
-                Vector<float> sumVec = Vector<float>.Zero;
-                int col = 0;
-                
-                // Process in SIMD chunks
-                for (; col <= dataSize - vectorSize; col += vectorSize)
-                {
-                    // Load chunk bytes as float vector (need to convert byte to float)
-                    float[] chunkFloats = new float[vectorSize];
-                    float[] projFloats = new float[vectorSize];
-                    
-                    for (int j = 0; j < vectorSize; j++)
-                    {
-                        chunkFloats[j] = (float)chunk[col + j];
-                        projFloats[j] = randomProjection[row, col + j];
-                    }
-                    
-                    var chunkVec = new Vector<float>(chunkFloats);
-                    var projVec = new Vector<float>(projFloats);
-                    
-                    sumVec += chunkVec * projVec;
-                }
-                
-                // Horizontal sum of SIMD vector
-                sum = HorizontalSum(sumVec);
-                
-                // Handle remainder sequentially
-                for (; col < dataSize; col++)
-                {
-                    sum += randomProjection[row, col] * chunk[col];
-                }
+                sum += randomProjection[row, col] * chunkFloats[col];
             }
-            else
-            {
-                // Fallback: Sequential computation
-                for (int col = 0; col < dataSize; col++)
-            {
-                sum += randomProjection[row, col] * chunk[col];
-                }
-            }
-            
             lshVector[row] = sum;
         }
-    
+
         return lshVector;
-    }
-    
-    // OPTIMIZATION: Efficient horizontal sum for SIMD vectors
-    private static float HorizontalSum(Vector<float> vec)
-    {
-        float sum = 0.0f;
-        for (int i = 0; i < Vector<float>.Count; i++)
-        {
-            sum += vec[i];
-        }
-        return sum;
     }
 
     public static List<string> ComputeBitStringFromVectors(List<float[]> vectors)
     {
         var results = new string[vectors.Count];
-        // DYNAMIC: Adjust parallelism based on current CPU and memory usage
-        int baseParallelism = (int)(Environment.ProcessorCount * 0.75);
-        int optimalParallelism = DynamicResourceManager.GetOptimalParallelism(baseParallelism);
-        var parallelOptions = new ParallelOptions
-        {
-            MaxDegreeOfParallelism = Math.Max(1, optimalParallelism)
-        };
-        Parallel.For(0, vectors.Count, parallelOptions, i => {
+        Parallel.For(0, vectors.Count, new ParallelOptions { MaxDegreeOfParallelism = -1 }, i => {
             results[i] = ComputeBitStringFromVector(vectors[i]);
         });
 

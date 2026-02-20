@@ -197,99 +197,178 @@ public class CrossService : ICross
             Observability.RecordStage("ExtractBucketKeys", swStage.Elapsed.TotalMilliseconds, ("bucket_count", bitStrings.Count));
         }
 
-        // Search using streaming for better performance with caching
+        // ── DIRECT-TO-AGENT SEARCH (bypasses gateway entirely) ──
+        // Cross computes rendezvous hash locally, groups queries by agent,
+        // sends ONE BatchGet per agent. No gateway middleman, no streaming overhead.
+        // ~5 gRPC calls instead of 1200 sequential stream writes through gateway.
         Stopwatch sw = Stopwatch.StartNew();
-        // - Prepare queries (without chunk bytes for network efficiency)
-        List<QueryObject> queries = GetQueryObjects(fileChunks, vectors, bitStrings);
-        
-        // Keep chunk mapping for background storage after returning file
+
+        const float MIN_THRESH = 0.60f;
+
+        // Keep chunk mapping for background storage
         Dictionary<int, byte[]> chunkMap = new Dictionary<int, byte[]>();
         for (int i = 0; i < fileChunks.Count; i++)
         {
-            // CRITICAL: All chunks in fileChunks should be full-size (5120 bytes) - trim chunk was removed
             if (fileChunks[i] == null || fileChunks[i].Length == 0)
-            {
-                throw new InvalidOperationException($"FATAL: Empty chunk at index {i} in fileChunks. This should NEVER happen - all chunks should be full-size (5120 bytes). Trim chunks are handled separately.");
-            }
+                throw new InvalidOperationException($"FATAL: Empty chunk at index {i}.");
             if (fileChunks[i].Length != Globals.chunkSize)
-            {
-                throw new InvalidOperationException($"FATAL: Chunk at index {i} has size {fileChunks[i].Length}, expected {Globals.chunkSize}. Trim chunks should have been removed by SplitChunks.");
-            }
+                throw new InvalidOperationException($"FATAL: Chunk at index {i} has size {fileChunks[i].Length}, expected {Globals.chunkSize}.");
             chunkMap[i] = fileChunks[i];
         }
 
-        // - Check cache and prepare queries to send
-        Dictionary<int, QueryResponseObject> queryResults = new Dictionary<int, QueryResponseObject>();
-        List<QueryObject> queriesToSend = new List<QueryObject>();
-        List<int> queryIndices = new List<int>();
-        
-        // Check cache for each query
-        for (int i = 0; i < queries.Count; i++)
+        // Build query info: for each chunk compute neighbors + route to agent
+        var queryInfos = new (List<string> buckets, string agent, float[] vector, string bitString)[fileChunks.Count];
+        Parallel.For(0, fileChunks.Count, i =>
         {
-            var query = queries[i];
-            var cached = _searchCache.GetCachedResult(query.Vector.ToArray(), query.BucketString);
-            if (cached != null)
+            var neighbors = RendezvousRouter.GetNeighbouringBuckets(bitStrings[i], vectors[i]);
+            var agent = RendezvousRouter.PickAgent(bitStrings[i]);
+            queryInfos[i] = (neighbors, agent, vectors[i], bitStrings[i]);
+        });
+
+        // Group by agent
+        var agentGroups = new Dictionary<string, List<int>>();
+        for (int i = 0; i < queryInfos.Length; i++)
+        {
+            var agent = queryInfos[i].agent;
+            if (!agentGroups.TryGetValue(agent, out var list))
             {
-                // Use cached result
-                queryResults[i] = cached;
-                // Removed Console.WriteLine for performance (hot path)
+                list = new List<int>();
+                agentGroups[agent] = list;
             }
-            else
-            {
-                // Need to search
-                queriesToSend.Add(query);
-                queryIndices.Add(i);
-            }
+            list.Add(i);
         }
 
-        // Create async enumerable of queries that need searching
-        async IAsyncEnumerable<QueryObject> StreamQueries()
-        {
-            for (int i = 0; i < queriesToSend.Count; i++)
-            {
-                yield return queriesToSend[i];
-            }
-        }
-
-        // Stream queries to Gateway and receive results (only for non-cached)
-        if (queriesToSend.Count > 0)
+        // Fire ONE BatchGet per agent — in parallel, direct to agents
+        var sorted = new QueryResponseObject?[fileChunks.Count];
         {
             using var stage = Observability.StartStage("SearchBuckets");
             var swStage = Stopwatch.StartNew();
-            // Removed Console.WriteLine for performance (hot path)
-            await foreach (var response in Globals.searchAllServiceClient.SearchAllStreamAsync(StreamQueries()))
+
+            var batchTasks = agentGroups.Select(kv =>
             {
-                // IMPORTANT: Gateway streams results as they complete (out of order).
-                // Always use response.Index to map back to the original chunk index.
-                int originalIndex = response.Index;
-                queryResults[originalIndex] = response;
-
-                // Cache only valid responses. Fallback/error responses (0,0) can poison cache and
-                // repeatedly force bad bases on subsequent chunks/files.
-                if (!(response.BucketId == 0 && response.BucketKey == 0))
+                var agent = kv.Key;
+                var indices = kv.Value;
+                return Task.Run(async () =>
                 {
-                    var query = queries[originalIndex];
-                    _searchCache.CacheResult(query.Vector.ToArray(), query.BucketString, response);
-                }
+                    try
+                    {
+                        var client = GrpcChannelFactory.GetClient(
+                            target: agent,
+                            ctor: chan => new SearchVector.SearchVectorClient(chan),
+                            roundRobin: false, port: 5000);
 
-                // Removed Console.WriteLine for performance (hot path - logs every query result)
-            }
-            // Removed Console.WriteLine for performance
+                        var batchReq = new BatchSearchVector_Req();
+                        foreach (var idx in indices)
+                        {
+                            var info = queryInfos[idx];
+                            var req = new SearchVector_Req
+                            {
+                                Index = idx,
+                                MinimumSimilarity = MIN_THRESH,
+                                K = 1
+                            };
+                            req.Vector.AddRange(info.vector);
+                            req.Bitstrings.AddRange(info.buckets);
+                            batchReq.Queries.Add(req);
+                        }
+
+                        var batchRes = await client.BatchGetAsync(batchReq,
+                            deadline: DateTime.UtcNow.AddSeconds(30));
+
+                        // Map results back
+                        for (int j = 0; j < indices.Count && j < batchRes.Results.Count; j++)
+                        {
+                            var idx = indices[j];
+                            var res = batchRes.Results[j];
+                            var info = queryInfos[idx];
+
+                            if (res.Save)
+                            {
+                                sorted[idx] = new QueryResponseObject
+                                {
+                                    BucketId = 0, BucketKey = 0,
+                                    Similarity = 1.0f, Chunk = ByteString.Empty,
+                                    Index = idx, Duplicate = true,
+                                    NeedToStore = true, TargetAgent = agent
+                                };
+                            }
+                            else if (res.Results.Count > 0)
+                            {
+                                var best = res.Results[0];
+                                float sim = best.Similarity;
+                                if (sim >= MIN_THRESH)
+                                {
+                                    sorted[idx] = new QueryResponseObject
+                                    {
+                                        BucketId = best.BucketId,
+                                        BucketKey = (ulong)best.BucketKey,
+                                        Similarity = sim,
+                                        Chunk = best.Chunk, // base chunk bytes from agent MRU cache
+                                        Index = idx,
+                                        Duplicate = sim >= MIN_THRESH,
+                                        NeedToStore = false,
+                                        TargetAgent = agent
+                                    };
+                                }
+                                else
+                                {
+                                    // Below threshold — needs storing
+                                    sorted[idx] = new QueryResponseObject
+                                    {
+                                        BucketId = 0, BucketKey = 0,
+                                        Similarity = 1.0f, Chunk = ByteString.Empty,
+                                        Index = idx, Duplicate = true,
+                                        NeedToStore = true, TargetAgent = agent
+                                    };
+                                }
+                            }
+                            else
+                            {
+                                sorted[idx] = new QueryResponseObject
+                                {
+                                    BucketId = 0, BucketKey = 0,
+                                    Similarity = 1.0f, Chunk = ByteString.Empty,
+                                    Index = idx, Duplicate = true,
+                                    NeedToStore = true, TargetAgent = agent
+                                };
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Batch failed — mark all as need-to-store
+                        foreach (var idx in indices)
+                        {
+                            sorted[idx] = new QueryResponseObject
+                            {
+                                BucketId = 0, BucketKey = 0,
+                                Similarity = 1.0f, Chunk = ByteString.Empty,
+                                Index = idx, Duplicate = true,
+                                NeedToStore = true, TargetAgent = agent
+                            };
+                        }
+                    }
+                });
+            }).ToList();
+
+            await Task.WhenAll(batchTasks);
             swStage.Stop();
-            Observability.RecordStage("SearchBuckets", swStage.Elapsed.TotalMilliseconds, ("query_count", queriesToSend.Count));
+            Observability.RecordStage("SearchBuckets", swStage.Elapsed.TotalMilliseconds,
+                ("agents", agentGroups.Count), ("queries", fileChunks.Count));
         }
 
-        // - Sort by index (ensure all indices are present)
-        List<QueryResponseObject?> sorted = new List<QueryResponseObject?>(queries.Count);
-        for (int i = 0; i < queries.Count; i++)
+        // Fill any missing results (shouldn't happen, but safety net)
+        for (int i = 0; i < sorted.Length; i++)
         {
-            if (queryResults.TryGetValue(i, out var result))
+            if (sorted[i] == null)
             {
-                sorted.Add(result);
-            }
-            else
-            {
-                sorted.Add(null); // Will be handled in error check below
+                sorted[i] = new QueryResponseObject
+                {
+                    BucketId = 0, BucketKey = 0,
+                    Similarity = 1.0f, Chunk = ByteString.Empty,
+                    Index = i, Duplicate = true,
+                    NeedToStore = true, TargetAgent = RendezvousRouter.PickAgent(bitStrings[i])
+                };
             }
         }
 
@@ -301,8 +380,8 @@ public class CrossService : ICross
             var swStage = Stopwatch.StartNew();
 
             // Collect all chunks that need storing, grouped by target agent
-            var agentGroups = new Dictionary<string, List<(int index, QueryResponseObject response, byte[] chunk, float[] vector, string bucketString)>>();
-            for (int i = 0; i < sorted.Count; i++)
+            var storeGroups = new Dictionary<string, List<(int index, QueryResponseObject response, byte[] chunk, float[] vector, string bucketString)>>();
+            for (int i = 0; i < sorted.Length; i++)
             {
                 if (sorted[i] == null || !sorted[i].NeedToStore) continue;
 
@@ -316,19 +395,19 @@ public class CrossService : ICross
                     throw new InvalidOperationException($"FATAL: TargetAgent is empty for chunk at index {i}.");
 
                 var agent = sorted[i].TargetAgent;
-                if (!agentGroups.TryGetValue(agent, out var list))
+                if (!storeGroups.TryGetValue(agent, out var list))
                 {
                     list = new List<(int, QueryResponseObject, byte[], float[], string)>();
-                    agentGroups[agent] = list;
+                    storeGroups[agent] = list;
                 }
-                list.Add((i, sorted[i], chunkBytes, queries[i].Vector.ToArray(), queries[i].BucketString));
+                list.Add((i, sorted[i], chunkBytes, queryInfos[i].vector, queryInfos[i].bitString));
             }
 
             // Fire ONE BatchStore per agent — in parallel
             int totalStored = 0;
-            if (agentGroups.Count > 0)
+            if (storeGroups.Count > 0)
             {
-                var batchTasks = agentGroups.Select(async kv =>
+                var batchTasks = storeGroups.Select(async kv =>
                 {
                     var agent = kv.Key;
                     var items = kv.Value;
@@ -377,13 +456,13 @@ public class CrossService : ICross
 
             swStage.Stop();
             Observability.RecordStage("StoreChunks", swStage.Elapsed.TotalMilliseconds,
-                ("agents", agentGroups.Count), ("chunks_stored", totalStored));
+                ("agents", storeGroups.Count), ("chunks_stored", totalStored));
         }
 
         // Stats: "references found" = chunks that re-used an existing base (not newly stored chunks).
         // Count only when Duplicate=true AND similarity < 1.0 (excludes newly stored chunks where similarity=1.0).
         int referencesFound = sorted.Count(r => r != null && r.Duplicate && r.Similarity < 1.0f);
-        int totalChunks = sorted.Count;
+        int totalChunks = sorted.Length;
         int nullCount = sorted.Count(r => r == null);
         int zeroIdCount = sorted.Count(r => r != null && r.BucketId == 0 && r.BucketKey == 0);
         int validRefCount = sorted.Count(r => r != null && r.BucketId > 0);
@@ -393,8 +472,8 @@ public class CrossService : ICross
         // Encode references and per-chunk error dictionary.
         // Diff-only format: chunks live on the server, compressed file has only references + diff patches.
         // When base == original (newly stored chunk), diff is EMPTY → ~20 bytes per chunk.
-        var references = new List<byte>(sorted.Count * (sizeof(ulong) * 2));
-        var perChunkPatches = new List<List<(int key, int value)>>(sorted.Count);
+        var references = new List<byte>(sorted.Length * (sizeof(ulong) * 2));
+        var perChunkPatches = new List<List<(int key, int value)>>(sorted.Length);
         int diffCount = 0;
         int emptyDiffCount = 0;
         int zeroRefCount = 0;
@@ -408,7 +487,7 @@ public class CrossService : ICross
             // evicted the chunk (>512MB of chunks on one agent). Most files will have
             // zero entries in baseChunkFetchIndices.
             var baseChunkFetchIndices = new List<int>();
-            for (int i = 0; i < sorted.Count; i++)
+            for (int i = 0; i < sorted.Length; i++)
             {
                 if (sorted[i] == null)
                 {
@@ -436,7 +515,7 @@ public class CrossService : ICross
             if (baseChunkFetchIndices.Count > 0)
             {
                 var fetchSw = Stopwatch.StartNew();
-                var fetchedChunks = new byte[sorted.Count][];
+                var fetchedChunks = new byte[sorted.Length][];
                 var fetchTasks = baseChunkFetchIndices.Select(async idx =>
                 {
                     try
@@ -457,7 +536,7 @@ public class CrossService : ICross
                     ("count", baseChunkFetchIndices.Count));
 
                 // Inject fetched chunks into sorted results
-                for (int i = 0; i < sorted.Count; i++)
+                for (int i = 0; i < sorted.Length; i++)
                 {
                     if (fetchedChunks[i] != null)
                         sorted[i].Chunk = ByteString.CopyFrom(fetchedChunks[i]);
@@ -479,7 +558,7 @@ public class CrossService : ICross
                         string agent = sorted[idx].TargetAgent ?? "";
                         if (!string.IsNullOrWhiteSpace(agent))
                         {
-                            failedFetchStore.Add((idx, sorted[idx], chunkBytes, agent, queries[idx].Vector.ToArray(), queries[idx].BucketString));
+                            failedFetchStore.Add((idx, sorted[idx], chunkBytes, agent, queryInfos[idx].vector, queryInfos[idx].bitString));
                         }
                         else
                         {
@@ -530,7 +609,7 @@ public class CrossService : ICross
             }
 
             // ── Now encode references + diffs ──
-            for (int i = 0; i < sorted.Count; i++)
+            for (int i = 0; i < sorted.Length; i++)
             {
                 // Encode reference (bucketId, bucketKey) — always 16 bytes
                 references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
@@ -565,7 +644,7 @@ public class CrossService : ICross
             }
             swStage.Stop();
             Observability.RecordStage("DiffEncode", swStage.Elapsed.TotalMilliseconds,
-                ("chunk_count", sorted.Count), ("empty_diff", emptyDiffCount), ("non_empty_diff", diffCount),
+                ("chunk_count", sorted.Length), ("empty_diff", emptyDiffCount), ("non_empty_diff", diffCount),
                 ("zero_ref", zeroRefCount));
         }
 
@@ -576,8 +655,8 @@ public class CrossService : ICross
         using (var errorMs = new MemoryStream())
         using (var errorWriter = new BinaryWriter(errorMs, Encoding.UTF8, leaveOpen: true))
         {
-            errorWriter.Write(sorted.Count);
-            for (int i = 0; i < sorted.Count; i++)
+            errorWriter.Write(sorted.Length);
+            for (int i = 0; i < sorted.Length; i++)
             {
                 var patch = perChunkPatches[i];
                 errorWriter.Write(patch.Count); // 0 for empty diff (base == original)
