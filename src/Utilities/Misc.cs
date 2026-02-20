@@ -161,8 +161,8 @@ static public class Misc
             {
                 // Fallback: Sequential computation
                 for (int col = 0; col < dataSize; col++)
-                {
-                    sum += randomProjection[row, col] * chunk[col];
+            {
+                sum += randomProjection[row, col] * chunk[col];
                 }
             }
             

@@ -452,9 +452,12 @@ public class CrossService : ICross
                     zeroRefCount++;
                 }
 
-                // Fast path: Duplicate=true OR need_to_store=true means base == original (chunk was stored).
-                // Diff is guaranteed empty — skip the byte-by-byte comparison entirely.
-                if ((sorted[i].Duplicate || sorted[i].NeedToStore) && sorted[i].BucketId != 0)
+                // Fast path is valid ONLY when base == original:
+                //  - NeedToStore=true (new chunk stored; base is the same chunk), OR
+                //  - exact match (Similarity == 1.0 with a valid reference).
+                // NOTE: Duplicate=true alone only means "above threshold", not necessarily byte-identical.
+                bool isExactMatch = sorted[i].Similarity >= 0.999999f;
+                if ((sorted[i].NeedToStore || isExactMatch) && sorted[i].BucketId != 0)
                 {
                     perChunkPatches.Add(new List<(int key, int value)>());
                     emptyDiffCount++;
