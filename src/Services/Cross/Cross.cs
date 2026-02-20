@@ -452,7 +452,9 @@ public class CrossService : ICross
                 }
             }
 
-            // Parallel fetch all needed base chunks from agents
+            // Parallel fetch all needed base chunks from the CORRECT agent.
+            // Gateway sets TargetAgent for ALL responses so we know exactly where the data lives.
+            // This prevents the old bug where round-robin hit the wrong agent → recursive cross-agent search → timeout.
             if (baseChunkFetchIndices.Count > 0)
             {
                 var fetchSw = Stopwatch.StartNew();
@@ -461,8 +463,11 @@ public class CrossService : ICross
                 {
                     try
                     {
+                        // Route to the specific agent that owns this chunk (set by gateway)
+                        string? targetAgent = sorted[idx].TargetAgent;
                         var chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
-                            sorted[idx].BucketId, sorted[idx].BucketKey);
+                            sorted[idx].BucketId, sorted[idx].BucketKey,
+                            targetAgent: string.IsNullOrWhiteSpace(targetAgent) ? null : targetAgent);
                         if (chunk != null && chunk.Length > 0)
                             fetchedChunks[idx] = chunk;
                     }
