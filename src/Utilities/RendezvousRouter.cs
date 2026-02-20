@@ -1,21 +1,27 @@
 using System.Net;
 using System.Text;
+using System.Threading;
 
 namespace Cross.Utilities;
 
 /// <summary>
-/// Rendezvous (Highest Random Weight) hashing — same implementation as Gateway.
+/// Rendezvous (Highest Random Weight) hashing — same algorithm as Gateway.
 /// Cross uses this to route directly to agents, bypassing the gateway in the hot path.
+///
+/// Performance: PickAgent is called ~290,000 times per 4000-chunk file (65 buckets × N chunks).
+/// This implementation uses zero heap allocations in the hot path (stackalloc + Span).
 /// </summary>
 public static class RendezvousRouter
 {
     private static readonly object _lock = new();
-    private static string[] _agents = Array.Empty<string>();
-    private static DateTime _resolvedAt = DateTime.MinValue;
+    private static volatile string[] _agents = Array.Empty<string>();
+    private static volatile byte[][] _agentBytes = Array.Empty<byte[]>(); // Pre-encoded IPs
+    private static long _resolvedAtTicks = 0; // DateTime.UtcNow.Ticks — value type safe
 
     /// <summary>
     /// Pick the owning agent for a bucket using rendezvous hashing.
     /// Deterministic: same (bucket, agent set) always returns the same agent.
+    /// ZERO heap allocations — uses stackalloc for the hash buffer.
     /// </summary>
     public static string PickAgent(string bucketString)
     {
@@ -23,11 +29,28 @@ public static class RendezvousRouter
         if (agents.Length == 0) return Globals.AgentsLoadbalancer;
         if (agents.Length == 1) return agents[0];
 
+        var agentBytesLocal = _agentBytes;
+
+        // Bucket strings are always 64 ASCII chars. Agent IPs max ~15 chars.
+        // Buffer: bucket(64) + "|"(1) + agent(max 20) = 85 bytes max. Use 96 for safety.
+        int bucketLen = bucketString.Length;
+        Span<byte> buf = stackalloc byte[96];
+
+        // Encode bucket string (ASCII only — '0' and '1')
+        for (int c = 0; c < bucketLen; c++)
+            buf[c] = (byte)bucketString[c];
+        buf[bucketLen] = (byte)'|';
+
         string bestAgent = agents[0];
         uint bestHash = 0;
+
         for (int i = 0; i < agents.Length; i++)
         {
-            uint hash = MurmurHash3($"{bucketString}|{agents[i]}");
+            var ab = agentBytesLocal[i];
+            ab.AsSpan().CopyTo(buf.Slice(bucketLen + 1));
+            int totalLen = bucketLen + 1 + ab.Length;
+
+            uint hash = MurmurHash3(buf.Slice(0, totalLen));
             if (hash > bestHash)
             {
                 bestHash = hash;
@@ -39,42 +62,50 @@ public static class RendezvousRouter
 
     /// <summary>
     /// Resolve agent IPs from the headless K8s service. Cached 15s.
-    /// Sorted for deterministic ordering across all callers (same as gateway).
+    /// Double-checked locking: only ONE thread resolves DNS on cache miss.
+    /// Logs only on actual change, not on every cache refresh.
     /// </summary>
     public static string[] GetAgents()
     {
+        // Fast path: lock-free cache check
+        var agents = _agents;
+        long resolvedTicks = Interlocked.Read(ref _resolvedAtTicks);
+        if (agents.Length > 0 && (DateTime.UtcNow.Ticks - resolvedTicks) < TimeSpan.FromSeconds(15).Ticks)
+            return agents;
+
+        // Slow path: resolve DNS (only one thread at a time)
         lock (_lock)
         {
-            if (_agents.Length > 0 && DateTime.UtcNow - _resolvedAt < TimeSpan.FromSeconds(15))
+            // Double-check inside lock (another thread may have resolved already)
+            if (_agents.Length > 0 && (DateTime.UtcNow.Ticks - _resolvedAtTicks) < TimeSpan.FromSeconds(15).Ticks)
                 return _agents;
-        }
 
-        try
-        {
-            var resolved = Dns.GetHostAddresses(Globals.AgentsLoadbalancer)
-                .Where(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-                .Select(ip => ip.ToString())
-                .Distinct()
-                .OrderBy(x => x) // Stable order across all callers
-                .ToArray();
-
-            if (resolved.Length > 0)
+            try
             {
-                lock (_lock)
+                var resolved = Dns.GetHostAddresses(Globals.AgentsLoadbalancer)
+                    .Where(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                    .Select(ip => ip.ToString())
+                    .Distinct()
+                    .OrderBy(x => x)
+                    .ToArray();
+
+                if (resolved.Length > 0)
                 {
+                    bool changed = !resolved.SequenceEqual(_agents);
+                    _agentBytes = resolved.Select(a => Encoding.UTF8.GetBytes(a)).ToArray();
                     _agents = resolved;
-                    _resolvedAt = DateTime.UtcNow;
-                    Console.WriteLine($"[RendezvousRouter] Resolved {resolved.Length} agents: [{string.Join(", ", resolved)}]");
+                    Interlocked.Exchange(ref _resolvedAtTicks, DateTime.UtcNow.Ticks);
+
+                    // Only log on actual topology change, not every 15s refresh
+                    if (changed)
+                        Console.WriteLine($"[RendezvousRouter] Resolved {resolved.Length} agents: [{string.Join(", ", resolved)}]");
                 }
             }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[RendezvousRouter] DNS resolve failed: {ex.Message} — keeping previous {_agents.Length} agents");
-        }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[RendezvousRouter] DNS resolve failed: {ex.Message}");
+            }
 
-        lock (_lock)
-        {
             return _agents.Length > 0 ? _agents : new[] { Globals.AgentsLoadbalancer };
         }
     }
@@ -126,11 +157,11 @@ public static class RendezvousRouter
     }
 
     /// <summary>
-    /// MurmurHash3 32-bit — identical to gateway's implementation.
+    /// MurmurHash3 32-bit — Span overload, zero allocation.
+    /// Identical output to the string version (same bytes → same hash).
     /// </summary>
-    private static uint MurmurHash3(string key)
+    private static uint MurmurHash3(ReadOnlySpan<byte> bytes)
     {
-        var bytes = Encoding.UTF8.GetBytes(key);
         const uint seed = 0x9747b28c;
         const uint c1 = 0xcc9e2d51;
         const uint c2 = 0x1b873593;
@@ -141,7 +172,7 @@ public static class RendezvousRouter
 
         for (int i = 0; i < nblocks; i++)
         {
-            uint k = BitConverter.ToUInt32(bytes, i * 4);
+            uint k = BitConverter.ToUInt32(bytes.Slice(i * 4, 4));
             k *= c1;
             k = RotateLeft(k, 15);
             k *= c2;

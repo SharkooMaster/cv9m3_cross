@@ -298,7 +298,7 @@ public class CrossService : ICross
                         }
 
                         var batchRes = await client.BatchGetAsync(batchReq,
-                            deadline: DateTime.UtcNow.AddSeconds(30));
+                            deadline: DateTime.UtcNow.AddSeconds(10));
 
                         // Map results — only update sorted[idx] if this agent found a BETTER match
                         for (int j = 0; j < indexMap.Count && j < batchRes.Results.Count; j++)
@@ -407,6 +407,22 @@ public class CrossService : ICross
                 {
                     var agent = kv.Key;
                     var items = kv.Value;
+
+                    // Build batch request OUTSIDE try so retry can reuse it
+                    var batchReq = new BatchStoreVector_Req();
+                    foreach (var item in items)
+                    {
+                        var req = new StoreVector_Req
+                        {
+                            TargetIp = agent,
+                            Bitstring = item.bucketString,
+                            HeadRouteID = ""
+                        };
+                        req.Vector.AddRange(item.vector);
+                        req.Chunk = ByteString.CopyFrom(item.chunk);
+                        batchReq.Items.Add(req);
+                    }
+
                     try
                     {
                         var client = GrpcChannelFactory.GetClient(
@@ -414,36 +430,46 @@ public class CrossService : ICross
                             ctor: chan => new StoreVector.StoreVectorClient(chan),
                             roundRobin: false, port: 5000);
 
-                        var batchReq = new BatchStoreVector_Req();
-                        foreach (var item in items)
-                        {
-                            var req = new StoreVector_Req
-                            {
-                                TargetIp = agent,
-                                Bitstring = item.bucketString,
-                                HeadRouteID = ""
-                            };
-                            req.Vector.AddRange(item.vector);
-                            req.Chunk = ByteString.CopyFrom(item.chunk);
-                            batchReq.Items.Add(req);
-                        }
-
-                        // Generous deadline: batch may have thousands of chunks
                         var batchRes = await client.BatchStoreAsync(batchReq,
-                            deadline: DateTime.UtcNow.AddSeconds(60));
+                            deadline: DateTime.UtcNow.AddSeconds(20));
 
-                        // Map results back to sorted[] responses
                         for (int j = 0; j < items.Count && j < batchRes.Results.Count; j++)
                         {
-                            var res = batchRes.Results[j];
-                            items[j].response.BucketId = res.Id;
-                            items[j].response.BucketKey = res.Index;
+                            items[j].response.BucketId = batchRes.Results[j].Id;
+                            items[j].response.BucketKey = batchRes.Results[j].Index;
                         }
                         Interlocked.Add(ref totalStored, items.Count);
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // Batch failed — IDs stay 0, safety net in diff encoding handles it
+                        Console.WriteLine($"[Compress] BatchStore to {agent} failed: {ex.Message}");
+                        // Retry on a fallback agent — pick any live agent that isn't the failed one
+                        try
+                        {
+                            var allAgents = RendezvousRouter.GetAgents();
+                            var fallback = allAgents.FirstOrDefault(a => a != agent);
+                            if (fallback != null)
+                            {
+                                var retryClient = GrpcChannelFactory.GetClient(
+                                    target: fallback,
+                                    ctor: chan => new StoreVector.StoreVectorClient(chan),
+                                    roundRobin: false, port: 5000);
+                                var retryRes = await retryClient.BatchStoreAsync(batchReq,
+                                    deadline: DateTime.UtcNow.AddSeconds(15));
+                                for (int j = 0; j < items.Count && j < retryRes.Results.Count; j++)
+                                {
+                                    items[j].response.BucketId = retryRes.Results[j].Id;
+                                    items[j].response.BucketKey = retryRes.Results[j].Index;
+                                    items[j].response.TargetAgent = fallback;
+                                }
+                                Interlocked.Add(ref totalStored, items.Count);
+                                Console.WriteLine($"[Compress] Fallback store to {fallback} OK for {items.Count} chunks");
+                            }
+                        }
+                        catch (Exception retryEx)
+                        {
+                            Console.WriteLine($"[Compress] Fallback store also failed: {retryEx.Message}");
+                        }
                     }
                 }).ToList();
 
@@ -675,6 +701,22 @@ public class CrossService : ICross
             {
                 var agent = kv.Key;
                 var items = kv.Value;
+
+                // Build batch request OUTSIDE try so retry can reuse it
+                var batchReq = new BatchStoreVector_Req();
+                foreach (var item in items)
+                {
+                    var req = new StoreVector_Req
+                    {
+                        TargetIp = agent,
+                        Bitstring = item.bucketString,
+                        HeadRouteID = ""
+                    };
+                    req.Vector.AddRange(item.vector);
+                    req.Chunk = ByteString.CopyFrom(item.chunk);
+                    batchReq.Items.Add(req);
+                }
+
                 try
                 {
                     var client = GrpcChannelFactory.GetClient(
@@ -682,38 +724,51 @@ public class CrossService : ICross
                         ctor: chan => new StoreVector.StoreVectorClient(chan),
                         roundRobin: false, port: 5000);
 
-                    var batchReq = new BatchStoreVector_Req();
-                    foreach (var item in items)
-                    {
-                        var req = new StoreVector_Req
-                        {
-                            TargetIp = agent,
-                            Bitstring = item.bucketString,
-                            HeadRouteID = ""
-                        };
-                        req.Vector.AddRange(item.vector);
-                        req.Chunk = ByteString.CopyFrom(item.chunk);
-                        batchReq.Items.Add(req);
-                    }
-
                     var batchRes = await client.BatchStoreAsync(batchReq,
-                        deadline: DateTime.UtcNow.AddSeconds(60));
+                        deadline: DateTime.UtcNow.AddSeconds(15));
 
                     for (int j = 0; j < items.Count && j < batchRes.Results.Count; j++)
                     {
-                        var res = batchRes.Results[j];
-                        items[j].response.BucketId = res.Id;
-                        items[j].response.BucketKey = res.Index;
+                        items[j].response.BucketId = batchRes.Results[j].Id;
+                        items[j].response.BucketKey = batchRes.Results[j].Index;
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[Compress] Re-store to {agent} failed: {ex.Message}");
-                    // Clear references for failed re-stores → zeros-diff
-                    foreach (var item in items)
+                    Console.WriteLine($"[Compress] Re-store to {agent} failed: {ex.Message}, trying fallback...");
+                    try
                     {
-                        item.response.BucketId = 0;
-                        item.response.BucketKey = 0;
+                        var allAgents = RendezvousRouter.GetAgents();
+                        var fallback = allAgents.FirstOrDefault(a => a != agent);
+                        if (fallback != null)
+                        {
+                            var retryClient = GrpcChannelFactory.GetClient(
+                                target: fallback,
+                                ctor: chan => new StoreVector.StoreVectorClient(chan),
+                                roundRobin: false, port: 5000);
+                            foreach (var req in batchReq.Items)
+                                req.TargetIp = fallback;
+                            var retryRes = await retryClient.BatchStoreAsync(batchReq,
+                                deadline: DateTime.UtcNow.AddSeconds(10));
+                            for (int j = 0; j < items.Count && j < retryRes.Results.Count; j++)
+                            {
+                                items[j].response.BucketId = retryRes.Results[j].Id;
+                                items[j].response.BucketKey = retryRes.Results[j].Index;
+                                items[j].response.TargetAgent = fallback;
+                            }
+                            Console.WriteLine($"[Compress] Fallback re-store to {fallback} OK for {items.Count} chunks");
+                        }
+                        else
+                        {
+                            foreach (var item in items)
+                            { item.response.BucketId = 0; item.response.BucketKey = 0; }
+                        }
+                    }
+                    catch
+                    {
+                        // All agents failed — clear refs, zeros-diff will be mathematically correct (but bloated)
+                        foreach (var item in items)
+                        { item.response.BucketId = 0; item.response.BucketKey = 0; }
                     }
                 }
             }).ToList();
