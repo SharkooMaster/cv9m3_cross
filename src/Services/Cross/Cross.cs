@@ -423,39 +423,75 @@ public class CrossService : ICross
         {
             using var stage = Observability.StartStage("DiffEncode");
             var swStage = Stopwatch.StartNew();
+
+            // ── LAZY BASE CHUNK FETCH ──
+            // Agent search now returns metadata only (no chunk bytes).
+            // For matched chunks that need diff encoding, fetch base chunks in parallel.
+            // NeedToStore chunks don't need base fetch (base == original, empty diff).
+            // Exact matches (sim >= 0.999999) don't need base fetch (empty diff).
+            var baseChunkFetchIndices = new List<int>();
             for (int i = 0; i < sorted.Count; i++)
             {
                 if (sorted[i] == null)
                 {
-                    // This should NEVER happen — every chunk must get a response from the gateway.
-                    // If it does, the gateway stream broke. Log loudly but produce a zero-base diff
-                    // so the file is at least structurally valid (decompression will fetch a zero array).
-                    // Removed Console.WriteLine for performance (error still handled)
                     sorted[i] = new QueryResponseObject()
                     {
-                        BucketId = 0,
-                        BucketKey = 0,
-                        Similarity = 0,
-                        Chunk = ByteString.CopyFrom(new byte[Globals.chunkSize]),
-                        Index = i,
-                        Duplicate = false
+                        BucketId = 0, BucketKey = 0, Similarity = 0,
+                        Chunk = ByteString.Empty, Index = i, Duplicate = false
                     };
                 }
 
+                bool isExactMatch = sorted[i].Similarity >= 0.999999f;
+                bool skipDiff = (sorted[i].NeedToStore || isExactMatch) && sorted[i].BucketId != 0;
+
+                if (!skipDiff && sorted[i].BucketId != 0
+                    && (sorted[i].Chunk == null || sorted[i].Chunk.Length == 0))
+                {
+                    // This chunk matched a reference but has no base bytes — need to fetch
+                    baseChunkFetchIndices.Add(i);
+                }
+            }
+
+            // Parallel fetch all needed base chunks from agents
+            if (baseChunkFetchIndices.Count > 0)
+            {
+                var fetchSw = Stopwatch.StartNew();
+                var fetchedChunks = new byte[sorted.Count][];
+                var fetchTasks = baseChunkFetchIndices.Select(async idx =>
+                {
+                    try
+                    {
+                        var chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                            sorted[idx].BucketId, sorted[idx].BucketKey);
+                        if (chunk != null && chunk.Length > 0)
+                            fetchedChunks[idx] = chunk;
+                    }
+                    catch { /* Will fall back to zeros */ }
+                });
+                await Task.WhenAll(fetchTasks);
+                fetchSw.Stop();
+                Observability.RecordStage("FetchBaseChunks", fetchSw.Elapsed.TotalMilliseconds,
+                    ("count", baseChunkFetchIndices.Count));
+
+                // Inject fetched chunks into sorted results
+                for (int i = 0; i < sorted.Count; i++)
+                {
+                    if (fetchedChunks[i] != null)
+                        sorted[i].Chunk = ByteString.CopyFrom(fetchedChunks[i]);
+                }
+            }
+
+            // ── Now encode references + diffs ──
+            for (int i = 0; i < sorted.Count; i++)
+            {
                 // Encode reference (bucketId, bucketKey) — always 16 bytes
                 references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
                 references.AddRange(BitConverter.GetBytes(sorted[i].BucketKey));
 
                 if (sorted[i].BucketId == 0 && sorted[i].BucketKey == 0)
-                {
-                    // Removed Console.WriteLine for performance
                     zeroRefCount++;
-                }
 
-                // Fast path is valid ONLY when base == original:
-                //  - NeedToStore=true (new chunk stored; base is the same chunk), OR
-                //  - exact match (Similarity == 1.0 with a valid reference).
-                // NOTE: Duplicate=true alone only means "above threshold", not necessarily byte-identical.
+                // Fast path: base == original → empty diff
                 bool isExactMatch = sorted[i].Similarity >= 0.999999f;
                 if ((sorted[i].NeedToStore || isExactMatch) && sorted[i].BucketId != 0)
                 {
@@ -464,20 +500,12 @@ public class CrossService : ICross
                     continue;
                 }
 
-                // Compute diff: original chunk vs base chunk from server.
-                // - If base is similar (found reference): diff has entries for differing bytes
-                // - If BucketId == 0 (store failed): diff against zeros (degraded but decompressible)
+                // Compute diff: original chunk vs base chunk
                 byte[] baseChunk;
                 if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
-                {
                     baseChunk = sorted[i].Chunk.ToByteArray();
-                }
                 else
-                {
-                    // Missing chunk data — diff against zeros as fallback
-                    baseChunk = new byte[Globals.chunkSize];
-                    // Removed Console.WriteLine for performance (stats available via observability)
-                }
+                    baseChunk = new byte[Globals.chunkSize]; // zeros fallback
 
                 var diff = Misc.GetErrorEncoding(fileChunks[i], baseChunk);
                 perChunkPatches.Add(diff);
@@ -491,7 +519,6 @@ public class CrossService : ICross
             Observability.RecordStage("DiffEncode", swStage.Elapsed.TotalMilliseconds,
                 ("chunk_count", sorted.Count), ("empty_diff", emptyDiffCount), ("non_empty_diff", diffCount),
                 ("zero_ref", zeroRefCount));
-            // Removed Console.WriteLine for performance (stats available via observability)
         }
 
         // Error dictionary layout (v1.0.0 — diff only):
