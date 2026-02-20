@@ -53,7 +53,7 @@ public class CrossService : ICross
         if (toRet.Count > 0 && toRet[^1].Length < _chunkSize)
         {
             trimmedChunk.AddRange(toRet[^1]);
-            toRet.RemoveAt(toRet.Count - 1);
+        toRet.RemoveAt(toRet.Count - 1);
         }
 
         // CRITICAL: Validate all chunks are full-size - empty chunks should NEVER exist
@@ -267,84 +267,101 @@ public class CrossService : ICross
             var bestSims = new float[fileChunks.Count];
             Array.Fill(bestSims, -1f);
 
-            var batchTasks = agentChunkBuckets.Select(kv =>
+            // Split large batches to avoid gRPC message size limits (default 4MB).
+            // For 14,745 chunks × 65 buckets = ~958k queries, a single batch would be ~50MB+.
+            // Split into chunks of max 1000 queries per batch.
+            const int MAX_QUERIES_PER_BATCH = 1000;
+            var batchTasks = new List<Task>();
+
+            foreach (var kv in agentChunkBuckets)
             {
                 var agent = kv.Key;
                 var chunkBuckets = kv.Value; // Dict<chunkIndex, buckets on this agent>
-                return Task.Run(async () =>
+
+                // Convert to list for chunking
+                var allQueries = chunkBuckets.Select(kvp => (chunkIdx: kvp.Key, buckets: kvp.Value)).ToList();
+
+                // Split into batches of MAX_QUERIES_PER_BATCH
+                for (int batchStart = 0; batchStart < allQueries.Count; batchStart += MAX_QUERIES_PER_BATCH)
                 {
-                    try
+                    int batchEnd = Math.Min(batchStart + MAX_QUERIES_PER_BATCH, allQueries.Count);
+                    var batchQueries = allQueries.Skip(batchStart).Take(batchEnd - batchStart).ToList();
+
+                    batchTasks.Add(Task.Run(async () =>
                     {
-                        var client = GrpcChannelFactory.GetClient(
-                            target: agent,
-                            ctor: chan => new SearchVector.SearchVectorClient(chan),
-                            roundRobin: false, port: 5000);
-
-                        var batchReq = new BatchSearchVector_Req();
-                        var indexMap = new List<int>(chunkBuckets.Count);
-
-                        foreach (var (chunkIdx, buckets) in chunkBuckets)
+                        try
                         {
-                            var req = new SearchVector_Req
+                            var client = GrpcChannelFactory.GetClient(
+                                target: agent,
+                                ctor: chan => new SearchVector.SearchVectorClient(chan),
+                                roundRobin: false, port: 5000);
+
+                            var batchReq = new BatchSearchVector_Req();
+                            var indexMap = new List<int>(batchQueries.Count);
+
+                            foreach (var (chunkIdx, buckets) in batchQueries)
                             {
-                                Index = chunkIdx,
-                                MinimumSimilarity = MIN_THRESH,
-                                K = 1
-                            };
-                            req.Vector.AddRange(vectors[chunkIdx]);
-                            req.Bitstrings.AddRange(buckets);
-                            batchReq.Queries.Add(req);
-                            indexMap.Add(chunkIdx);
-                        }
-
-                        var batchRes = await client.BatchGetAsync(batchReq,
-                            deadline: DateTime.UtcNow.AddSeconds(10));
-
-                        // Map results — only update sorted[idx] if this agent found a BETTER match
-                        for (int j = 0; j < indexMap.Count && j < batchRes.Results.Count; j++)
-                        {
-                            var idx = indexMap[j];
-                            var res = batchRes.Results[j];
-
-                            if (!res.Save && res.Results.Count > 0)
-                            {
-                                var best = res.Results[0];
-                                float sim = best.Similarity;
-                                if (sim >= MIN_THRESH && sim > bestSims[idx])
+                                var req = new SearchVector_Req
                                 {
-                                    // Thread-safe: compare-and-swap the best similarity
-                                    float current;
-                                    do
-                                    {
-                                        current = Volatile.Read(ref bestSims[idx]);
-                                        if (sim <= current) break; // Another agent found better
-                                    } while (Interlocked.CompareExchange(ref bestSims[idx], sim, current) != current);
+                                    Index = chunkIdx,
+                                    MinimumSimilarity = MIN_THRESH,
+                                    K = 1
+                                };
+                                req.Vector.AddRange(vectors[chunkIdx]);
+                                req.Bitstrings.AddRange(buckets);
+                                batchReq.Queries.Add(req);
+                                indexMap.Add(chunkIdx);
+                            }
 
-                                    if (sim > current)
+                            var batchRes = await client.BatchGetAsync(batchReq,
+                                deadline: DateTime.UtcNow.AddSeconds(10));
+
+                            // Map results — only update sorted[idx] if this agent found a BETTER match
+                            for (int j = 0; j < indexMap.Count && j < batchRes.Results.Count; j++)
+                            {
+                                var idx = indexMap[j];
+                                var res = batchRes.Results[j];
+
+                                if (!res.Save && res.Results.Count > 0)
+                                {
+                                    var best = res.Results[0];
+                                    float sim = best.Similarity;
+                                    if (sim >= MIN_THRESH && sim > bestSims[idx])
                                     {
-                                        sorted[idx] = new QueryResponseObject
+                                        // Thread-safe: compare-and-swap the best similarity
+                                        float current;
+                                        do
                                         {
-                                            BucketId = best.BucketId,
-                                            BucketKey = (ulong)best.BucketKey,
-                                            Similarity = sim,
-                                            Chunk = best.Chunk, // base chunk bytes from agent MRU cache
-                                            Index = idx,
-                                            Duplicate = true,
-                                            NeedToStore = false,
-                                            TargetAgent = agent
-                                        };
+                                            current = Volatile.Read(ref bestSims[idx]);
+                                            if (sim <= current) break; // Another agent found better
+                                        } while (Interlocked.CompareExchange(ref bestSims[idx], sim, current) != current);
+
+                                        if (sim > current)
+                                        {
+                                            sorted[idx] = new QueryResponseObject
+                                            {
+                                                BucketId = best.BucketId,
+                                                BucketKey = (ulong)best.BucketKey,
+                                                Similarity = sim,
+                                                Chunk = best.Chunk, // base chunk bytes from agent MRU cache
+                                                Index = idx,
+                                                Duplicate = true,
+                                                NeedToStore = false,
+                                                TargetAgent = agent
+                                            };
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[Compress] BatchGet to {agent} failed: {ex.Message}");
-                        // Don't mark as need-to-store here — other agents may have matches
-                    }
-                });
-            }).ToList();
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[Compress] BatchGet to {agent} failed: {ex.Message}");
+                            // Don't mark as need-to-store here — other agents may have matches
+                        }
+                    }));
+                }
+            }
 
             await Task.WhenAll(batchTasks);
             phaseSw.Stop();
@@ -399,79 +416,97 @@ public class CrossService : ICross
                 list.Add((i, sorted[i], chunkBytes, vectors[i], bitStrings[i]));
             }
 
-            // Fire ONE BatchStore per agent — in parallel
+            // Fire BatchStore per agent — split large batches to avoid gRPC message size limits.
+            // Each chunk is ~5120 bytes + vector + metadata. 14,745 chunks = ~75MB+ per batch.
+            // Split into chunks of max 1000 items per batch.
+            const int MAX_STORES_PER_BATCH = 1000;
             int totalStored = 0;
             if (storeGroups.Count > 0)
             {
-                var batchTasks = storeGroups.Select(async kv =>
+                var batchTasks = new List<Task>();
+
+                foreach (var kv in storeGroups)
                 {
                     var agent = kv.Key;
                     var items = kv.Value;
 
-                    // Build batch request OUTSIDE try so retry can reuse it
-                    var batchReq = new BatchStoreVector_Req();
-                    foreach (var item in items)
+                    // Split into batches of MAX_STORES_PER_BATCH
+                    for (int batchStart = 0; batchStart < items.Count; batchStart += MAX_STORES_PER_BATCH)
                     {
-                        var req = new StoreVector_Req
-                        {
-                            TargetIp = agent,
-                            Bitstring = item.bucketString,
-                            HeadRouteID = ""
-                        };
-                        req.Vector.AddRange(item.vector);
-                        req.Chunk = ByteString.CopyFrom(item.chunk);
-                        batchReq.Items.Add(req);
-                    }
+                        int batchEnd = Math.Min(batchStart + MAX_STORES_PER_BATCH, items.Count);
+                        var batchItems = items.Skip(batchStart).Take(batchEnd - batchStart).ToList();
 
-                    try
-                    {
-                        var client = GrpcChannelFactory.GetClient(
-                            target: agent,
-                            ctor: chan => new StoreVector.StoreVectorClient(chan),
-                            roundRobin: false, port: 5000);
-
-                        var batchRes = await client.BatchStoreAsync(batchReq,
-                            deadline: DateTime.UtcNow.AddSeconds(20));
-
-                        for (int j = 0; j < items.Count && j < batchRes.Results.Count; j++)
+                        batchTasks.Add(Task.Run(async () =>
                         {
-                            items[j].response.BucketId = batchRes.Results[j].Id;
-                            items[j].response.BucketKey = batchRes.Results[j].Index;
-                        }
-                        Interlocked.Add(ref totalStored, items.Count);
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[Compress] BatchStore to {agent} failed: {ex.Message}");
-                        // Retry on a fallback agent — pick any live agent that isn't the failed one
-                        try
-                        {
-                            var allAgents = RendezvousRouter.GetAgents();
-                            var fallback = allAgents.FirstOrDefault(a => a != agent);
-                            if (fallback != null)
+                            // Build batch request OUTSIDE try so retry can reuse it
+                            var batchReq = new BatchStoreVector_Req();
+                            foreach (var item in batchItems)
                             {
-                                var retryClient = GrpcChannelFactory.GetClient(
-                                    target: fallback,
+                                var req = new StoreVector_Req
+                                {
+                                    TargetIp = agent,
+                                    Bitstring = item.bucketString,
+                                    HeadRouteID = ""
+                                };
+                                req.Vector.AddRange(item.vector);
+                                req.Chunk = ByteString.CopyFrom(item.chunk);
+                                batchReq.Items.Add(req);
+                            }
+
+                            try
+                            {
+                                var client = GrpcChannelFactory.GetClient(
+                                    target: agent,
                                     ctor: chan => new StoreVector.StoreVectorClient(chan),
                                     roundRobin: false, port: 5000);
-                                var retryRes = await retryClient.BatchStoreAsync(batchReq,
-                                    deadline: DateTime.UtcNow.AddSeconds(15));
-                                for (int j = 0; j < items.Count && j < retryRes.Results.Count; j++)
+
+                                var batchRes = await client.BatchStoreAsync(batchReq,
+                                    deadline: DateTime.UtcNow.AddSeconds(20));
+
+                                for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
                                 {
-                                    items[j].response.BucketId = retryRes.Results[j].Id;
-                                    items[j].response.BucketKey = retryRes.Results[j].Index;
-                                    items[j].response.TargetAgent = fallback;
+                                    batchItems[j].response.BucketId = batchRes.Results[j].Id;
+                                    batchItems[j].response.BucketKey = batchRes.Results[j].Index;
                                 }
-                                Interlocked.Add(ref totalStored, items.Count);
-                                Console.WriteLine($"[Compress] Fallback store to {fallback} OK for {items.Count} chunks");
+                                Interlocked.Add(ref totalStored, batchItems.Count);
                             }
-                        }
-                        catch (Exception retryEx)
-                        {
-                            Console.WriteLine($"[Compress] Fallback store also failed: {retryEx.Message}");
-                        }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"[Compress] BatchStore to {agent} failed: {ex.Message}");
+                                // Retry on a fallback agent — pick any live agent that isn't the failed one
+                                try
+                                {
+                                    var allAgents = RendezvousRouter.GetAgents();
+                                    var fallback = allAgents.FirstOrDefault(a => a != agent);
+                                    if (fallback != null)
+                                    {
+                                        var retryClient = GrpcChannelFactory.GetClient(
+                                            target: fallback,
+                                            ctor: chan => new StoreVector.StoreVectorClient(chan),
+                                            roundRobin: false, port: 5000);
+                                        // Update TargetIp for fallback
+                                        foreach (var req in batchReq.Items)
+                                            req.TargetIp = fallback;
+                                        var retryRes = await retryClient.BatchStoreAsync(batchReq,
+                                            deadline: DateTime.UtcNow.AddSeconds(15));
+                                        for (int j = 0; j < batchItems.Count && j < retryRes.Results.Count; j++)
+                                        {
+                                            batchItems[j].response.BucketId = retryRes.Results[j].Id;
+                                            batchItems[j].response.BucketKey = retryRes.Results[j].Index;
+                                            batchItems[j].response.TargetAgent = fallback;
+                                        }
+                                        Interlocked.Add(ref totalStored, batchItems.Count);
+                                        Console.WriteLine($"[Compress] Fallback store to {fallback} OK for {batchItems.Count} chunks");
+                                    }
+                                }
+                                catch (Exception retryEx)
+                                {
+                                    Console.WriteLine($"[Compress] Fallback store also failed: {retryEx.Message}");
+                                }
+                            }
+                        }));
                     }
-                }).ToList();
+                }
 
                 await Task.WhenAll(batchTasks);
             }
@@ -510,11 +545,11 @@ public class CrossService : ICross
             // zero entries in baseChunkFetchIndices.
             var baseChunkFetchIndices = new List<int>();
             for (int i = 0; i < sorted.Length; i++)
+        {
+            if (sorted[i] == null)
             {
-                if (sorted[i] == null)
+                sorted[i] = new QueryResponseObject()
                 {
-                    sorted[i] = new QueryResponseObject()
-                    {
                         BucketId = 0, BucketKey = 0, Similarity = 0,
                         Chunk = ByteString.Empty, Index = i, Duplicate = false
                     };
@@ -581,9 +616,9 @@ public class CrossService : ICross
                         if (!string.IsNullOrWhiteSpace(agent))
                         {
                             failedFetchStore.Add((idx, sorted[idx], chunkBytes, agent, queryInfos[idx].vector, queryInfos[idx].bitString));
-                        }
-                        else
-                        {
+                }
+                else
+                {
                             // No agent to store to — clear reference so zeros-diff is at least correct
                             sorted[idx].BucketId = 0;
                             sorted[idx].BucketKey = 0;
@@ -697,81 +732,95 @@ public class CrossService : ICross
                 list.Add((i, sorted[i], chunkBytes, vectors[i], bitStrings[i]));
             }
 
-            var reStoreTasks = reStoreGroups.Select(async kv =>
+            // Split large batches to avoid gRPC message size limits
+            const int MAX_RESTORE_PER_BATCH = 1000;
+            var reStoreTasks = new List<Task>();
+
+            foreach (var kv in reStoreGroups)
             {
                 var agent = kv.Key;
                 var items = kv.Value;
 
-                // Build batch request OUTSIDE try so retry can reuse it
-                var batchReq = new BatchStoreVector_Req();
-                foreach (var item in items)
+                // Split into batches of MAX_RESTORE_PER_BATCH
+                for (int batchStart = 0; batchStart < items.Count; batchStart += MAX_RESTORE_PER_BATCH)
                 {
-                    var req = new StoreVector_Req
-                    {
-                        TargetIp = agent,
-                        Bitstring = item.bucketString,
-                        HeadRouteID = ""
-                    };
-                    req.Vector.AddRange(item.vector);
-                    req.Chunk = ByteString.CopyFrom(item.chunk);
-                    batchReq.Items.Add(req);
-                }
+                    int batchEnd = Math.Min(batchStart + MAX_RESTORE_PER_BATCH, items.Count);
+                    var batchItems = items.Skip(batchStart).Take(batchEnd - batchStart).ToList();
 
-                try
-                {
-                    var client = GrpcChannelFactory.GetClient(
-                        target: agent,
-                        ctor: chan => new StoreVector.StoreVectorClient(chan),
-                        roundRobin: false, port: 5000);
-
-                    var batchRes = await client.BatchStoreAsync(batchReq,
-                        deadline: DateTime.UtcNow.AddSeconds(15));
-
-                    for (int j = 0; j < items.Count && j < batchRes.Results.Count; j++)
+                    reStoreTasks.Add(Task.Run(async () =>
                     {
-                        items[j].response.BucketId = batchRes.Results[j].Id;
-                        items[j].response.BucketKey = batchRes.Results[j].Index;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[Compress] Re-store to {agent} failed: {ex.Message}, trying fallback...");
-                    try
-                    {
-                        var allAgents = RendezvousRouter.GetAgents();
-                        var fallback = allAgents.FirstOrDefault(a => a != agent);
-                        if (fallback != null)
+                        // Build batch request OUTSIDE try so retry can reuse it
+                        var batchReq = new BatchStoreVector_Req();
+                        foreach (var item in batchItems)
                         {
-                            var retryClient = GrpcChannelFactory.GetClient(
-                                target: fallback,
+                            var req = new StoreVector_Req
+                            {
+                                TargetIp = agent,
+                                Bitstring = item.bucketString,
+                                HeadRouteID = ""
+                            };
+                            req.Vector.AddRange(item.vector);
+                            req.Chunk = ByteString.CopyFrom(item.chunk);
+                            batchReq.Items.Add(req);
+                        }
+
+                        try
+                        {
+                            var client = GrpcChannelFactory.GetClient(
+                                target: agent,
                                 ctor: chan => new StoreVector.StoreVectorClient(chan),
                                 roundRobin: false, port: 5000);
-                            foreach (var req in batchReq.Items)
-                                req.TargetIp = fallback;
-                            var retryRes = await retryClient.BatchStoreAsync(batchReq,
-                                deadline: DateTime.UtcNow.AddSeconds(10));
-                            for (int j = 0; j < items.Count && j < retryRes.Results.Count; j++)
+
+                            var batchRes = await client.BatchStoreAsync(batchReq,
+                                deadline: DateTime.UtcNow.AddSeconds(15));
+
+                            for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
                             {
-                                items[j].response.BucketId = retryRes.Results[j].Id;
-                                items[j].response.BucketKey = retryRes.Results[j].Index;
-                                items[j].response.TargetAgent = fallback;
+                                batchItems[j].response.BucketId = batchRes.Results[j].Id;
+                                batchItems[j].response.BucketKey = batchRes.Results[j].Index;
                             }
-                            Console.WriteLine($"[Compress] Fallback re-store to {fallback} OK for {items.Count} chunks");
                         }
-                        else
+                        catch (Exception ex)
                         {
-                            foreach (var item in items)
-                            { item.response.BucketId = 0; item.response.BucketKey = 0; }
+                            Console.WriteLine($"[Compress] Re-store to {agent} failed: {ex.Message}, trying fallback...");
+                            try
+                            {
+                                var allAgents = RendezvousRouter.GetAgents();
+                                var fallback = allAgents.FirstOrDefault(a => a != agent);
+                                if (fallback != null)
+                                {
+                                    var retryClient = GrpcChannelFactory.GetClient(
+                                        target: fallback,
+                                        ctor: chan => new StoreVector.StoreVectorClient(chan),
+                                        roundRobin: false, port: 5000);
+                                    foreach (var req in batchReq.Items)
+                                        req.TargetIp = fallback;
+                                    var retryRes = await retryClient.BatchStoreAsync(batchReq,
+                                        deadline: DateTime.UtcNow.AddSeconds(10));
+                                    for (int j = 0; j < batchItems.Count && j < retryRes.Results.Count; j++)
+                                    {
+                                        batchItems[j].response.BucketId = retryRes.Results[j].Id;
+                                        batchItems[j].response.BucketKey = retryRes.Results[j].Index;
+                                        batchItems[j].response.TargetAgent = fallback;
+                                    }
+                                    Console.WriteLine($"[Compress] Fallback re-store to {fallback} OK for {batchItems.Count} chunks");
+                                }
+                                else
+                                {
+                                    foreach (var item in batchItems)
+                                    { item.response.BucketId = 0; item.response.BucketKey = 0; }
+                                }
+                            }
+                            catch
+                            {
+                                // All agents failed — clear refs, zeros-diff will be mathematically correct (but bloated)
+                                foreach (var item in batchItems)
+                                { item.response.BucketId = 0; item.response.BucketKey = 0; }
+                            }
                         }
-                    }
-                    catch
-                    {
-                        // All agents failed — clear refs, zeros-diff will be mathematically correct (but bloated)
-                        foreach (var item in items)
-                        { item.response.BucketId = 0; item.response.BucketKey = 0; }
-                    }
+                    }));
                 }
-            }).ToList();
+            }
 
             await Task.WhenAll(reStoreTasks);
 

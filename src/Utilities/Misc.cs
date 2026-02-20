@@ -80,7 +80,7 @@ static public class Misc
                     Console.WriteLine($"[Misc] Creating flat projection matrix: {nComponents}x{dataSize} ({nComponents * dataSize * 4 / 1024}KB)");
                     var flat = new float[nComponents * dataSize];
                     var random = new Random(42); // Fixed seed for determinism
-
+    
                     for (int row = 0; row < nComponents; row++)
                     {
                         int rowOff = row * dataSize;
@@ -131,7 +131,7 @@ static public class Misc
             }
             lshVector[row] = sum;
         }
-
+    
         return lshVector;
     }
 
