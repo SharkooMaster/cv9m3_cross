@@ -5,6 +5,7 @@ import "google/protobuf/empty.proto";
 service StoreVector
 {
     rpc Store (StoreVector_Req) returns (StoreVector_Res);
+    rpc BatchStore (BatchStoreVector_Req) returns (BatchStoreVector_Res);
 }
 
 message StoreVector_Req
@@ -20,4 +21,18 @@ message StoreVector_Res
 {
     uint64 id = 1;
     uint64 index = 2;
+}
+
+// ── Batch store: many chunks in one gRPC call ──
+// Cross groups all NeedToStore chunks destined for the same agent
+// into one BatchStore call. Eliminates ~8000 per-chunk round trips per file.
+
+message BatchStoreVector_Req
+{
+    repeated StoreVector_Req items = 1;
+}
+
+message BatchStoreVector_Res
+{
+    repeated StoreVector_Res results = 1;
 }

@@ -293,113 +293,91 @@ public class CrossService : ICross
             }
         }
 
-        // OPTIMIZATION: Store chunks that need storing in parallel to get IDs, then return file fast
-        // This removes chunk bytes from queries and makes response non-blocking
+        // ── BATCH STORE: one gRPC call per agent instead of one per chunk ──
+        // Rendezvous hash already told us which agent owns each chunk.
+        // Group by agent, send ONE BatchStore per agent → ~5 calls instead of ~8,000.
         {
             using var stage = Observability.StartStage("StoreChunks");
             var swStage = Stopwatch.StartNew();
-            
-            // Collect all chunks that need storing
-            var chunksToStore = new List<(int index, QueryResponseObject response, byte[] chunk, string targetAgent, float[] vector, string bucketString)>();
+
+            // Collect all chunks that need storing, grouped by target agent
+            var agentGroups = new Dictionary<string, List<(int index, QueryResponseObject response, byte[] chunk, float[] vector, string bucketString)>>();
             for (int i = 0; i < sorted.Count; i++)
             {
-                if (sorted[i] != null && sorted[i].NeedToStore)
+                if (sorted[i] == null || !sorted[i].NeedToStore) continue;
+
+                if (!chunkMap.TryGetValue(i, out var chunkBytes))
+                    throw new InvalidOperationException($"FATAL: chunkMap missing entry for index {i}.");
+                if (chunkBytes == null || chunkBytes.Length == 0)
+                    throw new InvalidOperationException($"FATAL: Empty chunk at index {i}.");
+                if (chunkBytes.Length != Globals.chunkSize)
+                    throw new InvalidOperationException($"FATAL: Chunk at index {i} has size {chunkBytes.Length}, expected {Globals.chunkSize}.");
+                if (string.IsNullOrWhiteSpace(sorted[i].TargetAgent))
+                    throw new InvalidOperationException($"FATAL: TargetAgent is empty for chunk at index {i}.");
+
+                var agent = sorted[i].TargetAgent;
+                if (!agentGroups.TryGetValue(agent, out var list))
                 {
-                    // CRITICAL: chunkMap MUST have the chunk - if not, it's a bug
-                    if (!chunkMap.TryGetValue(i, out var chunkBytes))
-                    {
-                        throw new InvalidOperationException($"FATAL: chunkMap missing entry for index {i}. Expected {fileChunks.Count} chunks, got {sorted.Count} responses.");
-                    }
-                    
-                    // CRITICAL: Chunk bytes MUST be valid - this should NEVER be empty
-                    if (chunkBytes == null || chunkBytes.Length == 0)
-                    {
-                        throw new InvalidOperationException($"FATAL: Empty chunk at index {i} in chunkMap. This should NEVER happen - all chunks should be full-size (5120 bytes).");
-                    }
-                    
-                    if (chunkBytes.Length != Globals.chunkSize)
-                    {
-                        throw new InvalidOperationException($"FATAL: Chunk at index {i} has size {chunkBytes.Length}, expected {Globals.chunkSize}. Trim chunks should have been removed.");
-                    }
-                    
-                    // Validate target agent is set
-                    if (string.IsNullOrWhiteSpace(sorted[i].TargetAgent))
-                    {
-                        throw new InvalidOperationException($"FATAL: TargetAgent is empty for chunk at index {i}. Gateway should always set TargetAgent when NeedToStore=true.");
-                    }
-                    
-                    chunksToStore.Add((
-                        i,
-                        sorted[i],
-                        chunkBytes,
-                        sorted[i].TargetAgent,
-                        queries[i].Vector.ToArray(),
-                        queries[i].BucketString
-                    ));
+                    list = new List<(int, QueryResponseObject, byte[], float[], string)>();
+                    agentGroups[agent] = list;
                 }
+                list.Add((i, sorted[i], chunkBytes, queries[i].Vector.ToArray(), queries[i].BucketString));
             }
-            
-            // Store all chunks in parallel to get IDs
-            if (chunksToStore.Count > 0)
+
+            // Fire ONE BatchStore per agent — in parallel
+            int totalStored = 0;
+            if (agentGroups.Count > 0)
             {
-                var storeTasks = chunksToStore.Select(async item =>
+                var batchTasks = agentGroups.Select(async kv =>
                 {
+                    var agent = kv.Key;
+                    var items = kv.Value;
                     try
                     {
-                        // Call agent's StoreVector service directly
                         var client = GrpcChannelFactory.GetClient(
-                            target: item.targetAgent,
+                            target: agent,
                             ctor: chan => new StoreVector.StoreVectorClient(chan),
-                            roundRobin: false,
-                            port: 5000
-                        );
-                        
-                        var storeReq = new StoreVector_Req
+                            roundRobin: false, port: 5000);
+
+                        var batchReq = new BatchStoreVector_Req();
+                        foreach (var item in items)
                         {
-                            TargetIp = item.targetAgent,
-                            Bitstring = item.bucketString,
-                            HeadRouteID = ""
-                        };
-                        storeReq.Vector.AddRange(item.vector);
-                        
-                        // CRITICAL: Chunk bytes MUST be valid - this should NEVER be empty
-                        if (item.chunk == null || item.chunk.Length == 0)
-                        {
-                            throw new InvalidOperationException($"FATAL: Empty chunk at index {item.index} when storing. This should NEVER happen - all chunks should be full-size (5120 bytes).");
+                            var req = new StoreVector_Req
+                            {
+                                TargetIp = agent,
+                                Bitstring = item.bucketString,
+                                HeadRouteID = ""
+                            };
+                            req.Vector.AddRange(item.vector);
+                            req.Chunk = ByteString.CopyFrom(item.chunk);
+                            batchReq.Items.Add(req);
                         }
-                        
-                        if (item.chunk.Length != Globals.chunkSize)
+
+                        // Generous deadline: batch may have thousands of chunks
+                        var batchRes = await client.BatchStoreAsync(batchReq,
+                            deadline: DateTime.UtcNow.AddSeconds(60));
+
+                        // Map results back to sorted[] responses
+                        for (int j = 0; j < items.Count && j < batchRes.Results.Count; j++)
                         {
-                            throw new InvalidOperationException($"FATAL: Chunk at index {item.index} has size {item.chunk.Length}, expected {Globals.chunkSize} when storing.");
+                            var res = batchRes.Results[j];
+                            items[j].response.BucketId = res.Id;
+                            items[j].response.BucketKey = res.Index;
                         }
-                        
-                        storeReq.Chunk = ByteString.CopyFrom(item.chunk);
-                        
-                        var callOptions = new CallOptions(
-                            deadline: DateTime.UtcNow.AddSeconds(10),
-                            cancellationToken: CancellationToken.None
-                        );
-                        
-                        var storeRes = await client.StoreAsync(storeReq, callOptions);
-                        
-                        // Update response with actual IDs
-                        item.response.BucketId = storeRes.Id;
-                        item.response.BucketKey = storeRes.Index;
-                        
-                        return (item.index, true);
+                        Interlocked.Add(ref totalStored, items.Count);
                     }
-                    catch (Exception ex)
+                    catch
                     {
-                        // Store failed - leave IDs as 0, will diff against zeros
-                        return (item.index, false);
+                        // Batch failed — IDs stay 0, safety net in diff encoding handles it
                     }
                 }).ToList();
-                
-                await Task.WhenAll(storeTasks);
+
+                await Task.WhenAll(batchTasks);
             }
-            
+
             swStage.Stop();
-            Observability.RecordStage("StoreChunks", swStage.Elapsed.TotalMilliseconds, ("chunks_stored", chunksToStore.Count));
+            Observability.RecordStage("StoreChunks", swStage.Elapsed.TotalMilliseconds,
+                ("agents", agentGroups.Count), ("chunks_stored", totalStored));
         }
 
         // Stats: "references found" = chunks that re-used an existing base (not newly stored chunks).
@@ -424,11 +402,11 @@ public class CrossService : ICross
             using var stage = Observability.StartStage("DiffEncode");
             var swStage = Stopwatch.StartNew();
 
-            // ── LAZY BASE CHUNK FETCH ──
-            // Agent search now returns metadata only (no chunk bytes).
-            // For matched chunks that need diff encoding, fetch base chunks in parallel.
-            // NeedToStore chunks don't need base fetch (base == original, empty diff).
-            // Exact matches (sim >= 0.999999) don't need base fetch (empty diff).
+            // ── BASE CHUNK FETCH (fallback only) ──
+            // Agent search now returns base chunk bytes from its MRU cache (O(1)).
+            // This fetch is only needed for the RARE case where the agent's MRU cache
+            // evicted the chunk (>512MB of chunks on one agent). Most files will have
+            // zero entries in baseChunkFetchIndices.
             var baseChunkFetchIndices = new List<int>();
             for (int i = 0; i < sorted.Count; i++)
             {
@@ -483,6 +461,71 @@ public class CrossService : ICross
                 {
                     if (fetchedChunks[i] != null)
                         sorted[i].Chunk = ByteString.CopyFrom(fetchedChunks[i]);
+                }
+
+                // ── CRITICAL: Handle failed base chunk fetches ──
+                // If we have a valid reference (BucketId != 0) but couldn't fetch the base chunk,
+                // diffing against zeros would cause DATA CORRUPTION on decompression.
+                // Fix: store the chunk as its own reference (empty diff = base == original).
+                var failedFetchStore = new List<(int index, QueryResponseObject resp, byte[] chunk, string agent, float[] vector, string bucket)>();
+                foreach (var idx in baseChunkFetchIndices)
+                {
+                    if (fetchedChunks[idx] != null) continue; // fetch succeeded
+                    if (sorted[idx].BucketId == 0) continue;  // already no ref, zeros diff is correct
+
+                    // Base fetch FAILED with a valid reference → must store chunk to avoid corruption
+                    if (chunkMap.TryGetValue(idx, out var chunkBytes) && chunkBytes != null && chunkBytes.Length == Globals.chunkSize)
+                    {
+                        string agent = sorted[idx].TargetAgent ?? "";
+                        if (!string.IsNullOrWhiteSpace(agent))
+                        {
+                            failedFetchStore.Add((idx, sorted[idx], chunkBytes, agent, queries[idx].Vector.ToArray(), queries[idx].BucketString));
+                        }
+                        else
+                        {
+                            // No agent to store to — clear reference so zeros-diff is at least correct
+                            sorted[idx].BucketId = 0;
+                            sorted[idx].BucketKey = 0;
+                        }
+                    }
+                }
+
+                // Store failed-fetch chunks to get valid self-references (base == original → empty diff)
+                if (failedFetchStore.Count > 0)
+                {
+                    var fixSw = Stopwatch.StartNew();
+                    var fixTasks = failedFetchStore.Select(async item =>
+                    {
+                        try
+                        {
+                            var client = GrpcChannelFactory.GetClient(
+                                target: item.agent,
+                                ctor: chan => new StoreVector.StoreVectorClient(chan),
+                                roundRobin: false, port: 5000);
+                            var storeReq = new StoreVector_Req
+                            {
+                                TargetIp = item.agent,
+                                Bitstring = item.bucket,
+                                HeadRouteID = ""
+                            };
+                            storeReq.Vector.AddRange(item.vector);
+                            storeReq.Chunk = ByteString.CopyFrom(item.chunk);
+                            var storeRes = await client.StoreAsync(storeReq, new CallOptions(deadline: DateTime.UtcNow.AddSeconds(10)));
+                            item.resp.BucketId = storeRes.Id;
+                            item.resp.BucketKey = storeRes.Index;
+                            item.resp.NeedToStore = true;
+                            item.resp.Similarity = 1.0f; // base == original → empty diff
+                        }
+                        catch
+                        {
+                            // Store also failed — clear reference (zeros-diff is correct for (0,0) refs)
+                            item.resp.BucketId = 0;
+                            item.resp.BucketKey = 0;
+                        }
+                    }).ToList();
+                    await Task.WhenAll(fixTasks);
+                    fixSw.Stop();
+                    Console.WriteLine($"[Compress] Fixed {failedFetchStore.Count} failed base fetches by storing chunks ({fixSw.ElapsedMilliseconds}ms)");
                 }
             }
 
