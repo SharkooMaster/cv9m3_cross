@@ -113,6 +113,8 @@ public class CrossService : ICross
             {
                 Index = i,
                 BucketString = _bitStrings[i],
+                // NOTE: Chunk bytes are still sent in queries because gateway needs them when storing
+                // TODO: Optimize by only sending chunks when needed (requires new mechanism)
                 Chunk = ByteString.CopyFrom(_fileChunks[i])
             };
             toAdd.Vector.AddRange(_vectors[i]);
@@ -199,7 +201,7 @@ public class CrossService : ICross
             {
                 // Use cached result
                 queryResults[i] = cached;
-                Console.WriteLine($"{i}, sim: {cached.Similarity} (CACHED)");
+                // Removed Console.WriteLine for performance (hot path)
             }
             else
             {
@@ -223,7 +225,7 @@ public class CrossService : ICross
         {
             using var stage = Observability.StartStage("SearchBuckets");
             var swStage = Stopwatch.StartNew();
-            Console.WriteLine($"[Cross] Sending {queriesToSend.Count} queries to Gateway for search");
+            // Removed Console.WriteLine for performance (hot path)
             await foreach (var response in Globals.searchAllServiceClient.SearchAllStreamAsync(StreamQueries()))
             {
                 // IMPORTANT: Gateway streams results as they complete (out of order).
@@ -239,9 +241,9 @@ public class CrossService : ICross
                     _searchCache.CacheResult(query.Vector.ToArray(), query.BucketString, response);
                 }
 
-                Console.WriteLine($"[Cross] Query {originalIndex}: BucketId={response.BucketId}, sim={response.Similarity:F3}, Duplicate={response.Duplicate}, Chunk.Length={response.Chunk?.Length ?? 0}");
+                // Removed Console.WriteLine for performance (hot path - logs every query result)
             }
-            Console.WriteLine($"[Cross] Received {queryResults.Count} responses from Gateway");
+            // Removed Console.WriteLine for performance
             swStage.Stop();
             Observability.RecordStage("SearchBuckets", swStage.Elapsed.TotalMilliseconds, ("query_count", queriesToSend.Count));
         }
@@ -268,7 +270,7 @@ public class CrossService : ICross
         int zeroIdCount = sorted.Count(r => r != null && r.BucketId == 0 && r.BucketKey == 0);
         int validRefCount = sorted.Count(r => r != null && r.BucketId > 0);
         int emptyChunkRefs = sorted.Count(r => r != null && r.BucketId > 0 && (r.Chunk == null || r.Chunk.Length == 0));
-        Console.WriteLine($"[Cross] Chunk stats: total={totalChunks} refs_found={referencesFound} valid_ref={validRefCount} zero_ref={zeroIdCount} null={nullCount} empty_chunk_with_ref={emptyChunkRefs}");
+        // Removed Console.WriteLine for performance (stats available via observability)
 
         // Encode references and per-chunk error dictionary.
         // Diff-only format: chunks live on the server, compressed file has only references + diff patches.
@@ -288,7 +290,7 @@ public class CrossService : ICross
                     // This should NEVER happen — every chunk must get a response from the gateway.
                     // If it does, the gateway stream broke. Log loudly but produce a zero-base diff
                     // so the file is at least structurally valid (decompression will fetch a zero array).
-                    Console.WriteLine($"[DiffEncode] ERROR: No response for chunk [{i}] — store/search pipeline broke!");
+                    // Removed Console.WriteLine for performance (error still handled)
                     sorted[i] = new QueryResponseObject()
                     {
                         BucketId = 0,
@@ -306,7 +308,7 @@ public class CrossService : ICross
 
                 if (sorted[i].BucketId == 0 && sorted[i].BucketKey == 0)
                 {
-                    Console.WriteLine($"[DiffEncode] WARN: Chunk [{i}] has BucketId=0 — store failed, diff against zeros");
+                    // Removed Console.WriteLine for performance
                     zeroRefCount++;
                 }
 
@@ -331,8 +333,7 @@ public class CrossService : ICross
                 {
                     // Missing chunk data — diff against zeros as fallback
                     baseChunk = new byte[Globals.chunkSize];
-                    if (sorted[i].BucketId != 0)
-                        Console.WriteLine($"[DiffEncode] WARN: Chunk [{i}] has BucketId={sorted[i].BucketId} but no chunk data — diff against zeros");
+                    // Removed Console.WriteLine for performance (stats available via observability)
                 }
 
                 var diff = Misc.GetErrorEncoding(fileChunks[i], baseChunk);
@@ -347,7 +348,7 @@ public class CrossService : ICross
             Observability.RecordStage("DiffEncode", swStage.Elapsed.TotalMilliseconds,
                 ("chunk_count", sorted.Count), ("empty_diff", emptyDiffCount), ("non_empty_diff", diffCount),
                 ("zero_ref", zeroRefCount));
-            Console.WriteLine($"[DiffEncode] chunks={sorted.Count} empty_diff={emptyDiffCount} non_empty_diff={diffCount} zero_ref={zeroRefCount}");
+            // Removed Console.WriteLine for performance (stats available via observability)
         }
 
         // Error dictionary layout (v1.0.0 — diff only):
@@ -387,7 +388,7 @@ public class CrossService : ICross
 
         // Return
         sw.Stop();
-        Console.WriteLine($"[Cross] Total compression time: {sw.ElapsedMilliseconds}ms, output size: {toReturn.Length} bytes");
+        // Removed Console.WriteLine for performance (stats available via observability)
         return (toReturn, referencesFound, totalChunks);
     }
 
