@@ -168,13 +168,26 @@ static public class Misc
             if(dif != 0)
             {
                 int key = i - last_append;
-                // Allow duplicate keys - use List to store multiple entries with same key
-                // Example: {1:1, 1:255, 2:1, 2:20} means from 1 byte distance, corrections are 1 and 255, etc.
                 to_return.Add((key, dif));
                 last_append = i;
             }
         }
         return to_return;
+    }
+
+    /// <summary>
+    /// Count-only version of GetErrorEncoding — no list allocation.
+    /// Used by the bloat guard to check if a per-chunk diff would exceed chunk size.
+    /// </summary>
+    public static int GetErrorEncodingCount(byte[] a, byte[] b)
+    {
+        int count = 0;
+        for (int i = 0; i < a.Length; i++)
+        {
+            if (a[i] != b[i])
+                count++;
+        }
+        return count;
     }
 
     public static (byte[], int) GetErrorEncodingBytes(List<(int key, int value)> a, int offset)

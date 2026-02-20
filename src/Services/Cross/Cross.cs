@@ -19,9 +19,9 @@ namespace Cross.Services.Cross;
 
 public class CrossService : ICross
 {
-    // v1.0.0: Diff-only format. Chunks live on the server, compressed file has only references + patches.
-    // When base == original (newly stored chunk), patch list is empty → ~20 bytes per chunk.
-    private const string EncodingVersion = "v1.0.0";
+    // v2.0.0: Flat error encoding. One continuous delta stream across the entire stitched file.
+    // Chunks where base == original contribute ZERO entries. No per-chunk overhead at all.
+    private const string EncodingVersion = "v2.0.0";
     string headID = "";
     // OPTIMIZATION: Increased cache size from 10k to 100k for better hit rate
     private static readonly SearchCacheService _searchCache = new SearchCacheService(maxCacheSize: 100000);
@@ -466,15 +466,13 @@ public class CrossService : ICross
         int emptyChunkRefs = sorted.Count(r => r != null && r.BucketId > 0 && (r.Chunk == null || r.Chunk.Length == 0));
         // Removed Console.WriteLine for performance (stats available via observability)
 
-        // Encode references and per-chunk error dictionary.
-        // Diff-only format: chunks live on the server, compressed file has only references + diff patches.
-        // When base == original (newly stored chunk), diff is EMPTY → ~20 bytes per chunk.
-        var references = new List<byte>(sorted.Length * (sizeof(ulong) * 2));
-        var perChunkPatches = new List<List<(int key, int value)>>(sorted.Length);
+        // ── FLAT ERROR ENCODING PREP ──
+        // References are built once after all re-stores are finalized.
+        // Error encoding is a single flat stream across the entire stitched file.
         int diffCount = 0;
         int emptyDiffCount = 0;
         int zeroRefCount = 0;
-        var bloatedDiffRestore = new List<int>(); // chunks where diff > chunkSize → re-store
+        var bloatedDiffRestore = new List<int>();
         {
             using var stage = Observability.StartStage("DiffEncode");
             phaseSw.Restart();
@@ -606,58 +604,45 @@ public class CrossService : ICross
                 }
             }
 
-            // ── Now encode references + diffs ──
+            // ── Bloat guard pre-pass (count-only, no list allocation) ──
+            // We only need to detect chunks whose diff would be larger than the raw chunk.
+            // The actual diff is computed once in the flat encoding pass below.
             for (int i = 0; i < sorted.Length; i++)
             {
-                // Encode reference (bucketId, bucketKey) — always 16 bytes
-                references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
-                references.AddRange(BitConverter.GetBytes(sorted[i].BucketKey));
-
                 if (sorted[i].BucketId == 0 && sorted[i].BucketKey == 0)
+                {
                     zeroRefCount++;
+                    continue;
+                }
 
-                // Fast path: base == original → empty diff
                 bool isExactMatch = sorted[i].Similarity >= 0.999999f;
                 if ((sorted[i].NeedToStore || isExactMatch) && sorted[i].BucketId != 0)
                 {
-                    perChunkPatches.Add(new List<(int key, int value)>());
                     emptyDiffCount++;
                     continue;
                 }
 
-                // Compute diff: original chunk vs base chunk
+                // Count diffs only — no list allocation needed
                 byte[] baseChunk;
                 if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
                     baseChunk = sorted[i].Chunk.ToByteArray();
                 else
-                    baseChunk = new byte[Globals.chunkSize]; // zeros fallback
+                    baseChunk = new byte[Globals.chunkSize];
 
-                var diff = Misc.GetErrorEncoding(fileChunks[i], baseChunk);
+                int pairCount = Misc.GetErrorEncodingCount(fileChunks[i], baseChunk);
 
-                // ── BLOAT GUARD: if the diff encoding would be LARGER than the raw chunk,
-                // the reference is useless — it makes the file bigger not smaller.
-                // Encoding cost: 4 bytes (count) + diff.Count × 6 bytes (int key + short value).
-                // If that exceeds chunkSize, clear the reference → chunk will be re-stored
-                // in a second pass below and get an empty diff (base == original).
-                int diffEncodedBytes = 4 + diff.Count * 6; // int pairCount + pairs
-                if (diffEncodedBytes >= Globals.chunkSize && sorted[i].BucketId != 0)
+                // BLOAT GUARD: if per-chunk diff bytes would exceed chunk size, re-store as self-reference
+                if (pairCount * 6 >= Globals.chunkSize)
                 {
-                    // Mark for re-store: clear reference, set as needs-store
                     sorted[i].NeedToStore = true;
                     sorted[i].Similarity = 1.0f;
-                    // Keep BucketId/Key so we know where to store (same agent)
-                    // They'll be overwritten by the re-store pass
                     bloatedDiffRestore.Add(i);
-                    perChunkPatches.Add(new List<(int key, int value)>()); // placeholder empty
                     emptyDiffCount++;
                 }
                 else
                 {
-                    perChunkPatches.Add(diff);
-                    if (diff.Count == 0)
-                        emptyDiffCount++;
-                    else
-                        diffCount++;
+                    if (pairCount == 0) emptyDiffCount++;
+                    else diffCount++;
                 }
             }
             phaseSw.Stop();
@@ -735,39 +720,75 @@ public class CrossService : ICross
 
             await Task.WhenAll(reStoreTasks);
 
-            // Update the references bytes that were already written above
-            // We need to rebuild the references array since BucketId/Key changed
-            references.Clear();
-            for (int i = 0; i < sorted.Length; i++)
-            {
-                references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
-                references.AddRange(BitConverter.GetBytes(sorted[i].BucketKey));
-            }
-
             phaseSw.Stop();
             Console.WriteLine($"[Compress] BloatRestore: {phaseSw.ElapsedMilliseconds}ms, {bloatedDiffRestore.Count} chunks re-stored");
         }
 
-        // Error dictionary layout (v1.0.0 — diff only):
-        // <int chunkCount>
-        // Per chunk: <int pairCount> then <int deltaIndex><short delta> × pairCount
-        byte[] errorDictionaryBytes;
-        using (var errorMs = new MemoryStream())
-        using (var errorWriter = new BinaryWriter(errorMs, Encoding.UTF8, leaveOpen: true))
+        // ── Build references (once, after all re-stores are finalized) ──
+        var references = new List<byte>(sorted.Length * (sizeof(ulong) * 2));
+        for (int i = 0; i < sorted.Length; i++)
         {
-            errorWriter.Write(sorted.Length);
+            references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
+            references.AddRange(BitConverter.GetBytes(sorted[i].BucketKey));
+        }
+
+        // ── FLAT ERROR ENCODING (v2.0.0) ──
+        // Stitch all original chunks and all base chunks into two continuous buffers,
+        // run GetErrorEncoding once across the whole thing. Identical chunks contribute
+        // zero entries. No per-chunk overhead — just the diffs that exist.
+        byte[] errorDictionaryBytes;
+        {
+            using var stage = Observability.StartStage("FlatEncode");
+            phaseSw.Restart();
+
+            int totalBytes = sorted.Length * Globals.chunkSize;
+            byte[] originalBuffer = new byte[totalBytes];
+            byte[] baseBuffer = new byte[totalBytes];
+
             for (int i = 0; i < sorted.Length; i++)
             {
-                var patch = perChunkPatches[i];
-                errorWriter.Write(patch.Count); // 0 for empty diff (base == original)
-                foreach (var pair in patch)
+                int off = i * Globals.chunkSize;
+
+                // Original chunk
+                Buffer.BlockCopy(fileChunks[i], 0, originalBuffer, off, Globals.chunkSize);
+
+                // Determine base chunk
+                bool isExactMatch = sorted[i].Similarity >= 0.999999f;
+                if ((sorted[i].NeedToStore || isExactMatch) && sorted[i].BucketId != 0)
+                {
+                    // base == original → copy original (zero diff)
+                    Buffer.BlockCopy(fileChunks[i], 0, baseBuffer, off, Globals.chunkSize);
+                }
+                else if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
+                {
+                    // Matched chunk with base bytes from agent
+                    var baseBytes = sorted[i].Chunk.ToByteArray();
+                    Buffer.BlockCopy(baseBytes, 0, baseBuffer, off, Math.Min(baseBytes.Length, Globals.chunkSize));
+                }
+                // else: base is zeros (already zeroed by new byte[])
+            }
+
+            // ONE flat pass across the entire file
+            var flatDiff = Misc.GetErrorEncoding(originalBuffer, baseBuffer);
+
+            // Serialize: <int totalPairCount> + <int deltaIndex><short delta> × totalPairCount
+            using (var errorMs = new MemoryStream(4 + flatDiff.Count * 6))
+            using (var errorWriter = new BinaryWriter(errorMs, Encoding.UTF8, leaveOpen: true))
+            {
+                errorWriter.Write(flatDiff.Count);
+                foreach (var pair in flatDiff)
                 {
                     errorWriter.Write(pair.key);
                     errorWriter.Write((short)pair.value);
                 }
+                errorWriter.Flush();
+                errorDictionaryBytes = errorMs.ToArray();
             }
-            errorWriter.Flush();
-            errorDictionaryBytes = errorMs.ToArray();
+
+            phaseSw.Stop();
+            Console.WriteLine($"[Compress] FlatEncode: {phaseSw.ElapsedMilliseconds}ms, pairs={flatDiff.Count}, bytes={errorDictionaryBytes.Length}");
+            Observability.RecordStage("FlatEncode", phaseSw.Elapsed.TotalMilliseconds,
+                ("pairs", flatDiff.Count), ("bytes", errorDictionaryBytes.Length));
         }
 
         byte[] toReturn;
@@ -807,8 +828,8 @@ public class CrossService : ICross
         parseSw.Stop();
         Observability.RecordStage("Deserialize", parseSw.Elapsed.TotalMilliseconds);
 
-        if (!string.Equals(header.Version, "v1.0.0", StringComparison.Ordinal))
-            throw new InvalidDataException($"Unsupported encoding version '{header.Version}'. Expected v1.0.0.");
+        if (!string.Equals(header.Version, EncodingVersion, StringComparison.Ordinal))
+            throw new InvalidDataException($"Unsupported encoding version '{header.Version}'. Expected {EncodingVersion}.");
 
         int referencesOffset = header.PayloadStart;
         int errorOffset = referencesOffset + header.ReferencesLength;
@@ -829,97 +850,104 @@ public class CrossService : ICross
             references[i] = (bucketId, bucketIndex);
         }
 
-        // Parse error dictionary (v1.0.0 — diff only).
-        // Per chunk: <int pairCount> then <int deltaIndex><short delta> × pairCount
-        var chunkPatches = new List<(int key, short delta)>[chunkCount];
+        // ── Parse flat error encoding (v2.0.0) ──
+        // <int totalPairCount> then <int deltaIndex><short delta> × totalPairCount
+        (int deltaIndex, short delta)[] patches;
         using (var errorMs = new MemoryStream(file, errorOffset, header.ErrorLength, writable: false))
         using (var reader = new BinaryReader(errorMs, Encoding.UTF8, leaveOpen: true))
         {
-            int encodedChunkCount = reader.ReadInt32();
-            if (encodedChunkCount != chunkCount)
-                throw new InvalidDataException($"Error dictionary chunk count mismatch. refs={chunkCount}, errors={encodedChunkCount}");
+            int totalPairCount = reader.ReadInt32();
+            if (totalPairCount < 0)
+                throw new InvalidDataException($"Invalid negative total pair count: {totalPairCount}");
 
-            for (int i = 0; i < encodedChunkCount; i++)
+            patches = new (int, short)[totalPairCount];
+            for (int i = 0; i < totalPairCount; i++)
             {
-                int pairCount = reader.ReadInt32();
-                if (pairCount < 0)
-                    throw new InvalidDataException($"Invalid negative patch pair count ({pairCount}) at chunk {i}.");
-
-                var list = new List<(int key, short delta)>(pairCount);
-                for (int j = 0; j < pairCount; j++)
-                {
-                    int key = reader.ReadInt32();
-                    short delta = reader.ReadInt16();
-                    list.Add((key, delta));
-                }
-                chunkPatches[i] = list;
+                patches[i] = (reader.ReadInt32(), reader.ReadInt16());
             }
         }
 
-        using var output = new MemoryStream(chunkCount * Globals.chunkSize + (file.Length - trimOffset));
-        var applySw = Stopwatch.StartNew();
+        // ── Fetch all base chunks in parallel ──
+        var fetchSw = Stopwatch.StartNew();
+        var baseChunks = new byte[chunkCount][];
+        var fetchTasks = new Task[chunkCount];
         for (int i = 0; i < chunkCount; i++)
         {
-            // Fetch base chunk from server using the reference.
-            byte[] baseChunk;
             var reference = references[i];
             if (reference.BucketId == 0 && reference.BucketIndex == 0)
             {
-                // Store failed during compression — zero-base fallback (diff reconstructs from zeros).
-                baseChunk = new byte[Globals.chunkSize];
+                baseChunks[i] = new byte[Globals.chunkSize];
+                fetchTasks[i] = Task.CompletedTask;
             }
             else
             {
-                // OPTIMIZATION: Retry logic for chunks that might not be stored yet (background storage)
-                // This handles the race condition where decompression happens immediately after compression
-                baseChunk = await _chunkReferenceClient.GetChunkByReferenceAsync(reference.BucketId, reference.BucketIndex);
-                
-                if (baseChunk == null)
+                int idx = i;
+                var refCopy = reference;
+                fetchTasks[i] = Task.Run(async () =>
                 {
-                    // Retry with exponential backoff (chunk might still be storing in background)
-                    for (int retry = 0; retry < 3; retry++)
+                    byte[]? chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                        refCopy.BucketId, refCopy.BucketIndex);
+
+                    if (chunk == null)
                     {
-                        await Task.Delay(100 * (int)Math.Pow(2, retry)); // 100ms, 200ms, 400ms
-                        baseChunk = await _chunkReferenceClient.GetChunkByReferenceAsync(reference.BucketId, reference.BucketIndex);
-                        if (baseChunk != null)
-                            break;
+                        // Retry with exponential backoff
+                        for (int retry = 0; retry < 3; retry++)
+                        {
+                            await Task.Delay(100 * (int)Math.Pow(2, retry));
+                            chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                                refCopy.BucketId, refCopy.BucketIndex);
+                            if (chunk != null) break;
+                        }
+                        if (chunk == null)
+                            throw new InvalidDataException(
+                                $"Missing base chunk for reference ({refCopy.BucketId}, {refCopy.BucketIndex}).");
                     }
-                    
-                    if (baseChunk == null)
-                        throw new InvalidDataException($"Missing base chunk for reference ({reference.BucketId}, {reference.BucketIndex}).");
-                }
+                    baseChunks[idx] = chunk;
+                });
             }
-
-            if (baseChunk.Length != Globals.chunkSize)
-                throw new InvalidDataException($"Base chunk length {baseChunk.Length} differs from chunk size {Globals.chunkSize} for chunk {i}.");
-
-            // Apply diff patches to reconstruct original chunk.
-            // Empty patch list (pairCount == 0) means base == original → just write the base.
-            int cursor = 0;
-            foreach (var (deltaIndex, deltaValue) in chunkPatches[i])
-            {
-                cursor += deltaIndex;
-                if (cursor < 0 || cursor >= baseChunk.Length)
-                    throw new InvalidDataException($"Patch index out of range at chunk {i}, cursor {cursor}.");
-
-                int patched = baseChunk[cursor] + deltaValue;
-                if (patched < 0 || patched > 255)
-                    throw new InvalidDataException($"Patched byte out of range at chunk {i}, index {cursor}.");
-                baseChunk[cursor] = (byte)patched;
-            }
-
-            await output.WriteAsync(baseChunk);
         }
+        await Task.WhenAll(fetchTasks);
+        fetchSw.Stop();
+        Observability.RecordStage("FetchBaseChunks", fetchSw.Elapsed.TotalMilliseconds, ("chunk_count", chunkCount));
 
-        // Final trim chunk (if any) is appended verbatim.
-        if (trimOffset < file.Length)
+        // ── Stitch base chunks into one continuous buffer ──
+        var applySw = Stopwatch.StartNew();
+        byte[] baseBuffer = new byte[chunkCount * Globals.chunkSize];
+        for (int i = 0; i < chunkCount; i++)
         {
-            await output.WriteAsync(file.AsMemory(trimOffset, file.Length - trimOffset));
+            if (baseChunks[i].Length != Globals.chunkSize)
+                throw new InvalidDataException(
+                    $"Base chunk {i} has length {baseChunks[i].Length}, expected {Globals.chunkSize}.");
+            Buffer.BlockCopy(baseChunks[i], 0, baseBuffer, i * Globals.chunkSize, Globals.chunkSize);
         }
-        applySw.Stop();
-        Observability.RecordStage("ApplyPatchAndEgress", applySw.Elapsed.TotalMilliseconds, ("chunk_count", chunkCount));
 
-        return output.ToArray();
+        // ── Apply flat error encoding across the entire buffer ──
+        int cursor = 0;
+        foreach (var (deltaIndex, delta) in patches)
+        {
+            cursor += deltaIndex;
+            if (cursor < 0 || cursor >= baseBuffer.Length)
+                throw new InvalidDataException(
+                    $"Patch cursor {cursor} out of range (buffer size {baseBuffer.Length}).");
+
+            int patched = baseBuffer[cursor] + delta;
+            if (patched < 0 || patched > 255)
+                throw new InvalidDataException($"Patched byte {patched} out of range at cursor {cursor}.");
+            baseBuffer[cursor] = (byte)patched;
+        }
+
+        // ── Assemble output: reconstructed buffer + trim chunk ──
+        int trimLength = file.Length - trimOffset;
+        byte[] result = new byte[baseBuffer.Length + trimLength];
+        Buffer.BlockCopy(baseBuffer, 0, result, 0, baseBuffer.Length);
+        if (trimLength > 0)
+            Buffer.BlockCopy(file, trimOffset, result, baseBuffer.Length, trimLength);
+
+        applySw.Stop();
+        Observability.RecordStage("ApplyPatchAndEgress", applySw.Elapsed.TotalMilliseconds,
+            ("chunk_count", chunkCount), ("patches", patches.Length));
+
+        return result;
     }
 
     public async Task<byte[]> _CompressFile(byte[] _file)
