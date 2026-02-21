@@ -530,6 +530,9 @@ public class CrossService : ICross
                                 catch (Exception retryEx)
                                 {
                                     Console.WriteLine($"[Compress] Fallback store also failed: {retryEx.Message}");
+                                    // Both primary and fallback failed — clear refs to prevent dangling references
+                                    foreach (var item in batchItems)
+                                    { item.response.BucketId = 0; item.response.BucketKey = 0; }
                                 }
                             }
                         }));
