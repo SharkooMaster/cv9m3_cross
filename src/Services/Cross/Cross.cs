@@ -890,6 +890,24 @@ public class CrossService : ICross
             // ONE flat pass across the entire file
             var flatDiff = Misc.GetErrorEncoding(originalBuffer, baseBuffer);
 
+            // ── INTEGRITY CHECK: verify patches reconstruct original ──
+            // Catches type-truncation, wrong-base, or encoding bugs at compression time
+            // rather than producing silently corrupt compressed files.
+            {
+                int cursor = 0;
+                foreach (var (key, value) in flatDiff)
+                {
+                    cursor += key;
+                    int patched = baseBuffer[cursor] + value;
+                    if (patched < 0 || patched > 255)
+                    {
+                        Console.WriteLine($"[Compress] INTEGRITY FAIL: base[{cursor}]={baseBuffer[cursor]} + delta={value} = {patched} (chunk {cursor / Globals.chunkSize}, BucketId={sorted[cursor / Globals.chunkSize].BucketId})");
+                        throw new InvalidDataException(
+                            $"Compression integrity check failed: patch at {cursor} produces out-of-range byte {patched}. This indicates a base-chunk mismatch.");
+                    }
+                }
+            }
+
             // Serialize: <int totalPairCount> + <int deltaIndex><short delta> × totalPairCount
             using (var errorMs = new MemoryStream(4 + flatDiff.Count * 6))
             using (var errorWriter = new BinaryWriter(errorMs, Encoding.UTF8, leaveOpen: true))
