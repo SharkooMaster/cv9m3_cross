@@ -1089,7 +1089,7 @@ public class CrossService : ICross
                 var refCopy = reference;
                 fetchTasks[i] = Task.Run(async () =>
                 {
-                    // Derive bitstring from bucket ID → deterministic agent routing
+                    // Derive bitstring from bucket ID → deterministic agent routing (stable by node name)
                     string bitstring = UlongToBitstring(refCopy.BucketId);
                     string targetAgent = RendezvousRouter.PickAgent(bitstring);
 
@@ -1102,31 +1102,27 @@ public class CrossService : ICross
                     }
                     else
                     {
-                        // Fallback: query all agents (handles agent-down or post-rebalance scenarios).
-                        chunk = await _chunkReferenceClient.GetChunkByReferenceFromAnyAgentAsync(
-                            refCopy.BucketId, refCopy.BucketIndex);
-                        if (chunk != null)
-                            Interlocked.Increment(ref fallbackHits);
-                    }
-
-                    if (chunk == null)
-                    {
-                        // Retry with exponential backoff.
-                        for (int retry = 0; retry < 2; retry++)
+                        // Retry the SAME primary agent with exponential backoff.
+                        // DO NOT query random agents — they may have different chunks
+                        // at the same (bucketId, bucketIndex) from a previous routing era.
+                        for (int retry = 0; retry < 3; retry++)
                         {
-                            await Task.Delay(100 * (int)Math.Pow(2, retry));
-                            chunk = await _chunkReferenceClient.GetChunkByReferenceFromAnyAgentAsync(
-                                refCopy.BucketId, refCopy.BucketIndex);
+                            await Task.Delay(50 * (int)Math.Pow(2, retry)); // 50ms, 100ms, 200ms
+                            chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                                refCopy.BucketId, refCopy.BucketIndex, targetAgent);
                             if (chunk != null)
                             {
                                 Interlocked.Increment(ref fallbackHits);
                                 break;
                             }
                         }
-                        if (chunk == null)
-                            throw new InvalidDataException(
-                                $"Missing base chunk for reference ({refCopy.BucketId}, {refCopy.BucketIndex}).");
                     }
+
+                    if (chunk == null)
+                        throw new InvalidDataException(
+                            $"Missing base chunk for reference ({refCopy.BucketId}, {refCopy.BucketIndex}). " +
+                            $"Agent={targetAgent}, Bitstring={bitstring}");
+
                     baseChunks[idx] = chunk;
                 });
             }

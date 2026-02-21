@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+import "google/protobuf/empty.proto";
+
+service GetNodeInfo
+{
+    rpc Get (google.protobuf.Empty) returns (GetNodeInfo_Result);
+}
+
+message GetNodeInfo_Result
+{
+    string ip = 1;
+    uint64 id = 2;
+    string node_name = 3;
+}

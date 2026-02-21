@@ -1,104 +1,177 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using System.Threading;
+using Google.Protobuf.WellKnownTypes;
 
 namespace Cross.Utilities;
 
 /// <summary>
-/// Rendezvous (Highest Random Weight) hashing — same algorithm as Gateway.
-/// Cross uses this to route directly to agents, bypassing the gateway in the hot path.
+/// Rendezvous (Highest Random Weight) hashing — uses STABLE Kubernetes node names
+/// for the hash key, NOT ephemeral pod IPs.
 ///
-/// Performance: PickAgent is called ~290,000 times per 4000-chunk file (65 buckets × N chunks).
+/// Why: DaemonSet agent pods get new IPs on every restart / helm upgrade.
+/// If we hash against IPs, routing reshuffles and compressed-file references
+/// resolve to the WRONG agent (which may have a different chunk at the same
+/// (bucketId, bucketIndex)), causing silent data corruption.
+///
+/// Node names (spec.nodeName) never change. Same node → same data (hostPath).
+/// Hash by node name → routing is stable → no corruption.
+///
+/// Performance: PickAgent is called ~290,000 times per 4000-chunk file.
 /// This implementation uses zero heap allocations in the hot path (stackalloc + Span).
+/// Discovery (GetNodeInfo calls) happens once every 15 seconds in the background.
 /// </summary>
 public static class RendezvousRouter
 {
     private static readonly object _lock = new();
-    private static volatile string[] _agents = Array.Empty<string>();
-    private static volatile byte[][] _agentBytes = Array.Empty<byte[]>(); // Pre-encoded IPs
-    private static long _resolvedAtTicks = 0; // DateTime.UtcNow.Ticks — value type safe
+
+    // ── Stable routing data ──
+    // Hash keys: node names (stable across pod restarts)
+    // Connection targets: pod IPs (current, ephemeral)
+    private static volatile string[] _nodeNames = Array.Empty<string>();       // sorted, for deterministic hashing
+    private static volatile byte[][] _nodeNameBytes = Array.Empty<byte[]>();   // pre-encoded for zero-alloc hash
+    private static volatile string[] _nodeIps = Array.Empty<string>();         // parallel array: nodeNames[i] → nodeIps[i]
+    private static long _resolvedAtTicks = 0;
 
     /// <summary>
     /// Pick the owning agent for a bucket using rendezvous hashing.
-    /// Deterministic: same (bucket, agent set) always returns the same agent.
+    /// Deterministic: same (bucket, node set) always returns the same agent IP.
     /// ZERO heap allocations — uses stackalloc for the hash buffer.
+    /// Returns the pod IP of the agent to connect to.
     /// </summary>
     public static string PickAgent(string bucketString)
     {
-        var agents = GetAgents();
-        if (agents.Length == 0) return Globals.AgentsLoadbalancer;
-        if (agents.Length == 1) return agents[0];
+        var nodeNames = _nodeNames;
+        var nodeIps = _nodeIps;
 
-        var agentBytesLocal = _agentBytes;
+        if (nodeNames.Length == 0)
+        {
+            // Not yet discovered — trigger discovery and fall back to load balancer
+            GetAgents();
+            nodeNames = _nodeNames;
+            nodeIps = _nodeIps;
+            if (nodeNames.Length == 0) return Globals.AgentsLoadbalancer;
+        }
+        if (nodeNames.Length == 1) return nodeIps[0];
 
-        // Bucket strings are always 64 ASCII chars. Agent IPs max ~15 chars.
-        // Buffer: bucket(64) + "|"(1) + agent(max 20) = 85 bytes max. Use 96 for safety.
+        var nodeNameBytesLocal = _nodeNameBytes;
+
+        // Node names are typically 5-63 chars. Buffer: bucket(64) + "|"(1) + nodeName(max 63) = 128. Use 160 for safety.
         int bucketLen = bucketString.Length;
-        Span<byte> buf = stackalloc byte[96];
+        Span<byte> buf = stackalloc byte[160];
 
         // Encode bucket string (ASCII only — '0' and '1')
         for (int c = 0; c < bucketLen; c++)
             buf[c] = (byte)bucketString[c];
         buf[bucketLen] = (byte)'|';
 
-        string bestAgent = agents[0];
+        string bestIp = nodeIps[0];
         uint bestHash = 0;
 
-        for (int i = 0; i < agents.Length; i++)
+        for (int i = 0; i < nodeNames.Length; i++)
         {
-            var ab = agentBytesLocal[i];
-            ab.AsSpan().CopyTo(buf.Slice(bucketLen + 1));
-            int totalLen = bucketLen + 1 + ab.Length;
+            var nb = nodeNameBytesLocal[i];
+            nb.AsSpan().CopyTo(buf.Slice(bucketLen + 1));
+            int totalLen = bucketLen + 1 + nb.Length;
 
             uint hash = MurmurHash3(buf.Slice(0, totalLen));
             if (hash > bestHash)
             {
                 bestHash = hash;
-                bestAgent = agents[i];
+                bestIp = nodeIps[i];
             }
         }
-        return bestAgent;
+        return bestIp;
     }
 
     /// <summary>
-    /// Resolve agent IPs from the headless K8s service. Cached 15s.
-    /// Double-checked locking: only ONE thread resolves DNS on cache miss.
-    /// Logs only on actual change, not on every cache refresh.
+    /// Resolve agents: DNS → pod IPs → GetNodeInfo gRPC → node names.
+    /// Cached 15s. Only ONE thread resolves at a time.
+    /// Returns the current pod IPs (for callers that need them).
     /// </summary>
     public static string[] GetAgents()
     {
         // Fast path: lock-free cache check
-        var agents = _agents;
         long resolvedTicks = Interlocked.Read(ref _resolvedAtTicks);
-        if (agents.Length > 0 && (DateTime.UtcNow.Ticks - resolvedTicks) < TimeSpan.FromSeconds(15).Ticks)
-            return agents;
+        if (_nodeNames.Length > 0 && (DateTime.UtcNow.Ticks - resolvedTicks) < TimeSpan.FromSeconds(15).Ticks)
+            return _nodeIps;
 
-        // Slow path: resolve DNS (only one thread at a time)
+        // Slow path: resolve DNS + GetNodeInfo (only one thread)
         lock (_lock)
         {
-            // Double-check inside lock (another thread may have resolved already)
-            if (_agents.Length > 0 && (DateTime.UtcNow.Ticks - _resolvedAtTicks) < TimeSpan.FromSeconds(15).Ticks)
-                return _agents;
+            if (_nodeNames.Length > 0 && (DateTime.UtcNow.Ticks - _resolvedAtTicks) < TimeSpan.FromSeconds(15).Ticks)
+                return _nodeIps;
 
             try
             {
-                var resolved = Dns.GetHostAddresses(Globals.AgentsLoadbalancer)
+                var podIps = Dns.GetHostAddresses(Globals.AgentsLoadbalancer)
                     .Where(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
                     .Select(ip => ip.ToString())
                     .Distinct()
                     .OrderBy(x => x)
                     .ToArray();
 
-                if (resolved.Length > 0)
+                if (podIps.Length == 0)
                 {
-                    bool changed = !resolved.SequenceEqual(_agents);
-                    _agentBytes = resolved.Select(a => Encoding.UTF8.GetBytes(a)).ToArray();
-                    _agents = resolved;
                     Interlocked.Exchange(ref _resolvedAtTicks, DateTime.UtcNow.Ticks);
+                    return _nodeIps.Length > 0 ? _nodeIps : new[] { Globals.AgentsLoadbalancer };
+                }
 
-                    // Only log on actual topology change, not every 15s refresh
-                    if (changed)
-                        Console.WriteLine($"[RendezvousRouter] Resolved {resolved.Length} agents: [{string.Join(", ", resolved)}]");
+                // Call GetNodeInfo on each agent to get stable node names
+                var entries = new List<(string nodeName, string podIp)>(podIps.Length);
+                var tasks = podIps.Select(async ip =>
+                {
+                    try
+                    {
+                        var client = GrpcChannelFactory.GetClient(
+                            target: ip,
+                            ctor: chan => new GetNodeInfo.GetNodeInfoClient(chan),
+                            roundRobin: false,
+                            port: 5000);
+
+                        var res = await client.GetAsync(
+                            new Empty(),
+                            deadline: DateTime.UtcNow.AddSeconds(3));
+
+                        string nodeName = res.NodeName;
+                        // Fallback: if agent hasn't been updated yet, use IP as hash key
+                        if (string.IsNullOrWhiteSpace(nodeName))
+                            nodeName = ip;
+
+                        return (nodeName, ip);
+                    }
+                    catch
+                    {
+                        // Agent unreachable — use IP as hash key (backward compat)
+                        return (ip, ip);
+                    }
+                }).ToArray();
+
+                Task.WaitAll(tasks);
+                foreach (var t in tasks)
+                    entries.Add(t.Result);
+
+                // Sort by node name for deterministic ordering
+                entries.Sort((a, b) => string.Compare(a.nodeName, b.nodeName, StringComparison.Ordinal));
+
+                var newNodeNames = entries.Select(e => e.nodeName).ToArray();
+                var newNodeIps = entries.Select(e => e.podIp).ToArray();
+                var newNodeNameBytes = newNodeNames.Select(n => Encoding.UTF8.GetBytes(n)).ToArray();
+
+                bool changed = !newNodeNames.SequenceEqual(_nodeNames) || !newNodeIps.SequenceEqual(_nodeIps);
+
+                _nodeNameBytes = newNodeNameBytes;
+                _nodeNames = newNodeNames;
+                _nodeIps = newNodeIps;
+                Interlocked.Exchange(ref _resolvedAtTicks, DateTime.UtcNow.Ticks);
+
+                if (changed)
+                {
+                    var pairs = entries.Select(e => e.nodeName == e.podIp
+                        ? e.podIp
+                        : $"{e.nodeName}={e.podIp}");
+                    Console.WriteLine($"[RendezvousRouter] Resolved {entries.Count} agents: [{string.Join(", ", pairs)}]");
                 }
             }
             catch (Exception ex)
@@ -106,7 +179,7 @@ public static class RendezvousRouter
                 Console.WriteLine($"[RendezvousRouter] DNS resolve failed: {ex.Message}");
             }
 
-            return _agents.Length > 0 ? _agents : new[] { Globals.AgentsLoadbalancer };
+            return _nodeIps.Length > 0 ? _nodeIps : new[] { Globals.AgentsLoadbalancer };
         }
     }
 

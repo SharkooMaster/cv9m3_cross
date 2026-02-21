@@ -44,8 +44,7 @@ public class ChunkReferenceServiceClient
         }
         catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
         {
-            // Expected: GetChunkByReferenceFromAnyAgentAsync cancels remaining calls
-            // when the first agent returns a valid chunk. No need to log.
+            // Expected cancellation (e.g. timeout / caller abort). No need to log.
             return null;
         }
         catch (RpcException ex)
@@ -60,44 +59,10 @@ public class ChunkReferenceServiceClient
         }
     }
 
-    /// <summary>
-    /// Decompression fallback: when target ownership is unknown, query all agents in parallel
-    /// and return the first successful chunk. This guarantees correctness when references
-    /// don't carry TargetAgent metadata.
-    /// </summary>
-    public async Task<byte[]?> GetChunkByReferenceFromAnyAgentAsync(
-        ulong bucketId,
-        ulong bucketIndex,
-        CancellationToken ct = default)
-    {
-        var agents = RendezvousRouter.GetAgents();
-        if (agents.Length == 0)
-        {
-            return await GetChunkByReferenceAsync(bucketId, bucketIndex, null, ct);
-        }
-
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var tasks = new List<Task<byte[]?>>(agents.Length);
-
-        foreach (var agent in agents)
-        {
-            tasks.Add(GetChunkByReferenceAsync(bucketId, bucketIndex, agent, linkedCts.Token));
-        }
-
-        while (tasks.Count > 0)
-        {
-            var completed = await Task.WhenAny(tasks);
-            tasks.Remove(completed);
-
-            var chunk = await completed;
-            if (chunk != null && chunk.Length > 0)
-            {
-                linkedCts.Cancel(); // best-effort cancel remaining calls
-                return chunk;
-            }
-        }
-
-        return null;
-    }
+    // GetChunkByReferenceFromAnyAgentAsync REMOVED.
+    // Querying all agents is UNSAFE: different agents may hold different chunks
+    // at the same (bucketId, bucketIndex) from a previous routing era.
+    // With stable node-name-based rendezvous hashing, the primary agent is always
+    // deterministic. If it can't find the chunk, the chunk is genuinely lost.
 }
 
