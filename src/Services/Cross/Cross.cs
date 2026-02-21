@@ -21,11 +21,26 @@ public class CrossService : ICross
 {
     // v2.0.0: Flat error encoding. One continuous delta stream across the entire stitched file.
     // Chunks where base == original contribute ZERO entries. No per-chunk overhead at all.
-    private const string EncodingVersion = "v2.0.0";
+    // v2.0.1: BucketId is now a deterministic ulong derived from the 64-bit bitstring (not auto-increment).
+    //         Decompression converts BucketId → bitstring → RendezvousRouter.PickAgent() for correct routing.
+    //         Wire format unchanged from v2.0.0 — same (bucketId, bucketKey) pairs, just the ID semantics changed.
+    private const string EncodingVersion = "v2.0.0"; // format unchanged, only ID semantics differ
     string headID = "";
     // OPTIMIZATION: Increased cache size from 10k to 100k for better hit rate
     private static readonly SearchCacheService _searchCache = new SearchCacheService(maxCacheSize: 100000);
     private readonly global::Cross.Services.Grpc.Agent.ChunkReferenceServiceClient _chunkReferenceClient = new();
+
+    /// <summary>
+    /// Convert a ulong back to a 64-char '0'/'1' bitstring.
+    /// Inverse of the agent's BitstringToUlong — used to derive the correct agent for decompression.
+    /// </summary>
+    private static string UlongToBitstring(ulong packed)
+    {
+        char[] chars = new char[64];
+        for (int i = 0; i < 64; i++)
+            chars[i] = (packed & (1UL << i)) != 0 ? '1' : '0';
+        return new string(chars);
+    }
 
     private async Task initCLMS(string _name, string _id)
     {
@@ -972,6 +987,8 @@ public class CrossService : ICross
         }
 
         // ── Fetch all base chunks in parallel ──
+        // BucketId is now a deterministic ulong derived from the 64-bit bitstring.
+        // Convert BucketId → bitstring → RendezvousRouter.PickAgent() → query the correct agent.
         var fetchSw = Stopwatch.StartNew();
         var baseChunks = new byte[chunkCount][];
         var fetchTasks = new Task[chunkCount];
@@ -989,19 +1006,23 @@ public class CrossService : ICross
                 var refCopy = reference;
                 fetchTasks[i] = Task.Run(async () =>
                 {
+                    // Derive bitstring from bucket ID → deterministic agent routing
+                    string bitstring = UlongToBitstring(refCopy.BucketId);
+                    string targetAgent = RendezvousRouter.PickAgent(bitstring);
+
                     byte[]? chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
-                        refCopy.BucketId, refCopy.BucketIndex);
+                        refCopy.BucketId, refCopy.BucketIndex, targetAgent);
 
                     if (chunk == null)
                     {
-                        // Fallback: ownership is not encoded in references, so query all agents.
+                        // Fallback: query all agents (handles agent-down or post-rebalance scenarios).
                         chunk = await _chunkReferenceClient.GetChunkByReferenceFromAnyAgentAsync(
                             refCopy.BucketId, refCopy.BucketIndex);
                     }
 
                     if (chunk == null)
                     {
-                        // Retry with exponential backoff on "any agent" path.
+                        // Retry with exponential backoff.
                         for (int retry = 0; retry < 2; retry++)
                         {
                             await Task.Delay(100 * (int)Math.Pow(2, retry));
