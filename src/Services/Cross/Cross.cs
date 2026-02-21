@@ -1093,6 +1093,7 @@ public class CrossService : ICross
                     string bitstring = UlongToBitstring(refCopy.BucketId);
                     string targetAgent = RendezvousRouter.PickAgent(bitstring);
 
+                    // 1) Try the primary (node-name-routed) agent
                     byte[]? chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
                         refCopy.BucketId, refCopy.BucketIndex, targetAgent);
 
@@ -1102,19 +1103,22 @@ public class CrossService : ICross
                     }
                     else
                     {
-                        // Retry the SAME primary agent with exponential backoff.
-                        // DO NOT query random agents — they may have different chunks
-                        // at the same (bucketId, bucketIndex) from a previous routing era.
-                        for (int retry = 0; retry < 3; retry++)
+                        // 2) Primary missed — could be a file compressed under old IP-based routing.
+                        //    Query ALL other agents. Safe: in-memory dedup ensures no duplicate
+                        //    (bucketId, bucketIndex) pairs across agents.
+                        chunk = await _chunkReferenceClient.GetChunkFromOtherAgentsAsync(
+                            refCopy.BucketId, refCopy.BucketIndex, targetAgent);
+
+                        if (chunk != null)
                         {
-                            await Task.Delay(50 * (int)Math.Pow(2, retry)); // 50ms, 100ms, 200ms
+                            Interlocked.Increment(ref fallbackHits);
+                        }
+                        else
+                        {
+                            // 3) Last resort: retry primary once more (write batcher may have flushed)
+                            await Task.Delay(100);
                             chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
                                 refCopy.BucketId, refCopy.BucketIndex, targetAgent);
-                            if (chunk != null)
-                            {
-                                Interlocked.Increment(ref fallbackHits);
-                                break;
-                            }
                         }
                     }
 

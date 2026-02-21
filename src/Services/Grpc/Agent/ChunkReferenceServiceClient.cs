@@ -44,25 +44,62 @@ public class ChunkReferenceServiceClient
         }
         catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
         {
-            // Expected cancellation (e.g. timeout / caller abort). No need to log.
             return null;
         }
         catch (RpcException ex)
         {
-            Console.WriteLine($"[ChunkReferenceServiceClient] gRPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
+            Console.WriteLine($"[ChunkReferenceServiceClient] gRPC error targeting {agentTarget}: {ex.Status.StatusCode} - {ex.Status.Detail}");
             return null;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[ChunkReferenceServiceClient] Error: {ex.Message}");
+            Console.WriteLine($"[ChunkReferenceServiceClient] Error targeting {agentTarget}: {ex.Message}");
             return null;
         }
     }
 
-    // GetChunkByReferenceFromAnyAgentAsync REMOVED.
-    // Querying all agents is UNSAFE: different agents may hold different chunks
-    // at the same (bucketId, bucketIndex) from a previous routing era.
-    // With stable node-name-based rendezvous hashing, the primary agent is always
-    // deterministic. If it can't find the chunk, the chunk is genuinely lost.
-}
+    /// <summary>
+    /// Fallback for decompression: try ALL agents (excluding a specific one we already tried).
+    /// Safe because the in-memory dedup counters guarantee no duplicate (bucketId, bucketIndex)
+    /// across agents. This handles files compressed under a previous routing scheme.
+    /// </summary>
+    public async Task<byte[]?> GetChunkFromOtherAgentsAsync(
+        ulong bucketId,
+        ulong bucketIndex,
+        string excludeAgent,
+        CancellationToken ct = default)
+    {
+        var agents = RendezvousRouter.GetAgents();
+        if (agents.Length <= 1)
+            return null;
 
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        linkedCts.CancelAfter(TimeSpan.FromSeconds(15));
+
+        var tasks = new List<Task<byte[]?>>();
+        foreach (var agent in agents)
+        {
+            if (agent == excludeAgent) continue;
+            tasks.Add(GetChunkByReferenceAsync(bucketId, bucketIndex, agent, linkedCts.Token));
+        }
+
+        while (tasks.Count > 0)
+        {
+            var completed = await Task.WhenAny(tasks);
+            tasks.Remove(completed);
+
+            try
+            {
+                var chunk = await completed;
+                if (chunk != null && chunk.Length > 0)
+                {
+                    linkedCts.Cancel();
+                    return chunk;
+                }
+            }
+            catch { /* agent failed, try next */ }
+        }
+
+        return null;
+    }
+}
