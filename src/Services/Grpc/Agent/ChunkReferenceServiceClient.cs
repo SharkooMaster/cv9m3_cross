@@ -42,6 +42,12 @@ public class ChunkReferenceServiceClient
 
             return res.Chunk.ToByteArray();
         }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
+        {
+            // Expected: GetChunkByReferenceFromAnyAgentAsync cancels remaining calls
+            // when the first agent returns a valid chunk. No need to log.
+            return null;
+        }
         catch (RpcException ex)
         {
             Console.WriteLine($"[ChunkReferenceServiceClient] gRPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");

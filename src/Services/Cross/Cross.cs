@@ -1010,6 +1010,8 @@ public class CrossService : ICross
         var fetchSw = Stopwatch.StartNew();
         var baseChunks = new byte[chunkCount][];
         var fetchTasks = new Task[chunkCount];
+        int primaryHits = 0;
+        int fallbackHits = 0;
         for (int i = 0; i < chunkCount; i++)
         {
             var reference = references[i];
@@ -1031,11 +1033,17 @@ public class CrossService : ICross
                     byte[]? chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
                         refCopy.BucketId, refCopy.BucketIndex, targetAgent);
 
-                    if (chunk == null)
+                    if (chunk != null)
+                    {
+                        Interlocked.Increment(ref primaryHits);
+                    }
+                    else
                     {
                         // Fallback: query all agents (handles agent-down or post-rebalance scenarios).
                         chunk = await _chunkReferenceClient.GetChunkByReferenceFromAnyAgentAsync(
                             refCopy.BucketId, refCopy.BucketIndex);
+                        if (chunk != null)
+                            Interlocked.Increment(ref fallbackHits);
                     }
 
                     if (chunk == null)
@@ -1046,7 +1054,11 @@ public class CrossService : ICross
                             await Task.Delay(100 * (int)Math.Pow(2, retry));
                             chunk = await _chunkReferenceClient.GetChunkByReferenceFromAnyAgentAsync(
                                 refCopy.BucketId, refCopy.BucketIndex);
-                            if (chunk != null) break;
+                            if (chunk != null)
+                            {
+                                Interlocked.Increment(ref fallbackHits);
+                                break;
+                            }
                         }
                         if (chunk == null)
                             throw new InvalidDataException(
@@ -1058,6 +1070,8 @@ public class CrossService : ICross
         }
         await Task.WhenAll(fetchTasks);
         fetchSw.Stop();
+        int zeroRefChunks = references.Count(r => r.BucketId == 0 && r.BucketIndex == 0);
+        Console.WriteLine($"[Decompress] FetchBaseChunks: {fetchSw.ElapsedMilliseconds}ms, {chunkCount} chunks, primary={primaryHits}, fallback={fallbackHits}, zeroRef={zeroRefChunks}");
         Observability.RecordStage("FetchBaseChunks", fetchSw.Elapsed.TotalMilliseconds, ("chunk_count", chunkCount));
 
         // ── Stitch base chunks into one continuous buffer ──
