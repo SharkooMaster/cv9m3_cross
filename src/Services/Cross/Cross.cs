@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Collections.Generic;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Text;
 using Cross.Interfaces.Cross;
@@ -20,11 +21,11 @@ namespace Cross.Services.Cross;
 public class CrossService : ICross
 {
     // v2.0.0: Flat error encoding. One continuous delta stream across the entire stitched file.
-    // Chunks where base == original contribute ZERO entries. No per-chunk overhead at all.
     // v2.0.1: BucketId is now a deterministic ulong derived from the 64-bit bitstring (not auto-increment).
-    //         Decompression converts BucketId → bitstring → RendezvousRouter.PickAgent() for correct routing.
-    //         Wire format unchanged from v2.0.0 — same (bucketId, bucketKey) pairs, just the ID semantics changed.
-    private const string EncodingVersion = "v2.0.0"; // format unchanged, only ID semantics differ
+    // v2.1.0: SHA256 integrity hash appended after trim chunk. Decompression verifies output matches hash.
+    //         Backwards compatible: v2.0.0 files without a hash are still decompressible (hash check skipped).
+    private const string EncodingVersion = "v2.1.0";
+    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0" };
     string headID = "";
     // OPTIMIZATION: Increased cache size from 10k to 100k for better hit rate
     private static readonly SearchCacheService _searchCache = new SearchCacheService(maxCacheSize: 100000);
@@ -91,7 +92,8 @@ public class CrossService : ICross
         string version,
         byte[] references,
         byte[] errorDictionary,
-        byte[] trimChunk)
+        byte[] trimChunk,
+        byte[] originalFileHash)
     {
         using var ms = new MemoryStream();
         using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
@@ -101,15 +103,18 @@ public class CrossService : ICross
         bw.Write(versionBytes);
         bw.Write(references.Length);
         bw.Write(errorDictionary.Length);
+        bw.Write(trimChunk.Length);          // NEW in v2.1.0: trim chunk length (so we know where hash starts)
         bw.Write(references);
         bw.Write(errorDictionary);
         bw.Write(trimChunk);
+        bw.Write(originalFileHash.Length);   // 32 for SHA256
+        bw.Write(originalFileHash);
         bw.Flush();
 
         return ms.ToArray();
     }
 
-    private static (string Version, int ReferencesLength, int ErrorLength, int PayloadStart) ParseHeader(ReadOnlySpan<byte> payload)
+    private static (string Version, int ReferencesLength, int ErrorLength, int TrimLength, int PayloadStart) ParseHeader(ReadOnlySpan<byte> payload)
     {
         const int IntSize = sizeof(int);
         if (payload.Length < IntSize * 3)
@@ -131,7 +136,15 @@ public class CrossService : ICross
         if (referencesLength < 0 || errorLength < 0)
             throw new InvalidDataException("Negative section length in compressed payload.");
 
-        return (version, referencesLength, errorLength, offset);
+        // v2.1.0+: trim chunk length is stored in the header
+        int trimLength = -1; // -1 means "not present" (v2.0.0 compat)
+        if (version == "v2.1.0")
+        {
+            trimLength = BitConverter.ToInt32(payload.Slice(offset, IntSize));
+            offset += IntSize;
+        }
+
+        return (version, referencesLength, errorLength, trimLength, offset);
     }
 
     private List<QueryObject> GetQueryObjects(List<byte[]> _fileChunks, List<float[]> _vectors, List<string> _bitStrings)
@@ -890,21 +903,47 @@ public class CrossService : ICross
             // ONE flat pass across the entire file
             var flatDiff = Misc.GetErrorEncoding(originalBuffer, baseBuffer);
 
-            // ── INTEGRITY CHECK: verify patches reconstruct original ──
-            // Catches type-truncation, wrong-base, or encoding bugs at compression time
-            // rather than producing silently corrupt compressed files.
+            // ── INTEGRITY CHECK 1: full round-trip verification ──
+            // Apply patches to a COPY of baseBuffer and verify byte-for-byte match
+            // against originalBuffer. This catches diff-computation bugs, wrong-base
+            // chunks, or any logic error that the weaker range check would miss.
             {
+                byte[] verifyBuf = new byte[baseBuffer.Length];
+                Buffer.BlockCopy(baseBuffer, 0, verifyBuf, 0, baseBuffer.Length);
+
                 int cursor = 0;
                 foreach (var (key, value) in flatDiff)
                 {
                     cursor += key;
-                    int patched = baseBuffer[cursor] + value;
+                    if (cursor < 0 || cursor >= verifyBuf.Length)
+                        throw new InvalidDataException(
+                            $"Compression integrity: patch cursor {cursor} out of range (buffer {verifyBuf.Length}).");
+
+                    int patched = verifyBuf[cursor] + value;
                     if (patched < 0 || patched > 255)
                     {
-                        Console.WriteLine($"[Compress] INTEGRITY FAIL: base[{cursor}]={baseBuffer[cursor]} + delta={value} = {patched} (chunk {cursor / Globals.chunkSize}, BucketId={sorted[cursor / Globals.chunkSize].BucketId})");
+                        Console.WriteLine($"[Compress] INTEGRITY FAIL: base[{cursor}]={verifyBuf[cursor]} + delta={value} = {patched} (chunk {cursor / Globals.chunkSize}, BucketId={sorted[cursor / Globals.chunkSize].BucketId})");
                         throw new InvalidDataException(
-                            $"Compression integrity check failed: patch at {cursor} produces out-of-range byte {patched}. This indicates a base-chunk mismatch.");
+                            $"Compression integrity check failed: patch at {cursor} produces out-of-range byte {patched}.");
                     }
+                    verifyBuf[cursor] = (byte)patched;
+                }
+
+                // Byte-for-byte comparison: patched base must equal original
+                if (!verifyBuf.AsSpan().SequenceEqual(originalBuffer.AsSpan()))
+                {
+                    for (int i = 0; i < verifyBuf.Length; i++)
+                    {
+                        if (verifyBuf[i] != originalBuffer[i])
+                        {
+                            int chunkIdx = i / Globals.chunkSize;
+                            Console.WriteLine($"[Compress] INTEGRITY FAIL: byte {i} (chunk {chunkIdx}, BucketId={sorted[chunkIdx].BucketId}): expected 0x{originalBuffer[i]:X2}, got 0x{verifyBuf[i]:X2}");
+                            break;
+                        }
+                    }
+                    throw new InvalidDataException(
+                        "Compression integrity check failed: patched base buffer does not match original file. " +
+                        "This indicates a base-chunk mismatch or diff-encoding bug.");
                 }
             }
 
@@ -922,6 +961,27 @@ public class CrossService : ICross
                 errorDictionaryBytes = errorMs.ToArray();
             }
 
+            // ── INTEGRITY CHECK 2: serialization round-trip ──
+            // Deserialize what we just wrote and verify it matches the source diffs.
+            // Catches truncation (int→short overflow), off-by-one, or stream bugs.
+            {
+                using var verifyMs = new MemoryStream(errorDictionaryBytes, writable: false);
+                using var verifyReader = new BinaryReader(verifyMs, Encoding.UTF8, leaveOpen: true);
+                int verifyCount = verifyReader.ReadInt32();
+                if (verifyCount != flatDiff.Count)
+                    throw new InvalidDataException(
+                        $"Serialization integrity: pair count mismatch ({verifyCount} vs {flatDiff.Count}).");
+
+                for (int i = 0; i < verifyCount; i++)
+                {
+                    int rKey = verifyReader.ReadInt32();
+                    short rVal = verifyReader.ReadInt16();
+                    if (rKey != flatDiff[i].key || rVal != (short)flatDiff[i].value)
+                        throw new InvalidDataException(
+                            $"Serialization integrity: pair[{i}] mismatch. Expected ({flatDiff[i].key},{flatDiff[i].value}), got ({rKey},{rVal}).");
+                }
+            }
+
             phaseSw.Stop();
             Console.WriteLine($"[Compress] FlatEncode: {phaseSw.ElapsedMilliseconds}ms, pairs={flatDiff.Count}, bytes={errorDictionaryBytes.Length}");
             Observability.RecordStage("FlatEncode", phaseSw.Elapsed.TotalMilliseconds,
@@ -932,11 +992,14 @@ public class CrossService : ICross
         {
             using var stage = Observability.StartStage("Serialize");
             var swStage = Stopwatch.StartNew();
+            // SHA256 integrity hash of the ORIGINAL file — verified during decompression
+            byte[] originalHash = SHA256.HashData(_file);
             toReturn = BuildCompressedPayload(
                 EncodingVersion,
                 references.ToArray(),
                 errorDictionaryBytes,
-                trimmedChunk.ToArray());
+                trimmedChunk.ToArray(),
+                originalHash);
             swStage.Stop();
             Observability.RecordStage("Serialize", swStage.Elapsed.TotalMilliseconds, ("output_bytes", toReturn.Length));
         }
@@ -965,8 +1028,8 @@ public class CrossService : ICross
         parseSw.Stop();
         Observability.RecordStage("Deserialize", parseSw.Elapsed.TotalMilliseconds);
 
-        if (!string.Equals(header.Version, EncodingVersion, StringComparison.Ordinal))
-            throw new InvalidDataException($"Unsupported encoding version '{header.Version}'. Expected {EncodingVersion}.");
+        if (!SupportedVersions.Contains(header.Version))
+            throw new InvalidDataException($"Unsupported encoding version '{header.Version}'. Expected one of: {string.Join(", ", SupportedVersions)}.");
 
         int referencesOffset = header.PayloadStart;
         int errorOffset = referencesOffset + header.ReferencesLength;
@@ -1101,11 +1164,50 @@ public class CrossService : ICross
         }
 
         // ── Assemble output: reconstructed buffer + trim chunk ──
-        int trimLength = file.Length - trimOffset;
+        int trimLength;
+        byte[]? expectedHash = null;
+
+        if (header.TrimLength >= 0)
+        {
+            // v2.1.0+: trimLength is explicit in header; hash follows trim chunk
+            trimLength = header.TrimLength;
+            int hashOffset = trimOffset + trimLength;
+            if (hashOffset + sizeof(int) <= file.Length)
+            {
+                int hashLen = BitConverter.ToInt32(file, hashOffset);
+                if (hashLen > 0 && hashOffset + sizeof(int) + hashLen <= file.Length)
+                {
+                    expectedHash = new byte[hashLen];
+                    Buffer.BlockCopy(file, hashOffset + sizeof(int), expectedHash, 0, hashLen);
+                }
+            }
+        }
+        else
+        {
+            // v2.0.0: no trimLength in header, trim runs to end of file
+            trimLength = file.Length - trimOffset;
+        }
+
         byte[] result = new byte[baseBuffer.Length + trimLength];
         Buffer.BlockCopy(baseBuffer, 0, result, 0, baseBuffer.Length);
         if (trimLength > 0)
             Buffer.BlockCopy(file, trimOffset, result, baseBuffer.Length, trimLength);
+
+        // ── SHA256 integrity verification (v2.1.0+) ──
+        if (expectedHash != null)
+        {
+            byte[] actualHash = SHA256.HashData(result);
+            if (!actualHash.AsSpan().SequenceEqual(expectedHash))
+            {
+                Console.WriteLine($"[Decompress] ❌ INTEGRITY FAILURE: SHA256 mismatch. File is corrupted.");
+                Console.WriteLine($"[Decompress]    Expected: {Convert.ToHexString(expectedHash)}");
+                Console.WriteLine($"[Decompress]    Got:      {Convert.ToHexString(actualHash)}");
+                throw new InvalidDataException(
+                    "Decompression integrity check failed: SHA256 hash of reconstructed file does not match the original. " +
+                    "This means at least one base chunk was corrupted or missing.");
+            }
+            Console.WriteLine($"[Decompress] ✅ SHA256 integrity verified");
+        }
 
         applySw.Stop();
         Observability.RecordStage("ApplyPatchAndEgress", applySw.Elapsed.TotalMilliseconds,
