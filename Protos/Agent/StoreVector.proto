@@ -21,6 +21,7 @@ message StoreVector_Res
 {
     uint64 id = 1;
     uint64 index = 2;
+    string storage_guid = 3;  // SHA256 of chunk bytes — content-addressable, globally unique
 }
 
 // ── Batch store: many chunks in one gRPC call ──

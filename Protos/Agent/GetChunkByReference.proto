@@ -3,6 +3,7 @@ syntax = "proto3";
 service ChunkReferenceService
 {
     rpc GetChunkByReference (GetChunkByReference_Req) returns (GetChunkByReference_Res);
+    rpc GetChunkByKey (GetChunkByKey_Req) returns (GetChunkByKey_Res);
 }
 
 message GetChunkByReference_Req
@@ -17,3 +18,13 @@ message GetChunkByReference_Res
     bytes chunk = 2;
 }
 
+message GetChunkByKey_Req
+{
+    string chunk_key = 1;
+}
+
+message GetChunkByKey_Res
+{
+    bool found = 1;
+    bytes chunk = 2;
+}

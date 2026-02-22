@@ -24,8 +24,11 @@ public class CrossService : ICross
     // v2.0.1: BucketId is now a deterministic ulong derived from the 64-bit bitstring (not auto-increment).
     // v2.1.0: SHA256 integrity hash appended after trim chunk. Decompression verifies output matches hash.
     //         Backwards compatible: v2.0.0 files without a hash are still decompressible (hash check skipped).
-    private const string EncodingVersion = "v2.1.0";
-    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0" };
+    // v3.0.0: Content-addressable references. Each ref is (bucketId, storageGuid) where storageGuid = SHA256(chunk).
+    //         storageGuid is globally unique (content-addressable). Agents die/restart/scale → no data loss.
+    //         Decompression uses GetChunkByKey(storageGuid) for O(1) lookup. Safe multi-agent fallback.
+    private const string EncodingVersion = "v3.0.0";
+    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0" };
     string headID = "";
     // OPTIMIZATION: Increased cache size from 10k to 100k for better hit rate
     private static readonly SearchCacheService _searchCache = new SearchCacheService(maxCacheSize: 100000);
@@ -138,7 +141,7 @@ public class CrossService : ICross
 
         // v2.1.0+: trim chunk length is stored in the header
         int trimLength = -1; // -1 means "not present" (v2.0.0 compat)
-        if (version == "v2.1.0")
+        if (version == "v2.1.0" || version == "v3.0.0")
         {
             trimLength = BitConverter.ToInt32(payload.Slice(offset, IntSize));
             offset += IntSize;
@@ -375,7 +378,8 @@ public class CrossService : ICross
                                                 Index = idx,
                                                 Duplicate = true,
                                                 NeedToStore = false,
-                                                TargetAgent = agent
+                                                TargetAgent = agent,
+                                                StorageGuid = best.StorageGuid ?? ""
                                             };
                                         }
                                     }
@@ -495,6 +499,7 @@ public class CrossService : ICross
                                 {
                                     batchItems[j].response.BucketId = batchRes.Results[j].Id;
                                     batchItems[j].response.BucketKey = batchRes.Results[j].Index;
+                                    batchItems[j].response.StorageGuid = batchRes.Results[j].StorageGuid ?? "";
                                 }
                                 Interlocked.Add(ref totalStored, batchItems.Count);
                             }
@@ -517,6 +522,7 @@ public class CrossService : ICross
                                     {
                                         batchItems[j].response.BucketId = retryRes.Results[j].Id;
                                         batchItems[j].response.BucketKey = retryRes.Results[j].Index;
+                                        batchItems[j].response.StorageGuid = retryRes.Results[j].StorageGuid ?? "";
                                     }
                                     Interlocked.Add(ref totalStored, batchItems.Count);
                                     Console.WriteLine($"[Compress] Retry store to {agent} OK for {batchItems.Count} chunks");
@@ -526,7 +532,7 @@ public class CrossService : ICross
                                     Console.WriteLine($"[Compress] Retry store to {agent} also failed: {retryEx.Message}");
                                     // Primary agent unreachable — clear refs so diff encodes the full chunk
                                     foreach (var item in batchItems)
-                                    { item.response.BucketId = 0; item.response.BucketKey = 0; }
+                                    { item.response.BucketId = 0; item.response.BucketKey = 0; item.response.StorageGuid = ""; }
                                 }
                             }
                         }));
@@ -674,6 +680,7 @@ public class CrossService : ICross
                             var storeRes = await client.StoreAsync(storeReq, new CallOptions(deadline: DateTime.UtcNow.AddSeconds(10)));
                             item.resp.BucketId = storeRes.Id;
                             item.resp.BucketKey = storeRes.Index;
+                            item.resp.StorageGuid = storeRes.StorageGuid ?? "";
                             item.resp.NeedToStore = true;
                             item.resp.Similarity = 1.0f; // base == original → empty diff
                         }
@@ -803,6 +810,7 @@ public class CrossService : ICross
                             {
                                 batchItems[j].response.BucketId = batchRes.Results[j].Id;
                                 batchItems[j].response.BucketKey = batchRes.Results[j].Index;
+                                batchItems[j].response.StorageGuid = batchRes.Results[j].StorageGuid ?? "";
                             }
                         }
                         catch (Exception ex)
@@ -822,6 +830,7 @@ public class CrossService : ICross
                                 {
                                     batchItems[j].response.BucketId = retryRes.Results[j].Id;
                                     batchItems[j].response.BucketKey = retryRes.Results[j].Index;
+                                    batchItems[j].response.StorageGuid = retryRes.Results[j].StorageGuid ?? "";
                                 }
                                 Console.WriteLine($"[Compress] Retry re-store to {agent} OK for {batchItems.Count} chunks");
                             }
@@ -829,7 +838,7 @@ public class CrossService : ICross
                             {
                                 // Primary agent unreachable — clear refs so diff encodes the full chunk
                                 foreach (var item in batchItems)
-                                { item.response.BucketId = 0; item.response.BucketKey = 0; }
+                                { item.response.BucketId = 0; item.response.BucketKey = 0; item.response.StorageGuid = ""; }
                             }
                         }
                     }));
@@ -843,11 +852,25 @@ public class CrossService : ICross
         }
 
         // ── Build references (once, after all re-stores are finalized) ──
-        var references = new List<byte>(sorted.Length * (sizeof(ulong) * 2));
+        // v3.0.0: each ref = [8 bytes: bucketId][32 bytes: storageGuid raw SHA256] = 40 bytes
+        // storageGuid is content-addressable (SHA256 of chunk data). Any agent with it has correct data.
+        const int StorageGuidRawLen = 32; // SHA256 = 32 bytes
+        const int RefSize = sizeof(ulong) + StorageGuidRawLen; // 40 bytes per ref
+        var references = new List<byte>(sorted.Length * RefSize);
         for (int i = 0; i < sorted.Length; i++)
         {
             references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
-            references.AddRange(BitConverter.GetBytes(sorted[i].BucketKey));
+            // Convert hex storageGuid to raw 32 bytes; empty/null → all zeros
+            byte[] guidRaw;
+            if (!string.IsNullOrEmpty(sorted[i].StorageGuid) && sorted[i].StorageGuid.Length == 64)
+            {
+                guidRaw = Convert.FromHexString(sorted[i].StorageGuid);
+            }
+            else
+            {
+                guidRaw = new byte[StorageGuidRawLen]; // 32 zero bytes = no reference
+            }
+            references.AddRange(guidRaw);
         }
 
         // ── FLAT ERROR ENCODING (v2.0.0) ──
@@ -1023,20 +1046,43 @@ public class CrossService : ICross
 
         if (trimOffset > file.Length)
             throw new InvalidDataException("Compressed payload section lengths exceed file size.");
-        if (header.ReferencesLength % (sizeof(ulong) * 2) != 0)
-            throw new InvalidDataException("Reference section length is invalid.");
 
-        int chunkCount = header.ReferencesLength / (sizeof(ulong) * 2);
-        var references = new (ulong BucketId, ulong BucketIndex)[chunkCount];
+        // ── Parse references based on version ──
+        // v2.x: 16 bytes per ref (bucketId + bucketIndex)
+        // v3.0.0: 40 bytes per ref (bucketId + 32-byte storageGuid raw SHA256)
+        bool isV3 = header.Version == "v3.0.0";
+        int refBytesPerChunk = isV3 ? (sizeof(ulong) + 32) : (sizeof(ulong) * 2); // 40 or 16
+        if (header.ReferencesLength % refBytesPerChunk != 0)
+            throw new InvalidDataException($"Reference section length {header.ReferencesLength} is not divisible by {refBytesPerChunk}.");
+
+        int chunkCount = header.ReferencesLength / refBytesPerChunk;
+
+        // Unified ref: bucketId for routing, storageGuid for content-addressable retrieval
+        // For v2.x: storageGuid is empty, bucketIndex is used instead
+        var refBucketIds = new ulong[chunkCount];
+        var refBucketIndices = new ulong[chunkCount]; // v2.x only
+        var refStorageGuids = new string[chunkCount]; // v3.0.0 only
+
         for (int i = 0; i < chunkCount; i++)
         {
-            int off = referencesOffset + (i * sizeof(ulong) * 2);
-            ulong bucketId = BitConverter.ToUInt64(file, off);
-            ulong bucketIndex = BitConverter.ToUInt64(file, off + sizeof(ulong));
-            references[i] = (bucketId, bucketIndex);
+            int off = referencesOffset + (i * refBytesPerChunk);
+            refBucketIds[i] = BitConverter.ToUInt64(file, off);
+            if (isV3)
+            {
+                // 32 raw SHA256 bytes → 64-char hex string
+                var guidRaw = new byte[32];
+                Buffer.BlockCopy(file, off + sizeof(ulong), guidRaw, 0, 32);
+                bool allZero = true;
+                for (int b = 0; b < 32; b++) { if (guidRaw[b] != 0) { allZero = false; break; } }
+                refStorageGuids[i] = allZero ? "" : Convert.ToHexString(guidRaw).ToLowerInvariant();
+            }
+            else
+            {
+                refBucketIndices[i] = BitConverter.ToUInt64(file, off + sizeof(ulong));
+            }
         }
 
-        // ── Parse flat error encoding (v2.0.0) ──
+        // ── Parse flat error encoding ──
         // <int totalPairCount> then <int deltaIndex><short delta> × totalPairCount
         (int deltaIndex, short delta)[] patches;
         using (var errorMs = new MemoryStream(file, errorOffset, header.ErrorLength, writable: false))
@@ -1054,17 +1100,28 @@ public class CrossService : ICross
         }
 
         // ── Fetch all base chunks in parallel ──
-        // BucketId is now a deterministic ulong derived from the 64-bit bitstring.
-        // Convert BucketId → bitstring → RendezvousRouter.PickAgent() → query the correct agent.
         var fetchSw = Stopwatch.StartNew();
         var baseChunks = new byte[chunkCount][];
         var fetchTasks = new Task[chunkCount];
         int primaryHits = 0;
         int fallbackHits = 0;
+
+        // Get all agent IPs once for v3.0.0 safe fallback (content-addressable → any agent is correct)
+        string[]? allAgentIps = null;
+        if (isV3)
+        {
+            try { allAgentIps = RendezvousRouter.GetAllAgentIps(); }
+            catch { allAgentIps = null; }
+        }
+
         for (int i = 0; i < chunkCount; i++)
         {
-            var reference = references[i];
-            if (reference.BucketId == 0 && reference.BucketIndex == 0)
+            ulong bucketId = refBucketIds[i];
+            bool isZeroRef = isV3
+                ? (bucketId == 0 && string.IsNullOrEmpty(refStorageGuids[i]))
+                : (bucketId == 0 && refBucketIndices[i] == 0);
+
+            if (isZeroRef)
             {
                 baseChunks[i] = new byte[Globals.chunkSize];
                 fetchTasks[i] = Task.CompletedTask;
@@ -1072,44 +1129,105 @@ public class CrossService : ICross
             else
             {
                 int idx = i;
-                var refCopy = reference;
+                ulong bId = bucketId;
                 fetchTasks[i] = Task.Run(async () =>
                 {
-                    // Derive bitstring from bucket ID → deterministic agent routing (stable by node name)
-                    string bitstring = UlongToBitstring(refCopy.BucketId);
+                    // Route to the primary agent via RendezvousRouter
+                    string bitstring = UlongToBitstring(bId);
                     string targetAgent = RendezvousRouter.PickAgent(bitstring);
+                    byte[]? chunk = null;
 
-                    // 1) Try the primary (node-name-routed) agent
-                    byte[]? chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
-                        refCopy.BucketId, refCopy.BucketIndex, targetAgent);
-
-                    if (chunk != null)
+                    if (isV3)
                     {
-                        Interlocked.Increment(ref primaryHits);
+                        // ── v3.0.0: Content-addressable retrieval by storageGuid ──
+                        string guid = refStorageGuids[idx];
+
+                        // 1) Try primary agent (O(1) lookup by storageGuid)
+                        chunk = await _chunkReferenceClient.GetChunkByStorageGuidAsync(guid, targetAgent);
+                        if (chunk != null)
+                        {
+                            Interlocked.Increment(ref primaryHits);
+                        }
+                        else
+                        {
+                            // 2) SAFE FALLBACK: Query ALL other agents in parallel.
+                            //    This is SAFE because storageGuid = SHA256(chunk data).
+                            //    Any agent with this GUID has EXACTLY the same bytes.
+                            //    No stale data, no corruption. Content-addressable by definition.
+                            if (allAgentIps != null && allAgentIps.Length > 0)
+                            {
+                                var otherAgents = allAgentIps.Where(ip => ip != targetAgent).ToArray();
+                                if (otherAgents.Length > 0)
+                                {
+                                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                                    var fallbackTasks = otherAgents.Select(async agent =>
+                                    {
+                                        try
+                                        {
+                                            return await _chunkReferenceClient.GetChunkByStorageGuidAsync(
+                                                guid, agent, cts.Token);
+                                        }
+                                        catch { return null; }
+                                    }).ToList();
+
+                                    // First-wins: return as soon as ANY agent responds with data
+                                    while (fallbackTasks.Count > 0)
+                                    {
+                                        var completed = await Task.WhenAny(fallbackTasks);
+                                        fallbackTasks.Remove(completed);
+                                        var result = await completed;
+                                        if (result != null && result.Length > 0)
+                                        {
+                                            chunk = result;
+                                            Interlocked.Increment(ref fallbackHits);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 3) Last resort: retry primary with backoff
+                            if (chunk == null)
+                            {
+                                for (int retry = 0; retry < 3; retry++)
+                                {
+                                    await Task.Delay(100 * (retry + 1));
+                                    chunk = await _chunkReferenceClient.GetChunkByStorageGuidAsync(guid, targetAgent);
+                                    if (chunk != null) { Interlocked.Increment(ref fallbackHits); break; }
+                                }
+                            }
+                        }
+
+                        if (chunk == null)
+                            throw new InvalidDataException(
+                                $"Missing base chunk for storageGuid={guid}. " +
+                                $"PrimaryAgent={targetAgent}, Bitstring={bitstring}");
                     }
                     else
                     {
-                        // CRITICAL: Only retry the SAME primary agent. NEVER query other agents.
-                        // Other agents may have STALE data at the same (bucketId, bucketIndex)
-                        // from a previous routing era — returning the WRONG chunk and causing
-                        // silent data corruption (SHA256 mismatch).
-                        for (int retry = 0; retry < 3; retry++)
+                        // ── v2.x: Legacy retrieval by (bucketId, bucketIndex) ──
+                        ulong bIdx = refBucketIndices[idx];
+                        chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(bId, bIdx, targetAgent);
+                        if (chunk != null)
                         {
-                            await Task.Delay(100 * (retry + 1)); // 100ms, 200ms, 300ms
-                            chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
-                                refCopy.BucketId, refCopy.BucketIndex, targetAgent);
-                            if (chunk != null)
+                            Interlocked.Increment(ref primaryHits);
+                        }
+                        else
+                        {
+                            // Retry same agent with backoff (unsafe to query others for v2.x)
+                            for (int retry = 0; retry < 3; retry++)
                             {
-                                Interlocked.Increment(ref fallbackHits);
-                                break;
+                                await Task.Delay(100 * (retry + 1));
+                                chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(bId, bIdx, targetAgent);
+                                if (chunk != null) { Interlocked.Increment(ref fallbackHits); break; }
                             }
                         }
-                    }
 
-                    if (chunk == null)
-                        throw new InvalidDataException(
-                            $"Missing base chunk for reference ({refCopy.BucketId}, {refCopy.BucketIndex}). " +
-                            $"Agent={targetAgent}, Bitstring={bitstring}");
+                        if (chunk == null)
+                            throw new InvalidDataException(
+                                $"Missing base chunk for reference ({bId}, {bIdx}). " +
+                                $"Agent={targetAgent}, Bitstring={bitstring}");
+                    }
 
                     baseChunks[idx] = chunk;
                 });
@@ -1117,8 +1235,10 @@ public class CrossService : ICross
         }
         await Task.WhenAll(fetchTasks);
         fetchSw.Stop();
-        int zeroRefChunks = references.Count(r => r.BucketId == 0 && r.BucketIndex == 0);
-        Console.WriteLine($"[Decompress] FetchBaseChunks: {fetchSw.ElapsedMilliseconds}ms, {chunkCount} chunks, primary={primaryHits}, fallback={fallbackHits}, zeroRef={zeroRefChunks}");
+        int zeroRefChunks = isV3
+            ? Enumerable.Range(0, chunkCount).Count(i => refBucketIds[i] == 0 && string.IsNullOrEmpty(refStorageGuids[i]))
+            : Enumerable.Range(0, chunkCount).Count(i => refBucketIds[i] == 0 && refBucketIndices[i] == 0);
+        Console.WriteLine($"[Decompress] FetchBaseChunks: {fetchSw.ElapsedMilliseconds}ms, {chunkCount} chunks, version={header.Version}, primary={primaryHits}, fallback={fallbackHits}, zeroRef={zeroRefChunks}");
         Observability.RecordStage("FetchBaseChunks", fetchSw.Elapsed.TotalMilliseconds, ("chunk_count", chunkCount));
 
         // ── Stitch base chunks into one continuous buffer ──
@@ -1153,7 +1273,7 @@ public class CrossService : ICross
 
         if (header.TrimLength >= 0)
         {
-            // v2.1.0+: trimLength is explicit in header; hash follows trim chunk
+            // v2.1.0+/v3.0.0: trimLength is explicit in header; hash follows trim chunk
             trimLength = header.TrimLength;
             int hashOffset = trimOffset + trimLength;
             if (hashOffset + sizeof(int) <= file.Length)

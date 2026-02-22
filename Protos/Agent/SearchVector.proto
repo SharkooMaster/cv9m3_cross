@@ -26,6 +26,7 @@ message SearchVectorObject
     bytes chunk = 4;
 
     int32 index = 5;
+    string storage_guid = 6;  // SHA256 of matched chunk — content-addressable
 }
 
 message SearchVector_Result
