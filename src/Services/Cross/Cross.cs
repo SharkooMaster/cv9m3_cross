@@ -860,11 +860,26 @@ public class CrossService : ICross
         for (int i = 0; i < sorted.Length; i++)
         {
             references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
+
+            string storageGuid = sorted[i].StorageGuid;
+
+            // SAFETY NET: If the agent returned an empty StorageGuid (e.g. due to in-memory
+            // dedup short-circuit) but we have a valid BucketId, compute it locally from the
+            // original chunk bytes. SHA256 is deterministic: same chunk → same hash → the agent
+            // already stored it under this exact key, so decompression will find it.
+            if ((string.IsNullOrEmpty(storageGuid) || storageGuid.Length != 64)
+                && sorted[i].BucketId != 0
+                && chunkMap.TryGetValue(i, out var localChunk)
+                && localChunk != null && localChunk.Length > 0)
+            {
+                storageGuid = Convert.ToHexString(SHA256.HashData(localChunk)).ToLowerInvariant();
+            }
+
             // Convert hex storageGuid to raw 32 bytes; empty/null → all zeros
             byte[] guidRaw;
-            if (!string.IsNullOrEmpty(sorted[i].StorageGuid) && sorted[i].StorageGuid.Length == 64)
+            if (!string.IsNullOrEmpty(storageGuid) && storageGuid.Length == 64)
             {
-                guidRaw = Convert.FromHexString(sorted[i].StorageGuid);
+                guidRaw = Convert.FromHexString(storageGuid);
             }
             else
             {
