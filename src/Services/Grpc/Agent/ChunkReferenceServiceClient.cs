@@ -57,49 +57,4 @@ public class ChunkReferenceServiceClient
             return null;
         }
     }
-
-    /// <summary>
-    /// Fallback for decompression: try ALL agents (excluding a specific one we already tried).
-    /// Safe because the in-memory dedup counters guarantee no duplicate (bucketId, bucketIndex)
-    /// across agents. This handles files compressed under a previous routing scheme.
-    /// </summary>
-    public async Task<byte[]?> GetChunkFromOtherAgentsAsync(
-        ulong bucketId,
-        ulong bucketIndex,
-        string excludeAgent,
-        CancellationToken ct = default)
-    {
-        var agents = RendezvousRouter.GetAgents();
-        if (agents.Length <= 1)
-            return null;
-
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        linkedCts.CancelAfter(TimeSpan.FromSeconds(15));
-
-        var tasks = new List<Task<byte[]?>>();
-        foreach (var agent in agents)
-        {
-            if (agent == excludeAgent) continue;
-            tasks.Add(GetChunkByReferenceAsync(bucketId, bucketIndex, agent, linkedCts.Token));
-        }
-
-        while (tasks.Count > 0)
-        {
-            var completed = await Task.WhenAny(tasks);
-            tasks.Remove(completed);
-
-            try
-            {
-                var chunk = await completed;
-                if (chunk != null && chunk.Length > 0)
-                {
-                    linkedCts.Cancel();
-                    return chunk;
-                }
-            }
-            catch { /* agent failed, try next */ }
-        }
-
-        return null;
-    }
 }

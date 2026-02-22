@@ -500,37 +500,31 @@ public class CrossService : ICross
                             }
                             catch (Exception ex)
                             {
-                                Console.WriteLine($"[Compress] BatchStore to {agent} failed: {ex.Message}");
-                                // Retry on a fallback agent — pick any live agent that isn't the failed one
+                                Console.WriteLine($"[Compress] BatchStore to {agent} failed: {ex.Message}, retrying SAME agent...");
+                                // CRITICAL: NEVER store on a different agent!
+                                // PickAgent(bitstring) always routes to THIS agent during decompression.
+                                // Storing on a different agent means decompression can't find the chunk.
                                 try
                                 {
-                                    var allAgents = RendezvousRouter.GetAgents();
-                                    var fallback = allAgents.FirstOrDefault(a => a != agent);
-                                    if (fallback != null)
+                                    await Task.Delay(200); // Brief backoff before retry
+                                    var retryClient = GrpcChannelFactory.GetClient(
+                                        target: agent,
+                                        ctor: chan => new StoreVector.StoreVectorClient(chan),
+                                        roundRobin: false, port: 5000);
+                                    var retryRes = await retryClient.BatchStoreAsync(batchReq,
+                                        deadline: DateTime.UtcNow.AddSeconds(15));
+                                    for (int j = 0; j < batchItems.Count && j < retryRes.Results.Count; j++)
                                     {
-                                        var retryClient = GrpcChannelFactory.GetClient(
-                                            target: fallback,
-                                            ctor: chan => new StoreVector.StoreVectorClient(chan),
-                                            roundRobin: false, port: 5000);
-                                        // Update TargetIp for fallback
-                                        foreach (var req in batchReq.Items)
-                                            req.TargetIp = fallback;
-                                        var retryRes = await retryClient.BatchStoreAsync(batchReq,
-                                            deadline: DateTime.UtcNow.AddSeconds(15));
-                                        for (int j = 0; j < batchItems.Count && j < retryRes.Results.Count; j++)
-                                        {
-                                            batchItems[j].response.BucketId = retryRes.Results[j].Id;
-                                            batchItems[j].response.BucketKey = retryRes.Results[j].Index;
-                                            batchItems[j].response.TargetAgent = fallback;
-                                        }
-                                        Interlocked.Add(ref totalStored, batchItems.Count);
-                                        Console.WriteLine($"[Compress] Fallback store to {fallback} OK for {batchItems.Count} chunks");
+                                        batchItems[j].response.BucketId = retryRes.Results[j].Id;
+                                        batchItems[j].response.BucketKey = retryRes.Results[j].Index;
                                     }
+                                    Interlocked.Add(ref totalStored, batchItems.Count);
+                                    Console.WriteLine($"[Compress] Retry store to {agent} OK for {batchItems.Count} chunks");
                                 }
                                 catch (Exception retryEx)
                                 {
-                                    Console.WriteLine($"[Compress] Fallback store also failed: {retryEx.Message}");
-                                    // Both primary and fallback failed — clear refs to prevent dangling references
+                                    Console.WriteLine($"[Compress] Retry store to {agent} also failed: {retryEx.Message}");
+                                    // Primary agent unreachable — clear refs so diff encodes the full chunk
                                     foreach (var item in batchItems)
                                     { item.response.BucketId = 0; item.response.BucketKey = 0; }
                                 }
@@ -813,38 +807,27 @@ public class CrossService : ICross
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"[Compress] Re-store to {agent} failed: {ex.Message}, trying fallback...");
+                            Console.WriteLine($"[Compress] Re-store to {agent} failed: {ex.Message}, retrying SAME agent...");
+                            // CRITICAL: NEVER store on a different agent — decompression routes by bitstring to THIS agent.
                             try
                             {
-                                var allAgents = RendezvousRouter.GetAgents();
-                                var fallback = allAgents.FirstOrDefault(a => a != agent);
-                                if (fallback != null)
+                                await Task.Delay(200);
+                                var retryClient = GrpcChannelFactory.GetClient(
+                                    target: agent,
+                                    ctor: chan => new StoreVector.StoreVectorClient(chan),
+                                    roundRobin: false, port: 5000);
+                                var retryRes = await retryClient.BatchStoreAsync(batchReq,
+                                    deadline: DateTime.UtcNow.AddSeconds(10));
+                                for (int j = 0; j < batchItems.Count && j < retryRes.Results.Count; j++)
                                 {
-                                    var retryClient = GrpcChannelFactory.GetClient(
-                                        target: fallback,
-                                        ctor: chan => new StoreVector.StoreVectorClient(chan),
-                                        roundRobin: false, port: 5000);
-                                    foreach (var req in batchReq.Items)
-                                        req.TargetIp = fallback;
-                                    var retryRes = await retryClient.BatchStoreAsync(batchReq,
-                                        deadline: DateTime.UtcNow.AddSeconds(10));
-                                    for (int j = 0; j < batchItems.Count && j < retryRes.Results.Count; j++)
-                                    {
-                                        batchItems[j].response.BucketId = retryRes.Results[j].Id;
-                                        batchItems[j].response.BucketKey = retryRes.Results[j].Index;
-                                        batchItems[j].response.TargetAgent = fallback;
-                                    }
-                                    Console.WriteLine($"[Compress] Fallback re-store to {fallback} OK for {batchItems.Count} chunks");
+                                    batchItems[j].response.BucketId = retryRes.Results[j].Id;
+                                    batchItems[j].response.BucketKey = retryRes.Results[j].Index;
                                 }
-                                else
-                                {
-                                    foreach (var item in batchItems)
-                                    { item.response.BucketId = 0; item.response.BucketKey = 0; }
-                                }
+                                Console.WriteLine($"[Compress] Retry re-store to {agent} OK for {batchItems.Count} chunks");
                             }
                             catch
                             {
-                                // All agents failed — clear refs, zeros-diff will be mathematically correct (but bloated)
+                                // Primary agent unreachable — clear refs so diff encodes the full chunk
                                 foreach (var item in batchItems)
                                 { item.response.BucketId = 0; item.response.BucketKey = 0; }
                             }
@@ -1106,22 +1089,20 @@ public class CrossService : ICross
                     }
                     else
                     {
-                        // 2) Primary missed — could be a file compressed under old IP-based routing.
-                        //    Query ALL other agents. Safe: in-memory dedup ensures no duplicate
-                        //    (bucketId, bucketIndex) pairs across agents.
-                        chunk = await _chunkReferenceClient.GetChunkFromOtherAgentsAsync(
-                            refCopy.BucketId, refCopy.BucketIndex, targetAgent);
-
-                        if (chunk != null)
+                        // CRITICAL: Only retry the SAME primary agent. NEVER query other agents.
+                        // Other agents may have STALE data at the same (bucketId, bucketIndex)
+                        // from a previous routing era — returning the WRONG chunk and causing
+                        // silent data corruption (SHA256 mismatch).
+                        for (int retry = 0; retry < 3; retry++)
                         {
-                            Interlocked.Increment(ref fallbackHits);
-                        }
-                        else
-                        {
-                            // 3) Last resort: retry primary once more (write batcher may have flushed)
-                            await Task.Delay(100);
+                            await Task.Delay(100 * (retry + 1)); // 100ms, 200ms, 300ms
                             chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
                                 refCopy.BucketId, refCopy.BucketIndex, targetAgent);
+                            if (chunk != null)
+                            {
+                                Interlocked.Increment(ref fallbackHits);
+                                break;
+                            }
                         }
                     }
 
