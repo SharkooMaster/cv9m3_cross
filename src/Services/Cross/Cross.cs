@@ -530,9 +530,9 @@ public class CrossService : ICross
                                 catch (Exception retryEx)
                                 {
                                     Console.WriteLine($"[Compress] Retry store to {agent} also failed: {retryEx.Message}");
-                                    // Primary agent unreachable — clear refs so diff encodes the full chunk
+                                    // Primary agent unreachable — clear refs AND Chunk so base=zeros matches zero-ref
                                     foreach (var item in batchItems)
-                                    { item.response.BucketId = 0; item.response.BucketKey = 0; item.response.StorageGuid = ""; }
+                                    { item.response.BucketId = 0; item.response.BucketKey = 0; item.response.StorageGuid = ""; item.response.Chunk = ByteString.Empty; }
                                 }
                             }
                         }));
@@ -836,9 +836,12 @@ public class CrossService : ICross
                             }
                             catch
                             {
-                                // Primary agent unreachable — clear refs so diff encodes the full chunk
+                                // Primary agent unreachable — clear refs AND Chunk so the flat error
+                                // encoding uses zeros as base (matching the zero-ref in decompression).
+                                // WITHOUT clearing Chunk, the old matched bytes would be used as base
+                                // but the zero-ref during decompression gives base=zeros → SHA256 mismatch.
                                 foreach (var item in batchItems)
-                                { item.response.BucketId = 0; item.response.BucketKey = 0; item.response.StorageGuid = ""; }
+                                { item.response.BucketId = 0; item.response.BucketKey = 0; item.response.StorageGuid = ""; item.response.Chunk = ByteString.Empty; }
                             }
                         }
                     }));
@@ -846,6 +849,19 @@ public class CrossService : ICross
             }
 
             await Task.WhenAll(reStoreTasks);
+
+            // ── CRITICAL: Sweep bloated chunks for any that ended up with BucketId=0 ──
+            // This catches individual store failures within a successful batch (agent returns Id=0
+            // for one item but succeeds for others). Without this, sorted[i].Chunk still has the old
+            // matched bytes but the zero BucketId makes it a zero-ref → base mismatch → corruption.
+            foreach (var i in bloatedDiffRestore)
+            {
+                if (sorted[i].BucketId == 0)
+                {
+                    sorted[i].Chunk = ByteString.Empty;
+                    sorted[i].StorageGuid = "";
+                }
+            }
 
             phaseSw.Stop();
             Console.WriteLine($"[Compress] BloatRestore: {phaseSw.ElapsedMilliseconds}ms, {bloatedDiffRestore.Count} chunks re-stored");
@@ -865,14 +881,28 @@ public class CrossService : ICross
 
             // SAFETY NET: If the agent returned an empty StorageGuid (e.g. due to in-memory
             // dedup short-circuit) but we have a valid BucketId, compute it locally from the
-            // original chunk bytes. SHA256 is deterministic: same chunk → same hash → the agent
-            // already stored it under this exact key, so decompression will find it.
+            // ACTUAL base chunk that the flat error encoding will use. This MUST match the
+            // base chunk decompression will fetch — otherwise the patches produce wrong data.
             if ((string.IsNullOrEmpty(storageGuid) || storageGuid.Length != 64)
-                && sorted[i].BucketId != 0
-                && chunkMap.TryGetValue(i, out var localChunk)
-                && localChunk != null && localChunk.Length > 0)
+                && sorted[i].BucketId != 0)
             {
-                storageGuid = Convert.ToHexString(SHA256.HashData(localChunk)).ToLowerInvariant();
+                bool isExact = sorted[i].Similarity >= 0.999999f;
+                byte[]? baseForHash = null;
+
+                if ((sorted[i].NeedToStore || isExact) && sorted[i].BucketId != 0)
+                {
+                    // Base = original chunk (NeedToStore/exact → flat encoding copies fileChunks[i])
+                    if (chunkMap.TryGetValue(i, out var orig) && orig?.Length > 0)
+                        baseForHash = orig;
+                }
+                else if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
+                {
+                    // Base = matched chunk from agent (flat encoding copies sorted[i].Chunk)
+                    baseForHash = sorted[i].Chunk.ToByteArray();
+                }
+
+                if (baseForHash != null)
+                    storageGuid = Convert.ToHexString(SHA256.HashData(baseForHash)).ToLowerInvariant();
             }
 
             // Convert hex storageGuid to raw 32 bytes; empty/null → all zeros
