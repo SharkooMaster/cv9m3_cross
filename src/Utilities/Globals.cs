@@ -7,7 +7,7 @@ namespace Cross.Utilities;
 
 public static class Globals
 {
-    public static int chunkSize = 5120;
+    public static int chunkSize = int.TryParse(Environment.GetEnvironmentVariable("CHUNK_SIZE"), out var cs) ? cs : 5120;
     public static int k = 16;
     //public static string GatewayLoadbalancer = "192.168.50.241";
     // Allow running outside Kubernetes/Docker by overriding via env var.
