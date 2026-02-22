@@ -586,8 +586,10 @@ public class CrossService : ICross
                     };
                 }
 
-                bool isExactMatch = sorted[i].Similarity >= 0.999999f;
-                bool skipDiff = (sorted[i].NeedToStore || isExactMatch) && sorted[i].BucketId != 0;
+                // Only skip diff/fetch for chunks WE stored (NeedToStore) — their storageGuid
+                // points to the original bytes. For search matches (even similarity ≈ 1.0),
+                // we MUST use the agent's base chunk: vector similarity ≠ byte identity!
+                bool skipDiff = sorted[i].NeedToStore && sorted[i].BucketId != 0;
 
                 if (!skipDiff && sorted[i].BucketId != 0
                     && (sorted[i].Chunk == null || sorted[i].Chunk.Length == 0))
@@ -708,8 +710,9 @@ public class CrossService : ICross
                     continue;
                 }
 
-                bool isExactMatch = sorted[i].Similarity >= 0.999999f;
-                if ((sorted[i].NeedToStore || isExactMatch) && sorted[i].BucketId != 0)
+                // Only skip for chunks WE stored (NeedToStore) — their base IS the original.
+                // For search matches, even similarity ≈ 1.0, bytes may differ → must diff.
+                if (sorted[i].NeedToStore && sorted[i].BucketId != 0)
                 {
                     emptyDiffCount++;
                     continue;
@@ -886,18 +889,17 @@ public class CrossService : ICross
             if ((string.IsNullOrEmpty(storageGuid) || storageGuid.Length != 64)
                 && sorted[i].BucketId != 0)
             {
-                bool isExact = sorted[i].Similarity >= 0.999999f;
                 byte[]? baseForHash = null;
 
-                if ((sorted[i].NeedToStore || isExact) && sorted[i].BucketId != 0)
+                if (sorted[i].NeedToStore && sorted[i].BucketId != 0)
                 {
-                    // Base = original chunk (NeedToStore/exact → flat encoding copies fileChunks[i])
+                    // Base = original chunk (NeedToStore → we stored original → storageGuid = SHA256(original))
                     if (chunkMap.TryGetValue(i, out var orig) && orig?.Length > 0)
                         baseForHash = orig;
                 }
                 else if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
                 {
-                    // Base = matched chunk from agent (flat encoding copies sorted[i].Chunk)
+                    // Base = matched chunk from agent (the actual bytes the agent has)
                     baseForHash = sorted[i].Chunk.ToByteArray();
                 }
 
@@ -939,8 +941,10 @@ public class CrossService : ICross
                 Buffer.BlockCopy(fileChunks[i], 0, originalBuffer, off, Globals.chunkSize);
 
                 // Determine base chunk
-                bool isExactMatch = sorted[i].Similarity >= 0.999999f;
-                if ((sorted[i].NeedToStore || isExactMatch) && sorted[i].BucketId != 0)
+                // ONLY use original as base when WE stored it (NeedToStore) — storageGuid then
+                // points to original bytes. For search matches, ALWAYS use the matched chunk
+                // from the agent — vector similarity ≈ 1.0 does NOT mean byte-identical!
+                if (sorted[i].NeedToStore && sorted[i].BucketId != 0)
                 {
                     // base == original → copy original (zero diff)
                     Buffer.BlockCopy(fileChunks[i], 0, baseBuffer, off, Globals.chunkSize);
