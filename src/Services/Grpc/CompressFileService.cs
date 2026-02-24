@@ -312,7 +312,7 @@ public class CompressFileService : FileService.FileServiceBase
             Task? compressionTask = null;
             var crossService = new Cross.Services.Cross.CrossService();
             long windowedThreshold = GetWindowedThreshold();
-            bool willUseWindowed = declaredSize > (ulong)windowedThreshold;
+            bool willUseWindowed = false; // Will be set when metadata arrives
             
             {
                 // Use FileShare.Read to allow compression to read while we're still writing
@@ -336,7 +336,10 @@ public class CompressFileService : FileService.FileServiceBase
                         clientChunkSize = msg.Metadata.ChunkSize;
                         declaredSha256 = msg.Metadata.Sha256;
 
-                        Console.WriteLine($"[ProcessFileStream] Received metadata: fileName={fileName}, size={declaredSize} bytes");
+                        // CRITICAL: Update willUseWindowed now that we know the file size!
+                        willUseWindowed = declaredSize > (ulong)windowedThreshold;
+
+                        Console.WriteLine($"[ProcessFileStream] Received metadata: fileName={fileName}, size={declaredSize} bytes, willUseWindowed={willUseWindowed}");
 
                         // Use conditional limit: windowed files get unlimited, monolithic get the configured limit
                         long effectiveLimit = GetEffectiveMaxUploadBytes(declaredSize);
@@ -344,7 +347,7 @@ public class CompressFileService : FileService.FileServiceBase
                             throw new RpcException(new Status(StatusCode.InvalidArgument, $"File too large. Declared {declaredSize} bytes, max allowed {effectiveLimit}."));
                         // Update maxUploadBytes for the streaming check below
                         maxUploadBytes = effectiveLimit;
-                        Console.WriteLine($"[ProcessFileStream] Effective limit: {effectiveLimit} bytes, starting upload...");
+                        Console.WriteLine($"[ProcessFileStream] Effective limit: {effectiveLimit} bytes, windowed={willUseWindowed}, starting upload...");
                         continue;
                     }
 
