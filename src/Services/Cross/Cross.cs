@@ -1202,37 +1202,23 @@ public class CrossService : ICross
     }
 
     /// <summary>
-    /// Streaming version: Compress a large file using windowed v4.0.0 format,
-    /// writing directly to an output stream.  RAM usage ≈ O(windowSize).
-    /// Returns (totalCompressedSize, totalRefsFound, totalChunks).
+    /// TRUE STREAMING: Compress a file that's still being written, processing windows in order as they arrive.
+    /// Reads windows from file as they become available, compresses in order, writes to output in order.
+    /// RAM usage ≈ O(windowSize). No need to wait for entire file.
     /// </summary>
     public async Task<(long CompressedSize, int TotalRefs, int TotalChunks)> CompressFileWindowedStreamAsync(
-        string inputPath, Stream outputStream, CancellationToken ct = default)
+        string inputPath, Stream outputStream, long declaredFileSize, CancellationToken ct = default)
     {
-        long originalFileSize = new FileInfo(inputPath).Length;
+        long originalFileSize = declaredFileSize;
         int windowSize = WindowSize;
 
-        // ── 1. Compute SHA256 of entire original file (streaming — no full load) ──
-        byte[] originalHash;
-        using (var sha = System.Security.Cryptography.SHA256.Create())
-        await using (var hashStream = new FileStream(inputPath, FileMode.Open, FileAccess.Read,
-                         FileShare.Read, bufferSize: 1024 * 1024, useAsync: true))
-        {
-            byte[] buf = new byte[1024 * 1024];
-            int read;
-            while ((read = await hashStream.ReadAsync(buf, 0, buf.Length, ct)) > 0)
-                sha.TransformBlock(buf, 0, read, null, 0);
-            sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
-            originalHash = sha.Hash!;
-        }
-
-        // ── 2. Determine block count ──
+        // ── 1. Determine block count from declared size ──
         int blockCount = (int)((originalFileSize + windowSize - 1) / windowSize);
         if (blockCount == 0) blockCount = 1; // empty file edge case
 
         Console.WriteLine($"[CompressWindowedStream] file={originalFileSize} bytes, windowSize={windowSize}, blocks={blockCount}");
 
-        // ── 3. Write header + compress each window ──
+        // ── 2. Write placeholder header (we'll update hash at end) ──
         long totalCompressedSize = 0;
         int totalRefs = 0;
         int totalChunks = 0;
@@ -1240,11 +1226,14 @@ public class CrossService : ICross
         await using var inputFs = new FileStream(inputPath, FileMode.Open, FileAccess.Read,
                              FileShare.Read, bufferSize: 1024 * 1024, useAsync: true);
         using var bw = new BinaryWriter(outputStream, Encoding.UTF8, leaveOpen: true);
+        using var sha = System.Security.Cryptography.SHA256.Create();
 
-        // Header
+        // Write header with placeholder hash (we'll compute as we read)
+        long headerPos = outputStream.Position;
         bw.Write(V4Magic);
         bw.Write(originalFileSize);
-        bw.Write(originalHash);
+        byte[] placeholderHash = new byte[32]; // Placeholder - will update at end
+        bw.Write(placeholderHash);
         bw.Write(blockCount);
         await outputStream.FlushAsync(ct);
 
@@ -1252,34 +1241,69 @@ public class CrossService : ICross
         totalCompressedSize += headerBytes;
 
         byte[] windowBuffer = new byte[windowSize];
+        long totalReadSoFar = 0;
 
+        // ── 3. Process windows in order as they become available ──
         for (int block = 0; block < blockCount; block++)
         {
             ct.ThrowIfCancellationRequested();
 
-            // Read one window
-            int remaining = (int)Math.Min(windowSize, originalFileSize - inputFs.Position);
+            // Read one window (with retries if file is still being written)
+            int remaining = (int)Math.Min(windowSize, originalFileSize - totalReadSoFar);
             int totalRead = 0;
-            while (totalRead < remaining)
+            int retries = 0;
+            const int maxRetries = 100;
+            
+            while (totalRead < remaining && retries < maxRetries)
             {
-                int r = await inputFs.ReadAsync(windowBuffer.AsMemory(totalRead, remaining - totalRead), ct);
-                if (r == 0) break;
+                long filePos = inputFs.Position;
+                long availableBytes = inputFs.Length - filePos;
+                
+                if (availableBytes < remaining - totalRead)
+                {
+                    // File not ready yet, wait a bit
+                    if (retries % 10 == 0)
+                        Console.WriteLine($"[CompressWindowedStream] Block {block + 1}: waiting for data (have {availableBytes}, need {remaining - totalRead})");
+                    await Task.Delay(100, ct);
+                    retries++;
+                    continue;
+                }
+
+                int toRead = Math.Min(remaining - totalRead, (int)availableBytes);
+                int r = await inputFs.ReadAsync(windowBuffer.AsMemory(totalRead, toRead), ct);
+                if (r == 0)
+                {
+                    if (retries < maxRetries)
+                    {
+                        await Task.Delay(100, ct);
+                        retries++;
+                        continue;
+                    }
+                    break;
+                }
                 totalRead += r;
             }
+
+            if (totalRead == 0 && block < blockCount - 1)
+                throw new InvalidDataException($"Failed to read window {block + 1}: file may not be complete");
 
             // Exact-size slice (last window may be smaller)
             byte[] windowData = totalRead == windowSize
                 ? windowBuffer
                 : windowBuffer[..totalRead];
 
-            Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: {totalRead} bytes");
+            // Update hash as we read
+            sha.TransformBlock(windowData, 0, windowData.Length, null, 0);
+            totalReadSoFar += totalRead;
+
+            Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: {totalRead} bytes (total read: {totalReadSoFar}/{originalFileSize})");
 
             // Compress this window using the existing v3.0.0 pipeline (unchanged!)
             var (compressedBlock, refs, chunks) = await CompressFileWithStats(windowData);
             totalRefs += refs;
             totalChunks += chunks;
 
-            // Write block: [compressedLen][originalLen][compressed data]
+            // Write block: [compressedLen][originalLen][compressed data] - IN ORDER
             bw.Write((long)compressedBlock.Length);
             bw.Write((long)totalRead);
             await outputStream.WriteAsync(compressedBlock, 0, compressedBlock.Length, ct);
@@ -1287,8 +1311,19 @@ public class CrossService : ICross
 
             totalCompressedSize += 8 + 8 + compressedBlock.Length;
 
-            Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: compressed {totalRead} → {compressedBlock.Length} (ratio {(double)compressedBlock.Length / Math.Max(1, totalRead):F3})");
+            Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: compressed {totalRead} → {compressedBlock.Length} (ratio {(double)compressedBlock.Length / Math.Max(1, totalRead):F3}) → STREAMED");
         }
+
+        // ── 4. Finalize hash and update header ──
+        sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+        byte[] finalHash = sha.Hash!;
+
+        // Update hash in header
+        long currentPos = outputStream.Position;
+        outputStream.Position = headerPos + 4 + 8; // Skip magic and file size
+        await outputStream.WriteAsync(finalHash, 0, 32, ct);
+        outputStream.Position = currentPos; // Restore position
+        await outputStream.FlushAsync(ct);
 
         Console.WriteLine($"[CompressWindowedStream] DONE: {originalFileSize} → {totalCompressedSize} bytes, {blockCount} blocks, refs={totalRefs}");
         return (totalCompressedSize, totalRefs, totalChunks);
