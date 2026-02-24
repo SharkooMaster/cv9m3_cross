@@ -35,6 +35,137 @@ public class CompressFileService : FileService.FileServiceBase
         };
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  STREAMING DECOMPRESSION
+    // ═══════════════════════════════════════════════════════════════════
+    public override async Task DecompressFileStream(
+        IAsyncStreamReader<FileUploadRequest> requestStream,
+        IServerStreamWriter<FileUploadResponse> responseStream,
+        ServerCallContext context)
+    {
+        string tempPath = Path.Combine(Path.GetTempPath(), $"cross-decompress-{Guid.NewGuid():N}.bin");
+        long receivedBytes = 0;
+        long maxUploadBytes = GetMaxUploadBytes();
+
+        try
+        {
+            // ── 1. Receive .ccf via stream → temp file ──
+            {
+                await using var fs = new FileStream(
+                    tempPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    bufferSize: 1024 * 1024,
+                    useAsync: true);
+
+                while (await requestStream.MoveNext(context.CancellationToken))
+                {
+                    var msg = requestStream.Current;
+
+                    // Skip metadata messages (we don't need file info for decompression)
+                    if (msg.PayloadCase == FileUploadRequest.PayloadOneofCase.Metadata)
+                        continue;
+                    if (msg.PayloadCase != FileUploadRequest.PayloadOneofCase.Chunk)
+                        continue;
+
+                    var chunk = msg.Chunk;
+                    if (chunk.Data == null || chunk.Data.Length == 0)
+                    {
+                        if (chunk.Eof) break;
+                        continue;
+                    }
+
+                    byte[] data = chunk.Data.ToByteArray();
+                    await fs.WriteAsync(data, 0, data.Length, context.CancellationToken);
+                    receivedBytes += data.Length;
+
+                    if (receivedBytes > maxUploadBytes)
+                        throw new RpcException(new Status(StatusCode.InvalidArgument,
+                            $"File too large. Received {receivedBytes} bytes, max {maxUploadBytes}."));
+
+                    if (chunk.Eof) break;
+                }
+                await fs.FlushAsync(context.CancellationToken);
+            }
+
+            Console.WriteLine($"[DecompressStream] Received {receivedBytes} bytes → temp file");
+
+            // ── 2. Read .ccf from temp file and decompress ──
+            byte[] ccfBytes = await File.ReadAllBytesAsync(tempPath, context.CancellationToken);
+
+            var crossService = new Cross.Services.Cross.CrossService();
+            byte[] decompressedBytes = await crossService.DecompressFile(ccfBytes);
+
+            Console.WriteLine($"[DecompressStream] Decompressed {ccfBytes.Length} → {decompressedBytes.Length} bytes");
+
+            // ── 3. Send decompression stats first ──
+            byte[] decompressedHash;
+            using (var sha = SHA256.Create())
+                decompressedHash = sha.ComputeHash(decompressedBytes);
+
+            await responseStream.WriteAsync(new FileUploadResponse
+            {
+                DecompressStats = new DecompressionStats
+                {
+                    CompressedSize = (ulong)ccfBytes.Length,
+                    DecompressedSize = (ulong)decompressedBytes.Length,
+                    DecompressedSha256 = ByteString.CopyFrom(decompressedHash)
+                }
+            });
+
+            // ── 4. Stream decompressed result in 1 MiB chunks ──
+            const int outChunkSize = 1024 * 1024;
+            uint seq = 0;
+            for (int offset = 0; offset < decompressedBytes.Length; offset += outChunkSize, seq++)
+            {
+                int len = Math.Min(outChunkSize, decompressedBytes.Length - offset);
+                await responseStream.WriteAsync(new FileUploadResponse
+                {
+                    Chunk = new FileChunk
+                    {
+                        Seq = seq,
+                        Data = ByteString.CopyFrom(decompressedBytes, offset, len),
+                        Eof = false
+                    }
+                });
+            }
+
+            // ── 5. EOF marker ──
+            await responseStream.WriteAsync(new FileUploadResponse
+            {
+                Chunk = new FileChunk
+                {
+                    Seq = seq,
+                    Data = ByteString.Empty,
+                    Eof = true
+                }
+            });
+        }
+        catch (RpcException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[DecompressStream] FAILED: {ex.Message}");
+            throw new RpcException(new Status(StatusCode.Internal,
+                $"Decompression stream failed: {ex.Message}"));
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempPath))
+                    File.Delete(tempPath);
+            }
+            catch { /* best-effort cleanup */ }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  STREAMING COMPRESSION
+    // ═══════════════════════════════════════════════════════════════════
     public override async Task ProcessFileStream(
         IAsyncStreamReader<FileUploadRequest> requestStream,
         IServerStreamWriter<FileUploadResponse> responseStream,

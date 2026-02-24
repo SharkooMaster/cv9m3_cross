@@ -7,6 +7,8 @@ service FileService {
   rpc DecompressFile(FileRequest) returns (FileResponse);
   // Chunked streaming API for large files (avoids huge single messages).
   rpc ProcessFileStream(stream FileUploadRequest) returns (stream FileUploadResponse);
+  // Streaming decompression: client streams .ccf, server streams back decompressed bytes.
+  rpc DecompressFileStream(stream FileUploadRequest) returns (stream FileUploadResponse);
 }
 
 // FileRequest represents the file input.
@@ -52,10 +54,17 @@ message Error {
   string message = 1;
 }
 
+message DecompressionStats {
+  uint64 compressed_size = 1;
+  uint64 decompressed_size = 2;
+  bytes decompressed_sha256 = 3;
+}
+
 message FileUploadResponse {
   oneof payload {
     CompressionStats stats = 1;
     FileChunk chunk = 2;
     Error error = 3;
+    DecompressionStats decompress_stats = 4;
   }
 }
