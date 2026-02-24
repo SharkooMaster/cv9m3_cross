@@ -344,11 +344,34 @@ public class CrossService : ICross
                                 indexMap.Add(chunkIdx);
                             }
 
-                            var batchRes = await client.BatchGetAsync(batchReq,
-                                deadline: DateTime.UtcNow.AddSeconds(10));
+                            BatchSearchVector_Result? batchRes = null;
+                            // Try with generous deadline; retry once on timeout
+                            for (int attempt = 0; attempt < 2 && batchRes == null; attempt++)
+                            {
+                                try
+                                {
+                                    int deadlineSec = attempt == 0 ? 30 : 45;
+                                    batchRes = await client.BatchGetAsync(batchReq,
+                                        deadline: DateTime.UtcNow.AddSeconds(deadlineSec));
+                                }
+                                catch (global::Grpc.Core.RpcException rpcEx) when (rpcEx.StatusCode == global::Grpc.Core.StatusCode.DeadlineExceeded)
+                                {
+                                    if (attempt == 0)
+                                    {
+                                        Console.WriteLine($"[Compress] BatchGet to {agent} deadline ({batchReq.Queries.Count} queries), retrying...");
+                                        await Task.Delay(500);
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine($"[Compress] BatchGet to {agent} deadline on retry, skipping batch");
+                                    }
+                                }
+                            }
+
+                            if (batchRes == null) return; // skip this batch — agent overloaded
 
                             // Map results — only update sorted[idx] if this agent found a BETTER match
-                            for (int j = 0; j < indexMap.Count && j < batchRes.Results.Count; j++)
+                            for (int j = 0; j < indexMap.Count && j < batchRes!.Results.Count; j++)
                             {
                                 var idx = indexMap[j];
                                 var res = batchRes.Results[j];
@@ -493,7 +516,7 @@ public class CrossService : ICross
                                     roundRobin: false, port: 5000);
 
                                 var batchRes = await client.BatchStoreAsync(batchReq,
-                                    deadline: DateTime.UtcNow.AddSeconds(20));
+                                    deadline: DateTime.UtcNow.AddSeconds(30));
 
                                 for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
                                 {
@@ -511,13 +534,13 @@ public class CrossService : ICross
                                 // Storing on a different agent means decompression can't find the chunk.
                                 try
                                 {
-                                    await Task.Delay(200); // Brief backoff before retry
+                                    await Task.Delay(500); // Backoff before retry
                                     var retryClient = GrpcChannelFactory.GetClient(
                                         target: agent,
                                         ctor: chan => new StoreVector.StoreVectorClient(chan),
                                         roundRobin: false, port: 5000);
                                     var retryRes = await retryClient.BatchStoreAsync(batchReq,
-                                        deadline: DateTime.UtcNow.AddSeconds(15));
+                                        deadline: DateTime.UtcNow.AddSeconds(30));
                                     for (int j = 0; j < batchItems.Count && j < retryRes.Results.Count; j++)
                                     {
                                         batchItems[j].response.BucketId = retryRes.Results[j].Id;
@@ -679,7 +702,7 @@ public class CrossService : ICross
                             };
                             storeReq.Vector.AddRange(item.vector);
                             storeReq.Chunk = ByteString.CopyFrom(item.chunk);
-                            var storeRes = await client.StoreAsync(storeReq, new CallOptions(deadline: DateTime.UtcNow.AddSeconds(10)));
+                            var storeRes = await client.StoreAsync(storeReq, new CallOptions(deadline: DateTime.UtcNow.AddSeconds(30)));
                             item.resp.BucketId = storeRes.Id;
                             item.resp.BucketKey = storeRes.Index;
                             item.resp.StorageGuid = storeRes.StorageGuid ?? "";
@@ -807,7 +830,7 @@ public class CrossService : ICross
                                 roundRobin: false, port: 5000);
 
                             var batchRes = await client.BatchStoreAsync(batchReq,
-                                deadline: DateTime.UtcNow.AddSeconds(15));
+                                deadline: DateTime.UtcNow.AddSeconds(30));
 
                             for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
                             {
@@ -822,13 +845,13 @@ public class CrossService : ICross
                             // CRITICAL: NEVER store on a different agent — decompression routes by bitstring to THIS agent.
                             try
                             {
-                                await Task.Delay(200);
+                                await Task.Delay(500);
                                 var retryClient = GrpcChannelFactory.GetClient(
                                     target: agent,
                                     ctor: chan => new StoreVector.StoreVectorClient(chan),
                                     roundRobin: false, port: 5000);
                                 var retryRes = await retryClient.BatchStoreAsync(batchReq,
-                                    deadline: DateTime.UtcNow.AddSeconds(10));
+                                    deadline: DateTime.UtcNow.AddSeconds(30));
                                 for (int j = 0; j < batchItems.Count && j < retryRes.Results.Count; j++)
                                 {
                                     batchItems[j].response.BucketId = retryRes.Results[j].Id;
