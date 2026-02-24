@@ -1276,7 +1276,9 @@ public class CrossService : ICross
                     continue;
                 }
 
-                int toRead = Math.Min(remaining - totalRead, (int)availableBytes);
+                // remaining - totalRead is at most windowSize (64 MB), and we already verified
+                // availableBytes >= remaining - totalRead, so this is safe (no int overflow)
+                int toRead = remaining - totalRead;
                 int r = await inputFs.ReadAsync(windowBuffer.AsMemory(totalRead, toRead), ct);
                 if (r == 0)
                 {
@@ -1302,7 +1304,7 @@ public class CrossService : ICross
                     long available = fileLength - inputFs.Position;
                     if (available > 0)
                     {
-                        int r = await inputFs.ReadAsync(windowBuffer.AsMemory(0, Math.Min(remaining, (int)available)), ct);
+                        int r = await inputFs.ReadAsync(windowBuffer.AsMemory(0, remaining), ct);
                         if (r > 0) totalRead = r;
                     }
                     extraRetries++;
