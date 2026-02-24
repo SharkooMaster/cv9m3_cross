@@ -20,7 +20,7 @@ message GetChunkByReference_Res
 
 message GetChunkByKey_Req
 {
-    string chunk_key = 1;
+    string chunk_key = 1;  // SHA256 hash of chunk data (= storageGuid)
 }
 
 message GetChunkByKey_Res

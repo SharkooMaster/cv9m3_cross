@@ -7,6 +7,68 @@ using Google.Protobuf;
 using Grpc.Core;
 using System.Security.Cryptography;
 
+/// <summary>
+/// Stream wrapper that writes to a gRPC response stream.
+/// Used for true streaming compression/decompression.
+/// </summary>
+internal class GrpcResponseStream : Stream
+{
+    private readonly IServerStreamWriter<FileUploadResponse> _responseStream;
+    private readonly CancellationToken _ct;
+    private uint _seq = 0;
+    private readonly int _chunkSize;
+
+    public GrpcResponseStream(IServerStreamWriter<FileUploadResponse> responseStream, CancellationToken ct, int chunkSize = 1024 * 1024)
+    {
+        _responseStream = responseStream;
+        _ct = ct;
+        _chunkSize = chunkSize;
+    }
+
+    public override bool CanRead => false;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+
+    public override void Flush() => FlushAsync(_ct).GetAwaiter().GetResult();
+    public override async Task FlushAsync(CancellationToken cancellationToken)
+    {
+        // gRPC streams are automatically flushed on WriteAsync
+        await Task.CompletedTask;
+    }
+
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+
+    public override void Write(byte[] buffer, int offset, int count)
+        => WriteAsync(buffer, offset, count, _ct).GetAwaiter().GetResult();
+
+    public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        int remaining = count;
+        int pos = offset;
+
+        while (remaining > 0)
+        {
+            int chunk = Math.Min(remaining, _chunkSize);
+            await _responseStream.WriteAsync(new FileUploadResponse
+            {
+                Chunk = new FileChunk
+                {
+                    Seq = _seq++,
+                    Data = ByteString.CopyFrom(buffer, pos, chunk),
+                    Eof = false
+                }
+            }, cancellationToken);
+
+            remaining -= chunk;
+            pos += chunk;
+        }
+    }
+}
+
 public class CompressFileService : FileService.FileServiceBase
 {
     private static long GetMaxUploadBytes()
@@ -25,6 +87,23 @@ public class CompressFileService : FileService.FileServiceBase
         var raw = Environment.GetEnvironmentVariable("CROSS_WINDOWED_THRESHOLD_MB");
         if (long.TryParse(raw, out var mb) && mb > 0) return mb * 1024 * 1024;
         return 256L * 1024 * 1024; // 256 MiB default
+    }
+
+    /// <summary>
+    /// Returns the effective max upload size for a given file size.
+    /// If file will use windowed compression, returns unlimited (1 PB).
+    /// Otherwise, returns the configured monolithic limit.
+    /// </summary>
+    private static long GetEffectiveMaxUploadBytes(ulong declaredSize)
+    {
+        long windowedThreshold = GetWindowedThreshold();
+        if (declaredSize > (ulong)windowedThreshold)
+        {
+            // Windowed path → unlimited (1 PB)
+            return 1024L * 1024 * 1024 * 1024 * 1024; // 1 PB
+        }
+        // Monolithic path → use configured limit
+        return GetMaxUploadBytes();
     }
 
     public override async Task<FileResponse> ProcessFile(FileRequest request, ServerCallContext context)
@@ -57,11 +136,13 @@ public class CompressFileService : FileService.FileServiceBase
     {
         string tempPath = Path.Combine(Path.GetTempPath(), $"cross-decompress-{Guid.NewGuid():N}.bin");
         long receivedBytes = 0;
-        long maxUploadBytes = GetMaxUploadBytes();
 
         try
         {
             // ── 1. Receive .ccf via stream → temp file ──
+            // NOTE: No size limit for decompression. Format is detected after upload.
+            // v4.0.0 windowed files can be unlimited size (windowed handles RAM).
+            // v3.0.0 monolithic files are usually much smaller (compressed).
             {
                 await using var fs = new FileStream(
                     tempPath,
@@ -92,10 +173,6 @@ public class CompressFileService : FileService.FileServiceBase
                     await fs.WriteAsync(data, 0, data.Length, context.CancellationToken);
                     receivedBytes += data.Length;
 
-                    if (receivedBytes > maxUploadBytes)
-                        throw new RpcException(new Status(StatusCode.InvalidArgument,
-                            $"File too large. Received {receivedBytes} bytes, max {maxUploadBytes}."));
-
                     if (chunk.Eof) break;
                 }
                 await fs.FlushAsync(context.CancellationToken);
@@ -119,64 +196,31 @@ public class CompressFileService : FileService.FileServiceBase
             if (isV4)
             {
                 // ═══════════════════════════════════════════════════════════
-                //  WINDOWED v4.0.0 DECOMPRESSION — O(windowSize) RAM
+                //  WINDOWED v4.0.0 STREAMING DECOMPRESSION — O(windowSize) RAM
+                //  Decompresses and streams simultaneously (no temp file for output)
                 // ═══════════════════════════════════════════════════════════
-                string decompressedTempPath = Path.Combine(Path.GetTempPath(), $"cross-v4dec-{Guid.NewGuid():N}.bin");
-                try
+                var grpcStream = new GrpcResponseStream(responseStream, context.CancellationToken);
+
+                // Decompress and stream directly to client (hash computed and verified internally)
+                var (decompressedSize, decompressedHash) = await crossService.DecompressFileWindowedStreamAsync(
+                    tempPath, grpcStream, context.CancellationToken);
+
+                // Stats (send after decompression completes)
+                await responseStream.WriteAsync(new FileUploadResponse
                 {
-                    long decompressedSize = await crossService.DecompressFileWindowedAsync(
-                        tempPath, decompressedTempPath, context.CancellationToken);
-
-                    // Stats
-                    byte[] decompressedHash;
-                    using (var sha = SHA256.Create())
-                    await using (var hashFs = new FileStream(decompressedTempPath, FileMode.Open, FileAccess.Read,
-                                     FileShare.Read, bufferSize: 1024 * 1024, useAsync: true))
+                    DecompressStats = new DecompressionStats
                     {
-                        decompressedHash = await sha.ComputeHashAsync(hashFs, context.CancellationToken);
+                        CompressedSize = (ulong)receivedBytes,
+                        DecompressedSize = (ulong)decompressedSize,
+                        DecompressedSha256 = ByteString.CopyFrom(decompressedHash)
                     }
+                });
 
-                    await responseStream.WriteAsync(new FileUploadResponse
-                    {
-                        DecompressStats = new DecompressionStats
-                        {
-                            CompressedSize = (ulong)receivedBytes,
-                            DecompressedSize = (ulong)decompressedSize,
-                            DecompressedSha256 = ByteString.CopyFrom(decompressedHash)
-                        }
-                    });
-
-                    // Stream from temp file
-                    const int outChunkSize = 1024 * 1024;
-                    uint seq = 0;
-                    await using (var decFs = new FileStream(decompressedTempPath, FileMode.Open, FileAccess.Read,
-                                     FileShare.Read, bufferSize: 1024 * 1024, useAsync: true))
-                    {
-                        byte[] buf = new byte[outChunkSize];
-                        int read;
-                        while ((read = await decFs.ReadAsync(buf, 0, outChunkSize, context.CancellationToken)) > 0)
-                        {
-                            await responseStream.WriteAsync(new FileUploadResponse
-                            {
-                                Chunk = new FileChunk
-                                {
-                                    Seq = seq++,
-                                    Data = ByteString.CopyFrom(buf, 0, read),
-                                    Eof = false
-                                }
-                            });
-                        }
-                    }
-
-                    await responseStream.WriteAsync(new FileUploadResponse
-                    {
-                        Chunk = new FileChunk { Seq = seq, Data = ByteString.Empty, Eof = true }
-                    });
-                }
-                finally
+                // EOF
+                await responseStream.WriteAsync(new FileUploadResponse
                 {
-                    try { if (File.Exists(decompressedTempPath)) File.Delete(decompressedTempPath); } catch { }
-                }
+                    Chunk = new FileChunk { Seq = 0, Data = ByteString.Empty, Eof = true }
+                });
             }
             else
             {
@@ -286,8 +330,12 @@ public class CompressFileService : FileService.FileServiceBase
                         clientChunkSize = msg.Metadata.ChunkSize;
                         declaredSha256 = msg.Metadata.Sha256;
 
-                        if (declaredSize > 0 && declaredSize > (ulong)maxUploadBytes)
-                            throw new RpcException(new Status(StatusCode.InvalidArgument, $"File too large. Declared {declaredSize} bytes, max allowed {maxUploadBytes}."));
+                        // Use conditional limit: windowed files get unlimited, monolithic get the configured limit
+                        long effectiveLimit = GetEffectiveMaxUploadBytes(declaredSize);
+                        if (declaredSize > 0 && declaredSize > (ulong)effectiveLimit)
+                            throw new RpcException(new Status(StatusCode.InvalidArgument, $"File too large. Declared {declaredSize} bytes, max allowed {effectiveLimit}."));
+                        // Update maxUploadBytes for the streaming check below
+                        maxUploadBytes = effectiveLimit;
                         continue;
                     }
 
@@ -336,67 +384,38 @@ public class CompressFileService : FileService.FileServiceBase
             if (useWindowed)
             {
                 // ═══════════════════════════════════════════════════════════
-                //  WINDOWED v4.0.0 — O(windowSize) RAM, unlimited file size
+                //  WINDOWED v4.0.0 STREAMING — O(windowSize) RAM, unlimited file size
+                //  Compresses and streams simultaneously (no temp file for output)
                 // ═══════════════════════════════════════════════════════════
-                string compressedTempPath = Path.Combine(Path.GetTempPath(), $"cross-v4out-{Guid.NewGuid():N}.bin");
-                try
+                using var sha = SHA256.Create();
+                var grpcStream = new GrpcResponseStream(responseStream, context.CancellationToken);
+                using var hashStream = new CryptoStream(grpcStream, sha, CryptoStreamMode.Write);
+
+                // Compress and stream directly to client, computing hash as we go
+                var (compressedSize, refsFound, chunks) =
+                    await crossService.CompressFileWindowedStreamAsync(tempPath, hashStream, context.CancellationToken);
+
+                await hashStream.FlushFinalBlockAsync(context.CancellationToken);
+                byte[] compressedHash = sha.Hash!;
+
+                // Stats (send after compression completes)
+                await responseStream.WriteAsync(new FileUploadResponse
                 {
-                    var (compressedSize, refsFound, chunks) =
-                        await crossService.CompressFileWindowedAsync(tempPath, compressedTempPath, context.CancellationToken);
-
-                    byte[] compressedHash;
-                    using (var compressedSha = SHA256.Create())
-                    await using (var hashFs = new FileStream(compressedTempPath, FileMode.Open, FileAccess.Read,
-                                     FileShare.Read, bufferSize: 1024 * 1024, useAsync: true))
+                    Stats = new CompressionStats
                     {
-                        compressedHash = await compressedSha.ComputeHashAsync(hashFs, context.CancellationToken);
+                        OriginalSize = (ulong)receivedBytes,
+                        CompressedSize = (ulong)compressedSize,
+                        ReferencesFound = (uint)Math.Max(0, refsFound),
+                        TotalChunks = (uint)Math.Max(0, chunks),
+                        CompressedSha256 = ByteString.CopyFrom(compressedHash)
                     }
+                });
 
-                    // Stats
-                    await responseStream.WriteAsync(new FileUploadResponse
-                    {
-                        Stats = new CompressionStats
-                        {
-                            OriginalSize = (ulong)receivedBytes,
-                            CompressedSize = (ulong)compressedSize,
-                            ReferencesFound = (uint)Math.Max(0, refsFound),
-                            TotalChunks = (uint)Math.Max(0, chunks),
-                            CompressedSha256 = ByteString.CopyFrom(compressedHash)
-                        }
-                    });
-
-                    // Stream compressed output from temp file
-                    const int outChunkSize = 1024 * 1024;
-                    uint seq = 0;
-                    await using (var compressedFs = new FileStream(compressedTempPath, FileMode.Open, FileAccess.Read,
-                                     FileShare.Read, bufferSize: 1024 * 1024, useAsync: true))
-                    {
-                        byte[] buf = new byte[outChunkSize];
-                        int read;
-                        while ((read = await compressedFs.ReadAsync(buf, 0, outChunkSize, context.CancellationToken)) > 0)
-                        {
-                            await responseStream.WriteAsync(new FileUploadResponse
-                            {
-                                Chunk = new FileChunk
-                                {
-                                    Seq = seq++,
-                                    Data = ByteString.CopyFrom(buf, 0, read),
-                                    Eof = false
-                                }
-                            });
-                        }
-                    }
-
-                    // EOF
-                    await responseStream.WriteAsync(new FileUploadResponse
-                    {
-                        Chunk = new FileChunk { Seq = seq, Data = ByteString.Empty, Eof = true }
-                    });
-                }
-                finally
+                // EOF
+                await responseStream.WriteAsync(new FileUploadResponse
                 {
-                    try { if (File.Exists(compressedTempPath)) File.Delete(compressedTempPath); } catch { }
-                }
+                    Chunk = new FileChunk { Seq = 0, Data = ByteString.Empty, Eof = true }
+                });
             }
             else
             {
