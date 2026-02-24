@@ -1148,14 +1148,13 @@ public class CrossService : ICross
                              FileShare.None, bufferSize: 1024 * 1024, useAsync: true);
         using var bw = new BinaryWriter(outputFs, Encoding.UTF8, leaveOpen: true);
 
-        // Header
+        // Header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes (hash is written as trailer)
         bw.Write(V4Magic);
         bw.Write(originalFileSize);
-        bw.Write(originalHash);
         bw.Write(blockCount);
         await outputFs.FlushAsync(ct);
 
-        long headerBytes = outputFs.Position;
+        long headerBytes = 4 + 8 + 4;
         totalCompressedSize += headerBytes;
 
         byte[] windowBuffer = new byte[windowSize];
@@ -1197,6 +1196,11 @@ public class CrossService : ICross
             Console.WriteLine($"[CompressWindowed] Block {block + 1}/{blockCount}: compressed {totalRead} → {compressedBlock.Length} (ratio {(double)compressedBlock.Length / Math.Max(1, totalRead):F3})");
         }
 
+        // Write SHA256 hash as trailer at end of file
+        await outputFs.WriteAsync(originalHash, 0, originalHash.Length, ct);
+        await outputFs.FlushAsync(ct);
+        totalCompressedSize += 32;
+
         Console.WriteLine($"[CompressWindowed] DONE: {originalFileSize} → {totalCompressedSize} bytes, {blockCount} blocks, refs={totalRefs}");
         return (totalCompressedSize, totalRefs, totalChunks);
     }
@@ -1205,6 +1209,8 @@ public class CrossService : ICross
     /// TRUE STREAMING: Compress a file that's still being written, processing windows in order as they arrive.
     /// Reads windows from file as they become available, compresses in order, writes to output in order.
     /// RAM usage ≈ O(windowSize). No need to wait for entire file.
+    /// Format: Header(magic+fileSize+blockCount) → Blocks → Trailer(sha256)
+    /// Hash is written as a TRAILER (not in header) because the output stream is forward-only (gRPC).
     /// </summary>
     public async Task<(long CompressedSize, int TotalRefs, int TotalChunks)> CompressFileWindowedStreamAsync(
         string inputPath, Stream outputStream, long declaredFileSize, CancellationToken ct = default)
@@ -1218,7 +1224,7 @@ public class CrossService : ICross
 
         Console.WriteLine($"[CompressWindowedStream] file={originalFileSize} bytes, windowSize={windowSize}, blocks={blockCount}");
 
-        // ── 2. Write placeholder header (we'll update hash at end) ──
+        // ── 2. Write header (NO hash — hash goes at end as trailer) ──
         long totalCompressedSize = 0;
         int totalRefs = 0;
         int totalChunks = 0;
@@ -1228,16 +1234,13 @@ public class CrossService : ICross
         using var bw = new BinaryWriter(outputStream, Encoding.UTF8, leaveOpen: true);
         using var sha = System.Security.Cryptography.SHA256.Create();
 
-        // Write header with placeholder hash (we'll compute as we read)
-        long headerPos = outputStream.Position;
+        // Header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes
         bw.Write(V4Magic);
         bw.Write(originalFileSize);
-        byte[] placeholderHash = new byte[32]; // Placeholder - will update at end
-        bw.Write(placeholderHash);
         bw.Write(blockCount);
         await outputStream.FlushAsync(ct);
 
-        long headerBytes = 4 + 8 + 32 + 4; // magic + size + hash + blockCount
+        long headerBytes = 4 + 8 + 4; // magic + size + blockCount
         totalCompressedSize += headerBytes;
 
         byte[] windowBuffer = new byte[windowSize];
@@ -1291,7 +1294,6 @@ public class CrossService : ICross
             if (totalRead == 0 && block < blockCount - 1)
             {
                 Console.WriteLine($"[CompressWindowedStream] WARNING: Block {block + 1} read 0 bytes, file may not be complete yet. Waiting...");
-                // For last block, it's OK if it's smaller, but for others we should wait
                 int extraRetries = 0;
                 while (totalRead == 0 && extraRetries < 500)
                 {
@@ -1336,18 +1338,16 @@ public class CrossService : ICross
             Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: compressed {totalRead} → {compressedBlock.Length} (ratio {(double)compressedBlock.Length / Math.Max(1, totalRead):F3}) → STREAMED");
         }
 
-        // ── 4. Finalize hash and update header ──
+        // ── 4. Finalize hash and write as TRAILER (no seeking needed!) ──
         sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
         byte[] finalHash = sha.Hash!;
 
-        // Update hash in header
-        long currentPos = outputStream.Position;
-        outputStream.Position = headerPos + 4 + 8; // Skip magic and file size
+        // Write hash as trailer at end of stream
         await outputStream.WriteAsync(finalHash, 0, 32, ct);
-        outputStream.Position = currentPos; // Restore position
         await outputStream.FlushAsync(ct);
+        totalCompressedSize += 32;
 
-        Console.WriteLine($"[CompressWindowedStream] DONE: {originalFileSize} → {totalCompressedSize} bytes, {blockCount} blocks, refs={totalRefs}");
+        Console.WriteLine($"[CompressWindowedStream] DONE: {originalFileSize} → {totalCompressedSize} bytes, {blockCount} blocks, refs={totalRefs}, hash={Convert.ToHexString(finalHash)}");
         return (totalCompressedSize, totalRefs, totalChunks);
     }
 
@@ -1366,13 +1366,12 @@ public class CrossService : ICross
                              FileShare.None, bufferSize: 1024 * 1024, useAsync: true);
         using var br = new BinaryReader(inputFs, Encoding.UTF8, leaveOpen: true);
 
-        // ── 1. Read header ──
+        // ── 1. Read header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes ──
         byte[] magic = br.ReadBytes(4);
         if (!magic.AsSpan().SequenceEqual(V4Magic))
             throw new InvalidDataException("Not a v4.0.0 windowed compressed file (bad magic).");
 
         long originalFileSize = br.ReadInt64();
-        byte[] expectedHash = br.ReadBytes(32);
         int blockCount = br.ReadInt32();
 
         Console.WriteLine($"[DecompressWindowed] originalSize={originalFileSize}, blocks={blockCount}");
@@ -1415,7 +1414,12 @@ public class CrossService : ICross
             Console.WriteLine($"[DecompressWindowed] Block {block + 1}/{blockCount}: OK ({decompressedBlock.Length} bytes)");
         }
 
-        // ── 3. Verify whole-file SHA256 ──
+        // ── 3. Read SHA256 hash from trailer (last 32 bytes after all blocks) ──
+        byte[] expectedHash = br.ReadBytes(32);
+        if (expectedHash.Length != 32)
+            throw new InvalidDataException("Missing SHA256 trailer in compressed file.");
+
+        // ── 4. Verify whole-file SHA256 ──
         sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
         byte[] actualHash = sha.Hash!;
 
@@ -1445,13 +1449,12 @@ public class CrossService : ICross
                              FileShare.Read, bufferSize: 1024 * 1024, useAsync: true);
         using var br = new BinaryReader(inputFs, Encoding.UTF8, leaveOpen: true);
 
-        // ── 1. Read header ──
+        // ── 1. Read header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes ──
         byte[] magic = br.ReadBytes(4);
         if (!magic.AsSpan().SequenceEqual(V4Magic))
             throw new InvalidDataException("Not a v4.0.0 windowed compressed file (bad magic).");
 
         long originalFileSize = br.ReadInt64();
-        byte[] expectedHash = br.ReadBytes(32);
         int blockCount = br.ReadInt32();
 
         Console.WriteLine($"[DecompressWindowedStream] originalSize={originalFileSize}, blocks={blockCount}");
@@ -1495,7 +1498,12 @@ public class CrossService : ICross
             Console.WriteLine($"[DecompressWindowedStream] Block {block + 1}/{blockCount}: OK ({decompressedBlock.Length} bytes) → streamed");
         }
 
-        // ── 3. Verify whole-file SHA256 ──
+        // ── 3. Read SHA256 hash from trailer (last 32 bytes after all blocks) ──
+        byte[] expectedHash = br.ReadBytes(32);
+        if (expectedHash.Length != 32)
+            throw new InvalidDataException("Missing SHA256 trailer in compressed file.");
+
+        // ── 4. Verify whole-file SHA256 ──
         sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
         byte[] actualHash = sha.Hash!;
 
