@@ -364,23 +364,43 @@ public class CompressFileService : FileService.FileServiceBase
                     sha.TransformBlock(data, 0, data.Length, null, 0);
                     receivedBytes += data.Length;
                     
+                    // Flush frequently so compression can read the data
+                    if (willUseWindowed && compressionTask != null && receivedBytes % (10 * 1024 * 1024) < data.Length)
+                    {
+                        await fs.FlushAsync(context.CancellationToken);
+                    }
+                    
                     // Start compression in parallel once we have first window (for windowed files)
                     if (willUseWindowed && compressionTask == null && receivedBytes >= windowedThreshold)
                     {
-                        Console.WriteLine($"[ProcessFileStream] Starting parallel compression (received {receivedBytes / (1024.0 * 1024.0):F1} MB)...");
+                        Console.WriteLine($"[ProcessFileStream] ✅ Starting parallel compression NOW (received {receivedBytes / (1024.0 * 1024.0):F1} MB, threshold={windowedThreshold / (1024.0 * 1024.0):F1} MB)...");
                         compressionTask = Task.Run(async () =>
                         {
                             try
                             {
+                                Console.WriteLine($"[ProcessFileStream] Compression task started, waiting 500ms for file handle...");
                                 // Wait a bit for file handle to be available, then start compressing
                                 await Task.Delay(500, context.CancellationToken);
+                                Console.WriteLine($"[ProcessFileStream] Compression task: Starting CompressFileWindowedStreamAsync (file={tempPath}, declaredSize={declaredSize})...");
+                                
+                                // Verify file exists and is readable
+                                if (!File.Exists(tempPath))
+                                {
+                                    Console.WriteLine($"[ProcessFileStream] ERROR: File {tempPath} does not exist!");
+                                    throw new FileNotFoundException($"Temp file not found: {tempPath}");
+                                }
+                                
+                                long fileSize = new FileInfo(tempPath).Length;
+                                Console.WriteLine($"[ProcessFileStream] Compression task: File exists, size={fileSize} bytes");
                                 
                                 using var compSha = SHA256.Create();
                                 var grpcStream = new GrpcResponseStream(responseStream, context.CancellationToken);
                                 using var hashStream = new CryptoStream(grpcStream, compSha, CryptoStreamMode.Write);
 
+                                Console.WriteLine($"[ProcessFileStream] Compression task: Calling CompressFileWindowedStreamAsync...");
                                 var (compressedSize, refsFound, chunks) =
-                                    await crossService.CompressFileWindowedStreamAsync(tempPath, hashStream, declaredSize > 0 ? (long)declaredSize : receivedBytes, context.CancellationToken);
+                                    await crossService.CompressFileWindowedStreamAsync(tempPath, hashStream, declaredSize > 0 ? (long)declaredSize : fileSize, context.CancellationToken);
+                                Console.WriteLine($"[ProcessFileStream] Compression task: CompressFileWindowedStreamAsync completed!");
 
                                 await hashStream.FlushFinalBlockAsync(context.CancellationToken);
                                 byte[] compressedHash = compSha.Hash!;

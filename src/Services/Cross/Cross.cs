@@ -1244,6 +1244,7 @@ public class CrossService : ICross
         long totalReadSoFar = 0;
 
         // ── 3. Process windows in order as they become available ──
+        Console.WriteLine($"[CompressWindowedStream] 🚀 STARTING compression (file={originalFileSize} bytes, {blockCount} blocks, file may still be growing)");
         for (int block = 0; block < blockCount; block++)
         {
             ct.ThrowIfCancellationRequested();
@@ -1252,18 +1253,21 @@ public class CrossService : ICross
             int remaining = (int)Math.Min(windowSize, originalFileSize - totalReadSoFar);
             int totalRead = 0;
             int retries = 0;
-            const int maxRetries = 100;
+            const int maxRetries = 1000; // More retries for large files
+            
+            Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: Starting read (need {remaining} bytes, file size={inputFs.Length}, pos={inputFs.Position})");
             
             while (totalRead < remaining && retries < maxRetries)
             {
                 long filePos = inputFs.Position;
-                long availableBytes = inputFs.Length - filePos;
+                long fileLength = inputFs.Length;
+                long availableBytes = fileLength - filePos;
                 
                 if (availableBytes < remaining - totalRead)
                 {
                     // File not ready yet, wait a bit
-                    if (retries % 10 == 0)
-                        Console.WriteLine($"[CompressWindowedStream] Block {block + 1}: waiting for data (have {availableBytes}, need {remaining - totalRead})");
+                    if (retries % 50 == 0) // Log every 5 seconds
+                        Console.WriteLine($"[CompressWindowedStream] Block {block + 1}: waiting for data (have {availableBytes}, need {remaining - totalRead}, file size={fileLength}/{originalFileSize})");
                     await Task.Delay(100, ct);
                     retries++;
                     continue;
@@ -1285,7 +1289,25 @@ public class CrossService : ICross
             }
 
             if (totalRead == 0 && block < blockCount - 1)
-                throw new InvalidDataException($"Failed to read window {block + 1}: file may not be complete");
+            {
+                Console.WriteLine($"[CompressWindowedStream] WARNING: Block {block + 1} read 0 bytes, file may not be complete yet. Waiting...");
+                // For last block, it's OK if it's smaller, but for others we should wait
+                int extraRetries = 0;
+                while (totalRead == 0 && extraRetries < 500)
+                {
+                    await Task.Delay(200, ct);
+                    long fileLength = inputFs.Length;
+                    long available = fileLength - inputFs.Position;
+                    if (available > 0)
+                    {
+                        int r = await inputFs.ReadAsync(windowBuffer.AsMemory(0, Math.Min(remaining, (int)available)), ct);
+                        if (r > 0) totalRead = r;
+                    }
+                    extraRetries++;
+                }
+                if (totalRead == 0)
+                    throw new InvalidDataException($"Failed to read window {block + 1}: file may not be complete");
+            }
 
             // Exact-size slice (last window may be smaller)
             byte[] windowData = totalRead == windowSize
