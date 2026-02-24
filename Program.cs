@@ -65,6 +65,18 @@ app.MapGrpcService<CompressFileService>();
 
 app.MapGet("/", () => "Hello World!");
 
+// ── Global exception handlers to prevent silent crashes ──
+AppDomain.CurrentDomain.UnhandledException += (sender, eventArgs) =>
+{
+    Console.WriteLine($"[CROSS UNHANDLED EXCEPTION]: {eventArgs.ExceptionObject}");
+};
+
+TaskScheduler.UnobservedTaskException += (sender, e) =>
+{
+    Console.WriteLine($"[CROSS UNOBSERVED TASK EXCEPTION]: {e.Exception}");
+    e.SetObserved(); // Prevent process termination
+};
+
 app.Run();
 
 void ConfigureServices(IServiceCollection services)
