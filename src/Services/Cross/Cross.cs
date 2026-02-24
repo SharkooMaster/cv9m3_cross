@@ -1075,6 +1075,221 @@ public class CrossService : ICross
         return res.CompressedBytes;
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  v4.0.0 WINDOWED COMPRESSION — O(windowSize) RAM, unlimited file size
+    // ═══════════════════════════════════════════════════════════════════
+    // Format:
+    //   [4 bytes: magic "CV4\0"]
+    //   [8 bytes: originalFileSize (int64)]
+    //   [32 bytes: SHA256 of entire original file]
+    //   [4 bytes: blockCount (int32)]
+    //   ── per block ──
+    //   [8 bytes: blockCompressedLen (int64)]
+    //   [8 bytes: blockOriginalLen (int64)]
+    //   [blockCompressedLen bytes: self-contained v3.0.0 .ccf data]
+    //   ── end blocks ──
+    // Each block is an independent v3.0.0 .ccf file for a window of the
+    // original file.  This means the existing CompressFileWithStats and
+    // DecompressFile work per-block with zero changes.
+
+    private static readonly byte[] V4Magic = "CV4\0"u8.ToArray();
+
+    /// <summary>Default window size for windowed compression (64 MiB).</summary>
+    public static int WindowSize
+    {
+        get
+        {
+            var raw = Environment.GetEnvironmentVariable("CROSS_WINDOW_SIZE_MB");
+            if (int.TryParse(raw, out var mb) && mb > 0) return mb * 1024 * 1024;
+            return 64 * 1024 * 1024; // 64 MiB
+        }
+    }
+
+    /// <summary>
+    /// Compress a large file using windowed v4.0.0 format.
+    /// Reads the input file in windows, compresses each independently,
+    /// writes blocks to the output file.  RAM usage ≈ O(windowSize).
+    /// Returns (totalCompressedSize, totalRefsFound, totalChunks).
+    /// </summary>
+    public async Task<(long CompressedSize, int TotalRefs, int TotalChunks)> CompressFileWindowedAsync(
+        string inputPath, string outputPath, CancellationToken ct = default)
+    {
+        long originalFileSize = new FileInfo(inputPath).Length;
+        int windowSize = WindowSize;
+
+        // ── 1. Compute SHA256 of entire original file (streaming — no full load) ──
+        byte[] originalHash;
+        using (var sha = System.Security.Cryptography.SHA256.Create())
+        await using (var hashStream = new FileStream(inputPath, FileMode.Open, FileAccess.Read,
+                         FileShare.Read, bufferSize: 1024 * 1024, useAsync: true))
+        {
+            byte[] buf = new byte[1024 * 1024];
+            int read;
+            while ((read = await hashStream.ReadAsync(buf, 0, buf.Length, ct)) > 0)
+                sha.TransformBlock(buf, 0, read, null, 0);
+            sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+            originalHash = sha.Hash!;
+        }
+
+        // ── 2. Determine block count ──
+        int blockCount = (int)((originalFileSize + windowSize - 1) / windowSize);
+        if (blockCount == 0) blockCount = 1; // empty file edge case
+
+        Console.WriteLine($"[CompressWindowed] file={originalFileSize} bytes, windowSize={windowSize}, blocks={blockCount}");
+
+        // ── 3. Write header + compress each window ──
+        long totalCompressedSize = 0;
+        int totalRefs = 0;
+        int totalChunks = 0;
+
+        await using var inputFs = new FileStream(inputPath, FileMode.Open, FileAccess.Read,
+                             FileShare.Read, bufferSize: 1024 * 1024, useAsync: true);
+        await using var outputFs = new FileStream(outputPath, FileMode.Create, FileAccess.Write,
+                             FileShare.None, bufferSize: 1024 * 1024, useAsync: true);
+        using var bw = new BinaryWriter(outputFs, Encoding.UTF8, leaveOpen: true);
+
+        // Header
+        bw.Write(V4Magic);
+        bw.Write(originalFileSize);
+        bw.Write(originalHash);
+        bw.Write(blockCount);
+        await outputFs.FlushAsync(ct);
+
+        long headerBytes = outputFs.Position;
+        totalCompressedSize += headerBytes;
+
+        byte[] windowBuffer = new byte[windowSize];
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            // Read one window
+            int remaining = (int)Math.Min(windowSize, originalFileSize - inputFs.Position);
+            int totalRead = 0;
+            while (totalRead < remaining)
+            {
+                int r = await inputFs.ReadAsync(windowBuffer.AsMemory(totalRead, remaining - totalRead), ct);
+                if (r == 0) break;
+                totalRead += r;
+            }
+
+            // Exact-size slice (last window may be smaller)
+            byte[] windowData = totalRead == windowSize
+                ? windowBuffer
+                : windowBuffer[..totalRead];
+
+            Console.WriteLine($"[CompressWindowed] Block {block + 1}/{blockCount}: {totalRead} bytes");
+
+            // Compress this window using the existing v3.0.0 pipeline (unchanged!)
+            var (compressedBlock, refs, chunks) = await CompressFileWithStats(windowData);
+            totalRefs += refs;
+            totalChunks += chunks;
+
+            // Write block: [compressedLen][originalLen][compressed data]
+            bw.Write((long)compressedBlock.Length);
+            bw.Write((long)totalRead);
+            await outputFs.WriteAsync(compressedBlock, 0, compressedBlock.Length, ct);
+            await outputFs.FlushAsync(ct);
+
+            totalCompressedSize += 8 + 8 + compressedBlock.Length;
+
+            Console.WriteLine($"[CompressWindowed] Block {block + 1}/{blockCount}: compressed {totalRead} → {compressedBlock.Length} (ratio {(double)compressedBlock.Length / Math.Max(1, totalRead):F3})");
+        }
+
+        Console.WriteLine($"[CompressWindowed] DONE: {originalFileSize} → {totalCompressedSize} bytes, {blockCount} blocks, refs={totalRefs}");
+        return (totalCompressedSize, totalRefs, totalChunks);
+    }
+
+    /// <summary>
+    /// Decompress a v4.0.0 windowed file.  Reads blocks from the input file,
+    /// decompresses each independently, writes to the output file.
+    /// RAM usage ≈ O(windowSize).
+    /// Returns the total decompressed size.
+    /// </summary>
+    public async Task<long> DecompressFileWindowedAsync(
+        string inputPath, string outputPath, CancellationToken ct = default)
+    {
+        await using var inputFs = new FileStream(inputPath, FileMode.Open, FileAccess.Read,
+                             FileShare.Read, bufferSize: 1024 * 1024, useAsync: true);
+        await using var outputFs = new FileStream(outputPath, FileMode.Create, FileAccess.Write,
+                             FileShare.None, bufferSize: 1024 * 1024, useAsync: true);
+        using var br = new BinaryReader(inputFs, Encoding.UTF8, leaveOpen: true);
+
+        // ── 1. Read header ──
+        byte[] magic = br.ReadBytes(4);
+        if (!magic.AsSpan().SequenceEqual(V4Magic))
+            throw new InvalidDataException("Not a v4.0.0 windowed compressed file (bad magic).");
+
+        long originalFileSize = br.ReadInt64();
+        byte[] expectedHash = br.ReadBytes(32);
+        int blockCount = br.ReadInt32();
+
+        Console.WriteLine($"[DecompressWindowed] originalSize={originalFileSize}, blocks={blockCount}");
+
+        // ── 2. Decompress each block ──
+        long totalDecompressed = 0;
+        using var sha = System.Security.Cryptography.SHA256.Create();
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            long compressedLen = br.ReadInt64();
+            long originalLen = br.ReadInt64();
+
+            // Read the v3.0.0 .ccf block
+            byte[] compressedBlock = new byte[compressedLen];
+            int totalRead = 0;
+            while (totalRead < compressedLen)
+            {
+                int r = await inputFs.ReadAsync(compressedBlock.AsMemory(totalRead, (int)(compressedLen - totalRead)), ct);
+                if (r == 0) throw new InvalidDataException($"Unexpected EOF in block {block}.");
+                totalRead += r;
+            }
+
+            Console.WriteLine($"[DecompressWindowed] Block {block + 1}/{blockCount}: {compressedLen} compressed → decompressing...");
+
+            // Decompress using existing v3.0.0 pipeline (unchanged!)
+            byte[] decompressedBlock = await DecompressFile(compressedBlock);
+
+            if (decompressedBlock.Length != originalLen)
+                throw new InvalidDataException(
+                    $"Block {block}: decompressed size {decompressedBlock.Length} != expected {originalLen}.");
+
+            // Write to output and update rolling hash
+            await outputFs.WriteAsync(decompressedBlock, 0, decompressedBlock.Length, ct);
+            sha.TransformBlock(decompressedBlock, 0, decompressedBlock.Length, null, 0);
+            totalDecompressed += decompressedBlock.Length;
+
+            Console.WriteLine($"[DecompressWindowed] Block {block + 1}/{blockCount}: OK ({decompressedBlock.Length} bytes)");
+        }
+
+        // ── 3. Verify whole-file SHA256 ──
+        sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+        byte[] actualHash = sha.Hash!;
+
+        if (!actualHash.AsSpan().SequenceEqual(expectedHash))
+        {
+            Console.WriteLine($"[DecompressWindowed] ❌ INTEGRITY FAILURE: whole-file SHA256 mismatch");
+            Console.WriteLine($"[DecompressWindowed]    Expected: {Convert.ToHexString(expectedHash)}");
+            Console.WriteLine($"[DecompressWindowed]    Got:      {Convert.ToHexString(actualHash)}");
+            throw new InvalidDataException(
+                "Windowed decompression integrity check failed: SHA256 of reconstructed file does not match original.");
+        }
+
+        Console.WriteLine($"[DecompressWindowed] ✅ SHA256 verified, total={totalDecompressed} bytes");
+        return totalDecompressed;
+    }
+
+    /// <summary>
+    /// Detect whether a compressed file is v4.0.0 windowed format by checking the magic bytes.
+    /// </summary>
+    public static bool IsV4Format(byte[] headerBytes)
+    {
+        return headerBytes.Length >= 4 && headerBytes.AsSpan(0, 4).SequenceEqual(V4Magic);
+    }
+
     public async Task<byte[]> DecompressFile(byte[] file)
     {
         using var rootSpan = Observability.StartStage("DecompressFile");
