@@ -755,11 +755,11 @@ public class CrossService : ICross
                         differingByteCount++;
                 }
 
-                // BLOAT GUARD: only re-store if chunks share less than 60% at the byte level.
-                // Allow up to 40% of bytes to differ (60% similarity) — this is the CORE feature
+                // BLOAT GUARD: only re-store if chunks share less than 40% at the byte level.
+                // Allow up to 60% of bytes to differ — this is the CORE feature
                 // that lets us dedup chunks that are similar but not identical.
-                // RLE only affects the ENCODED FILE SIZE, not when we use error encoding.
-                int maxAllowedDifferingBytes = (int)(Globals.chunkSize * 0.40); // 40% threshold
+                // User explicitly: "60% of bytes as diff... THATS FINE, I WANT THAT ALMOST"
+                int maxAllowedDifferingBytes = (int)(Globals.chunkSize * 0.60); // 60% threshold
                 if (differingByteCount > maxAllowedDifferingBytes)
                 {
                     sorted[i].NeedToStore = true;

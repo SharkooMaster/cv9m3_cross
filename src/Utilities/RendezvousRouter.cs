@@ -44,7 +44,15 @@ public static class RendezvousRouter
     public static string PickAgent(string bucketString)
     {
         var nodeNames = _nodeNames;
-        if (nodeNames.Length == 0)
+
+        // ── CRITICAL: Always check cache staleness, not just empty state. ──
+        // BUG FIX: Previously only refreshed when _nodeNames.Length == 0.
+        // If initial DNS resolved only 1 agent (others not ready yet), PickAgent
+        // would PERMANENTLY route everything to that single agent — never re-resolving.
+        // DateTime.UtcNow.Ticks + Interlocked.Read ≈ 5ns — negligible even at 4M calls.
+        long resolvedTicks = Interlocked.Read(ref _resolvedAtTicks);
+        bool stale = (DateTime.UtcNow.Ticks - resolvedTicks) >= TimeSpan.FromSeconds(15).Ticks;
+        if (nodeNames.Length == 0 || stale)
         {
             GetAgents();
             nodeNames = _nodeNames;
