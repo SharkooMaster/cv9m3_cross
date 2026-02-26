@@ -745,16 +745,22 @@ public class CrossService : ICross
                 else
                     baseChunk = new byte[Globals.chunkSize];
 
-                int runCount = Misc.GetErrorEncodingCount(fileChunks[i], baseChunk);
+                // Count actual differing bytes (not RLE runs) for bloat guard
+                // We want to allow up to 40% of bytes to differ (60% similarity threshold).
+                // Only re-store if MORE than 40% of bytes differ.
+                int differingByteCount = 0;
+                for (int j = 0; j < fileChunks[i].Length; j++)
+                {
+                    if (fileChunks[i][j] != baseChunk[j])
+                        differingByteCount++;
+                }
 
-                // BLOAT GUARD: only re-store if chunks share almost nothing at the byte level.
-                // With RLE, each run encodes as 8 bytes (4 pos + 2 length + 2 diff).
-                // 95% threshold = only discard truly spurious LSH matches where <5% bytes match.
-                // At 60% similarity with RLE, ~200 runs × 8 bytes = 1600 bytes — that's FINE,
-                // because the dedup benefit (not re-storing 1024 bytes on agent) is what matters.
-                // Old format: 600 bytes × 6 = 3600 bytes. RLE saves ~55% on typical data.
-                int encodedSizeBytes = runCount * 8; // 8 bytes per RLE run
-                if (encodedSizeBytes > Globals.chunkSize)
+                // BLOAT GUARD: only re-store if chunks share less than 60% at the byte level.
+                // Allow up to 40% of bytes to differ (60% similarity) — this is the CORE feature
+                // that lets us dedup chunks that are similar but not identical.
+                // RLE only affects the ENCODED FILE SIZE, not when we use error encoding.
+                int maxAllowedDifferingBytes = (int)(Globals.chunkSize * 0.40); // 40% threshold
+                if (differingByteCount > maxAllowedDifferingBytes)
                 {
                     sorted[i].NeedToStore = true;
                     sorted[i].Similarity = 1.0f;
@@ -763,7 +769,7 @@ public class CrossService : ICross
                 }
                 else
                 {
-                    if (runCount == 0) emptyDiffCount++;
+                    if (differingByteCount == 0) emptyDiffCount++;
                     else diffCount++;
                 }
             }
