@@ -745,13 +745,16 @@ public class CrossService : ICross
                 else
                     baseChunk = new byte[Globals.chunkSize];
 
-                int pairCount = Misc.GetErrorEncodingCount(fileChunks[i], baseChunk);
+                int runCount = Misc.GetErrorEncodingCount(fileChunks[i], baseChunk);
 
                 // BLOAT GUARD: only re-store if chunks share almost nothing at the byte level.
+                // With RLE, each run encodes as 8 bytes (4 pos + 2 length + 2 diff).
                 // 95% threshold = only discard truly spurious LSH matches where <5% bytes match.
-                // At 60% similarity the diff is ~600/1024 bytes = 3600 encoded bytes — that's FINE,
+                // At 60% similarity with RLE, ~200 runs × 8 bytes = 1600 bytes — that's FINE,
                 // because the dedup benefit (not re-storing 1024 bytes on agent) is what matters.
-                if (pairCount > (int)(Globals.chunkSize * 0.95))
+                // Old format: 600 bytes × 6 = 3600 bytes. RLE saves ~55% on typical data.
+                int encodedSizeBytes = runCount * 8; // 8 bytes per RLE run
+                if (encodedSizeBytes > Globals.chunkSize)
                 {
                     sorted[i].NeedToStore = true;
                     sorted[i].Similarity = 1.0f;
@@ -760,7 +763,7 @@ public class CrossService : ICross
                 }
                 else
                 {
-                    if (pairCount == 0) emptyDiffCount++;
+                    if (runCount == 0) emptyDiffCount++;
                     else diffCount++;
                 }
             }
@@ -999,21 +1002,30 @@ public class CrossService : ICross
                 Buffer.BlockCopy(baseBuffer, 0, verifyBuf, 0, baseBuffer.Length);
 
                 int cursor = 0;
-                foreach (var (key, value) in flatDiff)
+                foreach (var (startPos, runLength, diffValue) in flatDiff)
                 {
-                    cursor += key;
+                    cursor += startPos; // Move to start of run
                     if (cursor < 0 || cursor >= verifyBuf.Length)
                         throw new InvalidDataException(
                             $"Compression integrity: patch cursor {cursor} out of range (buffer {verifyBuf.Length}).");
 
-                    int patched = verifyBuf[cursor] + value;
-                    if (patched < 0 || patched > 255)
+                    // Apply the entire run
+                    for (int j = 0; j < runLength; j++)
                     {
-                        Console.WriteLine($"[Compress] INTEGRITY FAIL: base[{cursor}]={verifyBuf[cursor]} + delta={value} = {patched} (chunk {cursor / Globals.chunkSize}, BucketId={sorted[cursor / Globals.chunkSize].BucketId})");
-                        throw new InvalidDataException(
-                            $"Compression integrity check failed: patch at {cursor} produces out-of-range byte {patched}.");
+                        if (cursor + j >= verifyBuf.Length)
+                            throw new InvalidDataException(
+                                $"Compression integrity: run extends beyond buffer (cursor={cursor}, runLength={runLength}, buffer={verifyBuf.Length}).");
+
+                        int patched = verifyBuf[cursor + j] + diffValue;
+                        if (patched < 0 || patched > 255)
+                        {
+                            Console.WriteLine($"[Compress] INTEGRITY FAIL: base[{cursor + j}]={verifyBuf[cursor + j]} + delta={diffValue} = {patched} (chunk {(cursor + j) / Globals.chunkSize}, BucketId={sorted[(cursor + j) / Globals.chunkSize].BucketId})");
+                            throw new InvalidDataException(
+                                $"Compression integrity check failed: patch at {cursor + j} produces out-of-range byte {patched}.");
+                        }
+                        verifyBuf[cursor + j] = (byte)patched;
                     }
-                    verifyBuf[cursor] = (byte)patched;
+                    cursor += runLength; // Move past the run
                 }
 
                 // Byte-for-byte comparison: patched base must equal original
@@ -1034,22 +1046,24 @@ public class CrossService : ICross
                 }
             }
 
-            // Serialize: <int totalPairCount> + <int deltaIndex><short delta> × totalPairCount
-            using (var errorMs = new MemoryStream(4 + flatDiff.Count * 6))
+            // Serialize RLE: <int totalRunCount> + <int startPos><ushort runLength><short diffValue> × totalRunCount
+            // Each run: 4 + 2 + 2 = 8 bytes (vs old 6 bytes per byte, but runs compress consecutive identical diffs)
+            using (var errorMs = new MemoryStream(4 + flatDiff.Count * 8))
             using (var errorWriter = new BinaryWriter(errorMs, Encoding.UTF8, leaveOpen: true))
             {
                 errorWriter.Write(flatDiff.Count);
-                foreach (var pair in flatDiff)
+                foreach (var (startPos, runLength, diffValue) in flatDiff)
                 {
-                    errorWriter.Write(pair.key);
-                    errorWriter.Write((short)pair.value);
+                    errorWriter.Write(startPos); // 4 bytes: relative start position
+                    errorWriter.Write((ushort)runLength); // 2 bytes: run length (max 65,535)
+                    errorWriter.Write((short)diffValue); // 2 bytes: diff value
                 }
                 errorWriter.Flush();
                 errorDictionaryBytes = errorMs.ToArray();
             }
 
             // ── INTEGRITY CHECK 2: serialization round-trip ──
-            // Deserialize what we just wrote and verify it matches the source diffs.
+            // Deserialize what we just wrote and verify it matches the source runs.
             // Catches truncation (int→short overflow), off-by-one, or stream bugs.
             {
                 using var verifyMs = new MemoryStream(errorDictionaryBytes, writable: false);
@@ -1057,15 +1071,16 @@ public class CrossService : ICross
                 int verifyCount = verifyReader.ReadInt32();
                 if (verifyCount != flatDiff.Count)
                     throw new InvalidDataException(
-                        $"Serialization integrity: pair count mismatch ({verifyCount} vs {flatDiff.Count}).");
+                        $"Serialization integrity: run count mismatch ({verifyCount} vs {flatDiff.Count}).");
 
                 for (int i = 0; i < verifyCount; i++)
                 {
-                    int rKey = verifyReader.ReadInt32();
-                    short rVal = verifyReader.ReadInt16();
-                    if (rKey != flatDiff[i].key || rVal != (short)flatDiff[i].value)
+                    int rStartPos = verifyReader.ReadInt32();
+                    ushort rRunLength = verifyReader.ReadUInt16();
+                    short rDiffValue = verifyReader.ReadInt16();
+                    if (rStartPos != flatDiff[i].startPos || rRunLength != flatDiff[i].runLength || rDiffValue != (short)flatDiff[i].diffValue)
                         throw new InvalidDataException(
-                            $"Serialization integrity: pair[{i}] mismatch. Expected ({flatDiff[i].key},{flatDiff[i].value}), got ({rKey},{rVal}).");
+                            $"Serialization integrity: run[{i}] mismatch. Expected ({flatDiff[i].startPos},{flatDiff[i].runLength},{flatDiff[i].diffValue}), got ({rStartPos},{rRunLength},{rDiffValue}).");
                 }
             }
 
@@ -1614,20 +1629,23 @@ public class CrossService : ICross
             }
         }
 
-        // ── Parse flat error encoding ──
-        // <int totalPairCount> then <int deltaIndex><short delta> × totalPairCount
-        (int deltaIndex, short delta)[] patches;
+        // ── Parse flat error encoding (RLE format) ──
+        // <int totalRunCount> then <int startPos><ushort runLength><short diffValue> × totalRunCount
+        (int startPos, int runLength, short diffValue)[] patches;
         using (var errorMs = new MemoryStream(file, errorOffset, header.ErrorLength, writable: false))
         using (var reader = new BinaryReader(errorMs, Encoding.UTF8, leaveOpen: true))
         {
-            int totalPairCount = reader.ReadInt32();
-            if (totalPairCount < 0)
-                throw new InvalidDataException($"Invalid negative total pair count: {totalPairCount}");
+            int totalRunCount = reader.ReadInt32();
+            if (totalRunCount < 0)
+                throw new InvalidDataException($"Invalid negative total run count: {totalRunCount}");
 
-            patches = new (int, short)[totalPairCount];
-            for (int i = 0; i < totalPairCount; i++)
+            patches = new (int, int, short)[totalRunCount];
+            for (int i = 0; i < totalRunCount; i++)
             {
-                patches[i] = (reader.ReadInt32(), reader.ReadInt16());
+                int startPos = reader.ReadInt32();
+                ushort runLength = reader.ReadUInt16();
+                short diffValue = reader.ReadInt16();
+                patches[i] = (startPos, runLength, diffValue);
             }
         }
 
@@ -1784,19 +1802,28 @@ public class CrossService : ICross
             Buffer.BlockCopy(baseChunks[i], 0, baseBuffer, i * Globals.chunkSize, Globals.chunkSize);
         }
 
-        // ── Apply flat error encoding across the entire buffer ──
+        // ── Apply flat error encoding (RLE) across the entire buffer ──
         int cursor = 0;
-        foreach (var (deltaIndex, delta) in patches)
+        foreach (var (startPos, runLength, diffValue) in patches)
         {
-            cursor += deltaIndex;
+            cursor += startPos; // Move to start of run (relative position)
             if (cursor < 0 || cursor >= baseBuffer.Length)
                 throw new InvalidDataException(
                     $"Patch cursor {cursor} out of range (buffer size {baseBuffer.Length}).");
 
-            int patched = baseBuffer[cursor] + delta;
-            if (patched < 0 || patched > 255)
-                throw new InvalidDataException($"Patched byte {patched} out of range at cursor {cursor}.");
-            baseBuffer[cursor] = (byte)patched;
+            // Apply the entire run
+            for (int j = 0; j < runLength; j++)
+            {
+                if (cursor + j >= baseBuffer.Length)
+                    throw new InvalidDataException(
+                        $"Run extends beyond buffer (cursor={cursor}, runLength={runLength}, buffer={baseBuffer.Length}).");
+
+                int patched = baseBuffer[cursor + j] + diffValue;
+                if (patched < 0 || patched > 255)
+                    throw new InvalidDataException($"Patched byte {patched} out of range at cursor {cursor + j}.");
+                baseBuffer[cursor + j] = (byte)patched;
+            }
+            cursor += runLength; // Move past the run
         }
 
         // ── Assemble output: reconstructed buffer + trim chunk ──
@@ -1961,31 +1988,44 @@ public class CrossService : ICross
                         .Select(r => r.Chunk.ToByteArray())
                         .ToArray();
 
-                    // 2) First pass: find best by error COUNT only
+                    // 2) First pass: find best by error COUNT only (RLE run count)
                     int bestErrorCount = Globals.chunkSize;
                     int bestIndex = -1;
                     for (int j = 0; j < chunkBytesArray.Length; j++)
                     {
-                        var count = Misc.GetErrorEncoding(
+                        int runCount = Misc.GetErrorEncodingCount(
                             fileChunks[i],
                             chunkBytesArray[j]
-                        ).Count;
+                        );
 
-                        if (count < bestErrorCount)
+                        if (runCount < bestErrorCount)
                         {
-                            bestErrorCount = count;
+                            bestErrorCount = runCount;
                             bestIndex = j;
                         }
                     }
 
-                    // 3) Second pass: full encoding for the best candidate
+                    // 3) Second pass: full encoding for the best candidate (RLE format)
                     var bestEncoding = Misc.GetErrorEncoding(
                         fileChunks[i],
                         chunkBytesArray[bestIndex]
                     );
 
                     final_results[i] = candidates[bestIndex];
-                    final_error_results[i] = bestEncoding;
+                    // Convert RLE runs to legacy (key, value) pairs for old code path compatibility
+                    // This is dead code (_CompressFile is never called), but keep it compiling
+                    final_error_results[i] = new List<(int, int)>();
+                    int legacyLastAppend = 0;
+                    foreach (var (startPos, runLength, diffValue) in bestEncoding)
+                    {
+                        int absStart = legacyLastAppend + startPos;
+                        for (int k = 0; k < runLength; k++)
+                        {
+                            int key = (k == 0) ? (absStart - legacyLastAppend) : 1;
+                            final_error_results[i].Add((key, diffValue));
+                        }
+                        legacyLastAppend = absStart + runLength;
+                    }
                 }
 
                 return ValueTask.CompletedTask;
@@ -2020,7 +2060,7 @@ public class CrossService : ICross
         for (int i = 0; i < encoded_objects.Count; i++)
         {
             first_bytes.AddRange(BitConverter.GetBytes(encoded_objects[i].bucket_id));
-            (byte[], int) _errors = Misc.GetErrorEncodingBytes(encoded_objects[i].error_encoding, error_bytes_offset);
+            (byte[], int) _errors = Misc.GetErrorEncodingBytesLegacy(encoded_objects[i].error_encoding, error_bytes_offset);
             error_bytes_offset = _errors.Item2;
             error_bytes.AddRange(_errors.Item1);
         }

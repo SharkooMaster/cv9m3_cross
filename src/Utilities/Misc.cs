@@ -155,52 +155,119 @@ static public class Misc
         return new string(chars);
     }
 
-    public static List<(int key, int value)> GetErrorEncoding(byte[] a, byte[] b)
+    /// <summary>
+    /// Get error encoding with RLE (Run-Length Encoding) for consecutive bytes with same diff.
+    /// Returns list of (startPosition, runLength, diffValue) tuples.
+    /// startPosition is relative to the last run's end (delta encoding for positions).
+    /// </summary>
+    public static List<(int startPos, int runLength, int diffValue)> GetErrorEncoding(byte[] a, byte[] b)
     {
-        List<(int key, int value)> to_return = new List<(int, int)>();
-        int last_append = 0;
+        List<(int startPos, int runLength, int diffValue)> runs = new List<(int, int, int)>();
+        int lastPos = 0; // Last position where a run ended (for delta encoding)
 
         for (int i = 0; i < a.Length; i++)
         {
-            // Delta should represent how much to add to BASE to get ORIGINAL:
-            // original = base + delta  =>  delta = original - base
             int dif = a[i] - b[i];
-            if(dif != 0)
+            if (dif != 0)
             {
-                int key = i - last_append;
-                to_return.Add((key, dif));
-                last_append = i;
+                // Start a new run
+                int runStart = i;
+                int runLength = 1;
+                int runDiff = dif;
+
+                // Extend the run as long as consecutive bytes have the same diff
+                while (i + 1 < a.Length && (a[i + 1] - b[i + 1]) == dif)
+                {
+                    runLength++;
+                    i++;
+                }
+
+                // Encode: relative start position (delta), run length, diff value
+                int relativeStart = runStart - lastPos;
+                runs.Add((relativeStart, runLength, runDiff));
+                lastPos = runStart + runLength;
             }
         }
-        return to_return;
+        return runs;
     }
 
     /// <summary>
-    /// Count-only version of GetErrorEncoding — no list allocation.
-    /// Used by the bloat guard to check if a per-chunk diff would exceed chunk size.
+    /// Count-only version of GetErrorEncoding — estimates encoded size with RLE.
+    /// Returns the number of runs (not individual bytes), which is what matters for bloat guard.
+    /// Each run encodes as: 4 bytes (startPos) + 2 bytes (runLength) + 2 bytes (diffValue) = 8 bytes.
     /// </summary>
     public static int GetErrorEncodingCount(byte[] a, byte[] b)
     {
-        int count = 0;
+        int runCount = 0;
         for (int i = 0; i < a.Length; i++)
         {
-            if (a[i] != b[i])
-                count++;
+            int dif = a[i] - b[i];
+            if (dif != 0)
+            {
+                runCount++;
+                // Skip consecutive bytes with same diff (they're part of this run)
+                while (i + 1 < a.Length && (a[i + 1] - b[i + 1]) == dif)
+                {
+                    i++;
+                }
+            }
         }
-        return count;
+        return runCount;
     }
 
-    public static (byte[], int) GetErrorEncodingBytes(List<(int key, int value)> a, int offset)
+    /// <summary>
+    /// Serialize RLE error encoding runs to bytes.
+    /// Format: <int startPos><ushort runLength><short diffValue> per run.
+    /// startPos is relative (delta), offset is accumulated for absolute position tracking.
+    /// </summary>
+    public static (byte[], int) GetErrorEncodingBytes(List<(int startPos, int runLength, int diffValue)> runs, int offset)
     {
         List<byte> to_return = new List<byte>();
         int offset_return = offset;
-        for (int i = 0; i < a.Count; i++)
+        for (int i = 0; i < runs.Count; i++)
         {
-            to_return.AddRange(BitConverter.GetBytes(a[i].key + offset));
-            to_return.AddRange(BitConverter.GetBytes((Int16)a[i].value));
-            offset_return += a[i].key;
+            var (startPos, runLength, diffValue) = runs[i];
+            to_return.AddRange(BitConverter.GetBytes(startPos)); // 4 bytes: relative start position
+            to_return.AddRange(BitConverter.GetBytes((ushort)runLength)); // 2 bytes: run length (max 65,535 bytes per run)
+            to_return.AddRange(BitConverter.GetBytes((short)diffValue)); // 2 bytes: diff value
+            offset_return += startPos + runLength; // Track absolute position
         }
         return (to_return.ToArray(), offset_return);
+    }
+
+    /// <summary>
+    /// Legacy wrapper: converts old (key, value) pairs to RLE format, then serializes.
+    /// Used by dead code path (_CompressFile) for backward compatibility.
+    /// </summary>
+    public static (byte[], int) GetErrorEncodingBytesLegacy(List<(int key, int value)> pairs, int offset)
+    {
+        // Convert pairs to RLE runs (group consecutive identical diffs)
+        List<(int startPos, int runLength, int diffValue)> runs = new List<(int, int, int)>();
+        int lastPos = 0;
+        int cursor = 0;
+
+        for (int i = 0; i < pairs.Count; i++)
+        {
+            cursor += pairs[i].key;
+            int diff = pairs[i].value;
+            int runStart = cursor;
+            int runLength = 1;
+
+            // Extend run if next pairs have same diff and are consecutive
+            while (i + 1 < pairs.Count && pairs[i + 1].key == 1 && pairs[i + 1].value == diff)
+            {
+                runLength++;
+                cursor++;
+                i++;
+            }
+
+            int relativeStart = runStart - lastPos;
+            runs.Add((relativeStart, runLength, diff));
+            lastPos = runStart + runLength;
+            cursor = lastPos;
+        }
+
+        return GetErrorEncodingBytes(runs, offset);
     }
 
     public static List<T> CreateList<T>(int count, Func<T> factory)
