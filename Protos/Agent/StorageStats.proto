@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+import "google/protobuf/empty.proto";
+
+service StorageStats
+{
+    rpc GetStats (google.protobuf.Empty) returns (StorageStats_Result);
+}
+
+message StorageStats_Result
+{
+    uint64 total_unique_chunks = 1;
+    uint64 total_chunk_bytes = 2;
+    uint64 total_buckets = 3;
+    uint64 total_vectors = 4;
+    string node_name = 5;
+}

@@ -730,4 +730,69 @@ public class CompressFileService : FileService.FileServiceBase
 
         Console.WriteLine($"[ProcessFileStream] Monolithic DONE: {receivedBytes} → {compressedBytes.Length}");
     }
+
+    /// <summary>
+    /// Aggregate storage statistics from all agents.
+    /// Queries every known agent in parallel and sums the results.
+    /// </summary>
+    public override async Task<SystemStatsResponse> GetSystemStats(
+        SystemStatsRequest request, ServerCallContext context)
+    {
+        var agentIps = RendezvousRouter.GetAllAgentIps();
+        if (agentIps.Length == 0)
+        {
+            // Force a refresh
+            RendezvousRouter.GetAgents();
+            agentIps = RendezvousRouter.GetAllAgentIps();
+        }
+
+        ulong totalChunks = 0, totalBytes = 0, totalBuckets = 0, totalVectors = 0;
+        uint reachable = 0;
+
+        var tasks = agentIps.Select(async ip =>
+        {
+            try
+            {
+                var client = GrpcChannelFactory.GetClient(
+                    target: ip,
+                    ctor: chan => new StorageStats.StorageStatsClient(chan),
+                    roundRobin: false,
+                    port: 5000);
+
+                var res = await client.GetStatsAsync(
+                    new Google.Protobuf.WellKnownTypes.Empty(),
+                    deadline: DateTime.UtcNow.AddSeconds(10),
+                    cancellationToken: context.CancellationToken);
+
+                return (res.TotalUniqueChunks, res.TotalChunkBytes, res.TotalBuckets, res.TotalVectors, true);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[GetSystemStats] Agent {ip} failed: {ex.Message}");
+                return (0UL, 0UL, 0UL, 0UL, false);
+            }
+        });
+
+        var results = await Task.WhenAll(tasks);
+        foreach (var (chunks, bytes, buckets, vectors, ok) in results)
+        {
+            if (!ok) continue;
+            totalChunks += chunks;
+            totalBytes += bytes;
+            totalBuckets += buckets;
+            totalVectors += vectors;
+            reachable++;
+        }
+
+        Console.WriteLine($"[GetSystemStats] {reachable}/{agentIps.Length} agents: {totalChunks:N0} chunks, {totalBytes / (1024.0 * 1024.0):F1} MB, {totalBuckets:N0} buckets, {totalVectors:N0} vectors");
+
+        return new SystemStatsResponse
+        {
+            TotalUniqueChunks = totalChunks,
+            TotalChunkBytes = totalBytes,
+            TotalBuckets = totalBuckets,
+            TotalVectors = totalVectors,
+            AgentCount = reachable
+        };
+    }
 }

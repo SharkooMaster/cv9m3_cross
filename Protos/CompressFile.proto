@@ -9,6 +9,18 @@ service FileService {
   rpc ProcessFileStream(stream FileUploadRequest) returns (stream FileUploadResponse);
   // Streaming decompression: client streams .ccf, server streams back decompressed bytes.
   rpc DecompressFileStream(stream FileUploadRequest) returns (stream FileUploadResponse);
+  // Aggregate storage stats from all agents.
+  rpc GetSystemStats(SystemStatsRequest) returns (SystemStatsResponse);
+}
+
+message SystemStatsRequest {}
+
+message SystemStatsResponse {
+  uint64 total_unique_chunks = 1;
+  uint64 total_chunk_bytes = 2;
+  uint64 total_buckets = 3;
+  uint64 total_vectors = 4;
+  uint32 agent_count = 5;
 }
 
 // FileRequest represents the file input.

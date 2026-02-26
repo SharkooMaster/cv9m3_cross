@@ -30,6 +30,7 @@
     <Protobuf Include="Protos\Agent\StoreVector.proto" GrpcServices="Client" />
     <Protobuf Include="Protos\Agent\SearchVector.proto" GrpcServices="Client" />
     <Protobuf Include="Protos\Agent\GetNodeInfo.proto" GrpcServices="Client" />
+    <Protobuf Include="Protos\Agent\StorageStats.proto" GrpcServices="Client" />
   </ItemGroup>
 
 </Project>
