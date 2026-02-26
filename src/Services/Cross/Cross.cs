@@ -571,15 +571,12 @@ public class CrossService : ICross
                 ("agents", storeGroups.Count), ("chunks_stored", totalStored));
         }
 
-        // Stats: "references found" = chunks that re-used an existing base (not newly stored chunks).
-        // Count only when Duplicate=true AND similarity < 1.0 (excludes newly stored chunks where similarity=1.0).
-        int referencesFound = sorted.Count(r => r != null && r.Duplicate && r.Similarity < 1.0f);
+        // NOTE: "referencesFound" is computed AFTER BloatRestore (see below)
+        // to reflect actual dedup — chunks that truly reuse an existing base
+        // and do NOT need to be re-stored. Initial LSH match count is tracked
+        // separately as "initialMatches" for diagnostics.
+        int initialMatches = sorted.Count(r => r != null && r.Duplicate && r.Similarity < 1.0f);
         int totalChunks = sorted.Length;
-        int nullCount = sorted.Count(r => r == null);
-        int zeroIdCount = sorted.Count(r => r != null && r.BucketId == 0 && r.BucketKey == 0);
-        int validRefCount = sorted.Count(r => r != null && r.BucketId > 0);
-        int emptyChunkRefs = sorted.Count(r => r != null && r.BucketId > 0 && (r.Chunk == null || r.Chunk.Length == 0));
-        // Removed Console.WriteLine for performance (stats available via observability)
 
         // ── FLAT ERROR ENCODING PREP ──
         // References are built once after all re-stores are finalized.
@@ -893,6 +890,12 @@ public class CrossService : ICross
             Console.WriteLine($"[Compress] BloatRestore: {phaseSw.ElapsedMilliseconds}ms, {bloatedDiffRestore.Count} chunks re-stored");
         }
 
+        // ── ACTUAL DEDUP STAT: computed AFTER BloatRestore so it reflects real savings ──
+        // "referencesFound" = chunks that truly reuse an existing base (not stored fresh).
+        // matchCount = chunks with a valid reference AND not flagged for re-storage.
+        int referencesFound = sorted.Count(r => r != null && !r.NeedToStore && r.BucketId != 0);
+        Console.WriteLine($"[Compress] Stats: initialLshMatches={initialMatches}, actualDedup={referencesFound}, totalChunks={totalChunks}");
+
         // ── Build references (once, after all re-stores are finalized) ──
         // v3.0.0: each ref = [8 bytes: bucketId][32 bytes: storageGuid raw SHA256] = 40 bytes
         // storageGuid is content-addressable (SHA256 of chunk data). Any agent with it has correct data.
@@ -1087,8 +1090,7 @@ public class CrossService : ICross
 
         // Return
         totalSw.Stop();
-        int matchCount = sorted.Count(r => r != null && !r.NeedToStore && r.BucketId != 0);
-        Console.WriteLine($"[Compress] DONE: {totalSw.ElapsedMilliseconds}ms total, in={_file.Length} out={toReturn.Length} ratio={toReturn.Length/(double)_file.Length:F3}, refs={referencesFound}, matches={matchCount}, stored={sorted.Count(r => r != null && r.NeedToStore)}");
+        Console.WriteLine($"[Compress] DONE: {totalSw.ElapsedMilliseconds}ms total, in={_file.Length} out={toReturn.Length} ratio={toReturn.Length/(double)_file.Length:F3}, dedup={referencesFound}, lshMatches={initialMatches}, stored={sorted.Count(r => r != null && r.NeedToStore)}");
         return (toReturn, referencesFound, totalChunks);
     }
 
