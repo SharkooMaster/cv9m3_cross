@@ -761,7 +761,7 @@ public class CompressFileService : FileService.FileServiceBase
 
                 var res = await client.GetStatsAsync(
                     new Google.Protobuf.WellKnownTypes.Empty(),
-                    deadline: DateTime.UtcNow.AddSeconds(10),
+                    deadline: DateTime.UtcNow.AddSeconds(15),
                     cancellationToken: context.CancellationToken);
 
                 return (res.TotalUniqueChunks, res.TotalChunkBytes, res.TotalBuckets, res.TotalVectors, true);

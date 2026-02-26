@@ -747,8 +747,11 @@ public class CrossService : ICross
 
                 int pairCount = Misc.GetErrorEncodingCount(fileChunks[i], baseChunk);
 
-                // BLOAT GUARD: if per-chunk diff bytes would exceed chunk size, re-store as self-reference
-                if (pairCount * 6 >= Globals.chunkSize)
+                // BLOAT GUARD: only re-store if chunks share almost nothing at the byte level.
+                // 95% threshold = only discard truly spurious LSH matches where <5% bytes match.
+                // At 60% similarity the diff is ~600/1024 bytes = 3600 encoded bytes — that's FINE,
+                // because the dedup benefit (not re-storing 1024 bytes on agent) is what matters.
+                if (pairCount > (int)(Globals.chunkSize * 0.95))
                 {
                     sorted[i].NeedToStore = true;
                     sorted[i].Similarity = 1.0f;
