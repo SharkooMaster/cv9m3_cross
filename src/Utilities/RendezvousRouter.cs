@@ -133,7 +133,7 @@ public static class RendezvousRouter
                             port: 5000);
 
                         var res = await client.GetAsync(new Empty(),
-                            deadline: DateTime.UtcNow.AddSeconds(3));
+                            deadline: DateTime.UtcNow.AddSeconds(10));
 
                         string nodeName = res.NodeName;
                         if (!string.IsNullOrWhiteSpace(nodeName))
@@ -146,7 +146,7 @@ public static class RendezvousRouter
                     return (nodeName: "", ip, ok: false);
                 }).ToArray();
 
-                Task.WaitAll(tasks, TimeSpan.FromSeconds(5));
+                Task.WaitAll(tasks, TimeSpan.FromSeconds(15));
 
                 foreach (var t in tasks)
                 {

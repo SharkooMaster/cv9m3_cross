@@ -77,6 +77,19 @@ TaskScheduler.UnobservedTaskException += (sender, e) =>
     e.SetObserved(); // Prevent process termination
 };
 
+// Warm up agent discovery before accepting traffic — ensures the first
+// compression request doesn't hit a cold router with partial agent visibility.
+try
+{
+    Console.WriteLine("[Cross] Warming up agent discovery...");
+    var agents = RendezvousRouter.GetAgents();
+    Console.WriteLine($"[Cross] Agent warmup complete: {agents.Length} agents discovered");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"[Cross] Agent warmup failed (will retry on first request): {ex.Message}");
+}
+
 app.Run();
 
 void ConfigureServices(IServiceCollection services)
