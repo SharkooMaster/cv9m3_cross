@@ -26,6 +26,17 @@ public static class Globals
         float.TryParse(Environment.GetEnvironmentVariable("BLOAT_GUARD_THRESHOLD"), out var bgt) ? bgt : 0.60f;
 
     /// <summary>
+    /// Bloat guard threshold for clustered non-representative chunks. These chunks
+    /// share a bitstring with their rep, so they are genuinely similar. Ejecting a
+    /// non-rep ADDS to datacenter storage (new store). Keeping it only adds to client
+    /// .ccf diff size. Since datacenter growth is the priority metric, we tolerate a
+    /// larger diff for non-reps before ejecting. Default 0.85 = eject only if >85%
+    /// of bytes differ (nearly random relative to base).
+    /// </summary>
+    public static float ClusterBloatGuardThreshold =
+        float.TryParse(Environment.GetEnvironmentVariable("CLUSTER_BLOAT_GUARD_THRESHOLD"), out var cbgt) ? cbgt : 0.85f;
+
+    /// <summary>
     /// Local chunk clustering: group chunks with identical LSH bitstrings before
     /// searching agents. Reduces agent I/O by 5-50x and captures intra-file dedup
     /// that is otherwise impossible (chunks not yet stored when later chunks search).

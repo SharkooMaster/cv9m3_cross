@@ -883,9 +883,13 @@ public class CrossService : ICross
 
             // ── Bloat guard pre-pass ──
             // Detect chunks whose diff would be larger than the raw chunk.
-            // For clustered non-reps, the base is the representative's base chunk.
-            // If a non-rep's diff exceeds threshold, eject it: store individually.
-            int maxAllowedDifferingBytes = (int)(Globals.chunkSize * Globals.BloatGuardThreshold);
+            // Two thresholds: standard for regular search matches, and a more lenient
+            // one for clustered non-reps. Ejecting a non-rep adds to datacenter storage
+            // (new store), while keeping it only increases client .ccf diff size.
+            // Since datacenter growth is the priority metric, we tolerate bigger diffs
+            // for non-reps before ejecting.
+            int maxAllowedRegular = (int)(Globals.chunkSize * Globals.BloatGuardThreshold);
+            int maxAllowedCluster = (int)(Globals.chunkSize * Globals.ClusterBloatGuardThreshold);
             for (int i = 0; i < sorted.Length; i++)
             {
                 if (sorted[i].BucketId == 0 && sorted[i].BucketKey == 0)
@@ -900,7 +904,6 @@ public class CrossService : ICross
                     continue;
                 }
 
-                // Determine the base chunk for this chunk's diff
                 byte[] baseChunk;
                 bool isNonRep = !representativeSet.Contains(i);
                 int rep = groupRepresentative[i];
@@ -919,9 +922,9 @@ public class CrossService : ICross
                         differingByteCount++;
                 }
 
-                if (differingByteCount > maxAllowedDifferingBytes)
+                int threshold = isNonRep ? maxAllowedCluster : maxAllowedRegular;
+                if (differingByteCount > threshold)
                 {
-                    // Eject: this chunk needs its own store (too different from base)
                     sorted[i].NeedToStore = true;
                     sorted[i].Similarity = 1.0f;
                     sorted[i].TargetAgent = mainAgents[i];
@@ -1144,6 +1147,10 @@ public class CrossService : ICross
                 byte[]? baseForHash = null;
                 if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
                     baseForHash = sorted[i].Chunk.ToByteArray();
+                else if (!representativeSet.Contains(i)
+                         && sorted[groupRepresentative[i]].NeedToStore
+                         && sorted[groupRepresentative[i]].BucketId != 0)
+                    baseForHash = fileChunks[groupRepresentative[i]];
                 if (baseForHash != null)
                     storageGuid = Convert.ToHexString(SHA256.HashData(baseForHash)).ToLowerInvariant();
             }
