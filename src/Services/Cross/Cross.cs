@@ -1122,10 +1122,11 @@ public class CrossService : ICross
             datacenterBytesStored = zstdComp.Wrap(storedData.AsSpan(0, pos)).Length;
         }
 
+        long rawStoredBytes = (long)storedChunks * Globals.chunkSize;
         Console.WriteLine($"[Compress] Stats: initialLshMatches={initialMatches}, actualDedup={referencesFound}, " +
             $"stored={storedChunks}, totalChunks={totalChunks}, " +
             $"clusteredNonReps={clusteredNonReps}, ejectedByBloat={ejectedByBloat}, " +
-            $"datacenterBytes={datacenterBytesStored}");
+            $"rawStoredBytes={rawStoredBytes}, datacenterBytesZstd={datacenterBytesStored}");
 
         // ── Build references (once, after all re-stores are finalized) ──
         // v3.1.0: flag-based variable-size refs (saves ~23 bytes per self-stored chunk)
