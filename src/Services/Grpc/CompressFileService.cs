@@ -522,7 +522,7 @@ public class CompressFileService : FileService.FileServiceBase
             throw new RpcException(new Status(StatusCode.InvalidArgument, "SHA-256 mismatch for uploaded file."));
 
         // ── Wait for pipeline to finish writing all compressed blocks ──
-        var (compressedSize, refsFound, totalChunks) = await pipelineTask;
+        var (compressedSize, refsFound, totalChunks, dcBytesStored) = await pipelineTask;
 
         // ── Write SHA256 trailer (hash of original file, computed in receive loop) ──
         await grpcStream.WriteAsync(uploadedSha256, 0, 32, context.CancellationToken);
@@ -538,7 +538,8 @@ public class CompressFileService : FileService.FileServiceBase
                 CompressedSize = (ulong)compressedSize,
                 ReferencesFound = (uint)Math.Max(0, refsFound),
                 TotalChunks = (uint)Math.Max(0, totalChunks),
-                CompressedSha256 = ByteString.CopyFrom(uploadedSha256)
+                CompressedSha256 = ByteString.CopyFrom(uploadedSha256),
+                DatacenterBytesStored = (ulong)Math.Max(0, dcBytesStored)
             }
         });
         await responseStream.WriteAsync(new FileUploadResponse
@@ -553,7 +554,7 @@ public class CompressFileService : FileService.FileServiceBase
     /// Parallel compression pipeline: N workers compress windows, writer outputs in order.
     /// Writes v4.0.0 header + blocks (NOT trailer — caller writes that).
     /// </summary>
-    private static async Task<(long CompressedSize, int TotalRefs, int TotalChunks)> RunCompressionPipeline(
+    private static async Task<(long CompressedSize, int TotalRefs, int TotalChunks, long DatacenterBytes)> RunCompressionPipeline(
         ChannelReader<(int Index, byte[] Data)> reader,
         GrpcResponseStream grpcStream,
         long declaredFileSize,
@@ -573,6 +574,7 @@ public class CompressFileService : FileService.FileServiceBase
 
         long totalCompressedSize = header.Length;
         int totalRefs = 0, totalChunks = 0;
+        long totalDatacenterBytes = 0;
 
         // Completed blocks waiting to be written in order
         var completedBlocks = new ConcurrentDictionary<int, (byte[] Compressed, int OriginalLen)>();
@@ -591,13 +593,14 @@ public class CompressFileService : FileService.FileServiceBase
                     {
                         Console.WriteLine($"[Pipeline] Compressing block {item.Index + 1}/{blockCount} ({item.Data.Length} bytes)...");
                         var sw = System.Diagnostics.Stopwatch.StartNew();
-                        (byte[] compressed, int refs, int chunks) = await crossService.CompressFileWithStats(item.Data);
+                        (byte[] compressed, int refs, int chunks, long dcBytes) = await crossService.CompressFileWithStats(item.Data);
                         sw.Stop();
                         Console.WriteLine($"[Pipeline] Block {item.Index + 1}/{blockCount}: {item.Data.Length} → {compressed.Length} ({sw.ElapsedMilliseconds}ms)");
 
                         completedBlocks[item.Index] = (compressed, item.Data.Length);
                         Interlocked.Add(ref totalRefs, refs);
                         Interlocked.Add(ref totalChunks, chunks);
+                        Interlocked.Add(ref totalDatacenterBytes, dcBytes);
                         blockReady.Release();
                     }
                 }
@@ -624,7 +627,7 @@ public class CompressFileService : FileService.FileServiceBase
         }
 
         await Task.WhenAll(workers);
-        return (totalCompressedSize, totalRefs, totalChunks);
+        return (totalCompressedSize, totalRefs, totalChunks, totalDatacenterBytes);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -689,7 +692,7 @@ public class CompressFileService : FileService.FileServiceBase
         // ── Compress ──
         var crossService = new MyCrossService();
         byte[] fileBytes = await File.ReadAllBytesAsync(tempPath, context.CancellationToken);
-        (byte[] compressedBytes, int referencesFound, int totalChunks) = await crossService.CompressFileWithStats(fileBytes);
+        (byte[] compressedBytes, int referencesFound, int totalChunks, long dcBytesStored) = await crossService.CompressFileWithStats(fileBytes);
 
         byte[] compressedHash;
         using (var compressedSha = SHA256.Create())
@@ -704,7 +707,8 @@ public class CompressFileService : FileService.FileServiceBase
                 CompressedSize = (ulong)compressedBytes.Length,
                 ReferencesFound = (uint)Math.Max(0, referencesFound),
                 TotalChunks = (uint)Math.Max(0, totalChunks),
-                CompressedSha256 = ByteString.CopyFrom(compressedHash)
+                CompressedSha256 = ByteString.CopyFrom(compressedHash),
+                DatacenterBytesStored = (ulong)Math.Max(0, dcBytesStored)
             }
         });
 

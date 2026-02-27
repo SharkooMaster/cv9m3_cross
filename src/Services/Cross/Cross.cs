@@ -251,7 +251,7 @@ public class CrossService : ICross
     }
 
     // Local/in-process helper: returns compressed bytes plus per-file reference stats
-    public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks)> CompressFileWithStats(byte[] _file)
+    public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks, long DatacenterBytesStored)> CompressFileWithStats(byte[] _file)
     {
         using var rootSpan = Observability.StartStage("CompressFileWithStats");
         // Divide into (N) chunks
@@ -1101,9 +1101,31 @@ public class CrossService : ICross
         int storedChunks = sorted.Count(r => r != null && r.NeedToStore && r.BucketId != 0);
         int clusteredNonReps = Globals.EnableChunkClustering ? fileChunks.Count - representativeSet.Count : 0;
         int ejectedByBloat = bloatedDiffRestore.Count(i => !representativeSet.Contains(i));
+
+        // Compute actual datacenter storage cost: collect the exact bytes of every
+        // newly stored chunk and compress with zstd (matching agent RocksDB config).
+        // No estimation — these are the real bytes that landed on agents.
+        long datacenterBytesStored = 0;
+        if (storedChunks > 0)
+        {
+            byte[] storedData = new byte[storedChunks * Globals.chunkSize];
+            int pos = 0;
+            for (int i = 0; i < sorted.Length; i++)
+            {
+                if (sorted[i] != null && sorted[i].NeedToStore && sorted[i].BucketId != 0)
+                {
+                    Buffer.BlockCopy(fileChunks[i], 0, storedData, pos, Globals.chunkSize);
+                    pos += Globals.chunkSize;
+                }
+            }
+            using var zstdComp = new Compressor(3);
+            datacenterBytesStored = zstdComp.Wrap(storedData.AsSpan(0, pos)).Length;
+        }
+
         Console.WriteLine($"[Compress] Stats: initialLshMatches={initialMatches}, actualDedup={referencesFound}, " +
             $"stored={storedChunks}, totalChunks={totalChunks}, " +
-            $"clusteredNonReps={clusteredNonReps}, ejectedByBloat={ejectedByBloat}");
+            $"clusteredNonReps={clusteredNonReps}, ejectedByBloat={ejectedByBloat}, " +
+            $"datacenterBytes={datacenterBytesStored}");
 
         // ── Build references (once, after all re-stores are finalized) ──
         // v3.1.0: flag-based variable-size refs (saves ~23 bytes per self-stored chunk)
@@ -1324,7 +1346,7 @@ public class CrossService : ICross
         // Return
         totalSw.Stop();
         Console.WriteLine($"[Compress] DONE: {totalSw.ElapsedMilliseconds}ms total, in={_file.Length} out={toReturn.Length} ratio={toReturn.Length/(double)_file.Length:F3}, dedup={referencesFound}, lshMatches={initialMatches}, stored={sorted.Count(r => r != null && r.NeedToStore)}");
-        return (toReturn, referencesFound, totalChunks);
+        return (toReturn, referencesFound, totalChunks, datacenterBytesStored);
     }
 
     public async Task<byte[]> CompressFile(byte[] _file)
@@ -1439,7 +1461,7 @@ public class CrossService : ICross
             Console.WriteLine($"[CompressWindowed] Block {block + 1}/{blockCount}: {totalRead} bytes");
 
             // Compress this window using the existing v3.0.0 pipeline (unchanged!)
-            var (compressedBlock, refs, chunks) = await CompressFileWithStats(windowData);
+            var (compressedBlock, refs, chunks, _) = await CompressFileWithStats(windowData);
             totalRefs += refs;
             totalChunks += chunks;
 
@@ -1583,7 +1605,7 @@ public class CrossService : ICross
             Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: {totalRead} bytes (total read: {totalReadSoFar}/{originalFileSize})");
 
             // Compress this window using the existing v3.0.0 pipeline (unchanged!)
-            var (compressedBlock, refs, chunks) = await CompressFileWithStats(windowData);
+            var (compressedBlock, refs, chunks, _) = await CompressFileWithStats(windowData);
             totalRefs += refs;
             totalChunks += chunks;
 

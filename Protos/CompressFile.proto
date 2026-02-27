@@ -60,6 +60,9 @@ message CompressionStats {
   uint32 total_chunks = 4;
   // 32-byte SHA-256 of compressed bytes.
   bytes compressed_sha256 = 5;
+  // Actual bytes stored on agents for this file (new chunks only, no replication,
+  // after zstd compression). This is the real datacenter storage cost.
+  uint64 datacenter_bytes_stored = 6;
 }
 
 message Error {
