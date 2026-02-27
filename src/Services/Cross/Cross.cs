@@ -217,6 +217,39 @@ public class CrossService : ICross
         return toRet;
     }
 
+    /// <summary>
+    /// Pick the group member whose raw bytes are closest to the byte-wise mean.
+    /// This minimizes the average diff size for all members diffing against the rep.
+    /// O(G * chunkSize) — pure CPU, no allocations beyond one float[chunkSize] buffer.
+    /// </summary>
+    private static int PickRepresentative(List<byte[]> chunks, List<int> memberIndices)
+    {
+        int cs = Globals.chunkSize;
+
+        float[] mean = new float[cs];
+        foreach (var idx in memberIndices)
+            for (int b = 0; b < cs; b++)
+                mean[b] += chunks[idx][b];
+        float inv = 1f / memberIndices.Count;
+        for (int b = 0; b < cs; b++)
+            mean[b] *= inv;
+
+        int bestIdx = memberIndices[0];
+        float bestDist = float.MaxValue;
+        foreach (var idx in memberIndices)
+        {
+            float dist = 0f;
+            for (int b = 0; b < cs; b++)
+                dist += MathF.Abs(chunks[idx][b] - mean[b]);
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                bestIdx = idx;
+            }
+        }
+        return bestIdx;
+    }
+
     // Local/in-process helper: returns compressed bytes plus per-file reference stats
     public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks)> CompressFileWithStats(byte[] _file)
     {
@@ -256,6 +289,67 @@ public class CrossService : ICross
             Observability.RecordStage("ExtractBucketKeys", swStage.Elapsed.TotalMilliseconds, ("bucket_count", bitStrings.Count));
         }
 
+        // ── LOCAL CHUNK CLUSTERING ──
+        // Group chunks with identical LSH bitstrings. Chunks sharing a bitstring have
+        // the same LSH projection signs → high vector similarity. We pick one
+        // representative per group and only search/store representatives on agents.
+        // Non-representatives diff against their representative's base chunk.
+        // This captures intra-file dedup (impossible before — chunks aren't stored
+        // when later chunks search) and reduces agent I/O by the grouping factor.
+        var representativeSet = new HashSet<int>(fileChunks.Count);
+        var groupRepresentative = new int[fileChunks.Count];
+
+        if (Globals.EnableChunkClustering)
+        {
+            using var clusterStage = Observability.StartStage("ChunkClustering");
+            var clusterSw = Stopwatch.StartNew();
+
+            var bitstringGroups = new Dictionary<string, List<int>>(fileChunks.Count / 4);
+            for (int i = 0; i < fileChunks.Count; i++)
+            {
+                if (!bitstringGroups.TryGetValue(bitStrings[i], out var group))
+                {
+                    group = new List<int>(4);
+                    bitstringGroups[bitStrings[i]] = group;
+                }
+                group.Add(i);
+            }
+
+            foreach (var kv in bitstringGroups)
+            {
+                var members = kv.Value;
+                if (members.Count == 1)
+                {
+                    groupRepresentative[members[0]] = members[0];
+                    representativeSet.Add(members[0]);
+                    continue;
+                }
+
+                int repIdx = PickRepresentative(fileChunks, members);
+                representativeSet.Add(repIdx);
+                foreach (var m in members)
+                    groupRepresentative[m] = repIdx;
+            }
+
+            clusterSw.Stop();
+            int totalGroups = bitstringGroups.Count;
+            int singletons = bitstringGroups.Count(g => g.Value.Count == 1);
+            Console.WriteLine($"[Compress] Clustering: {fileChunks.Count} chunks → {totalGroups} groups " +
+                $"({singletons} singletons, {totalGroups - singletons} multi-member), " +
+                $"{representativeSet.Count} representatives to search/store ({clusterSw.ElapsedMilliseconds}ms)");
+            Observability.RecordStage("ChunkClustering", clusterSw.Elapsed.TotalMilliseconds,
+                ("chunks", fileChunks.Count), ("groups", totalGroups), ("singletons", singletons),
+                ("representatives", representativeSet.Count));
+        }
+        else
+        {
+            for (int i = 0; i < fileChunks.Count; i++)
+            {
+                groupRepresentative[i] = i;
+                representativeSet.Add(i);
+            }
+        }
+
         // ── DIRECT-TO-AGENT SEARCH (bypasses gateway entirely) ──
         // CRITICAL: Each of the 65 neighbor buckets may live on a DIFFERENT agent.
         // We must route each bucket to its owning agent, then merge results per chunk.
@@ -277,25 +371,27 @@ public class CrossService : ICross
         }
 
         // ── Phase 1: Compute neighbors + per-bucket agent routing ──
+        // Only compute for representatives — non-reps inherit their rep's result.
         phaseSw.Restart();
         var allBuckets = new List<string>[fileChunks.Count];     // 65 buckets per chunk
         var mainAgents = new string[fileChunks.Count];            // agent owning the main bucket
-        // queryInfos is used later by StoreChunks section
         var queryInfos = new (float[] vector, string bitString)[fileChunks.Count];
 
         Parallel.For(0, fileChunks.Count, i =>
         {
-            allBuckets[i] = RendezvousRouter.GetNeighbouringBuckets(bitStrings[i], vectors[i]);
-            mainAgents[i] = RendezvousRouter.PickAgent(bitStrings[i]);
             queryInfos[i] = (vectors[i], bitStrings[i]);
+            mainAgents[i] = RendezvousRouter.PickAgent(bitStrings[i]);
+            if (representativeSet.Contains(i))
+                allBuckets[i] = RendezvousRouter.GetNeighbouringBuckets(bitStrings[i], vectors[i]);
         });
 
-        // Route each bucket to its owning agent:
-        // Agent → Dict<chunkIndex, List<buckets owned by this agent>>
+        // Route each bucket to its owning agent (representatives only)
         var agentChunkBuckets = new Dictionary<string, Dictionary<int, List<string>>>();
 
         for (int i = 0; i < fileChunks.Count; i++)
         {
+            if (!representativeSet.Contains(i)) continue;
+
             foreach (var bucket in allBuckets[i])
             {
                 var agent = RendezvousRouter.PickAgent(bucket);
@@ -312,7 +408,7 @@ public class CrossService : ICross
                 bucketList.Add(bucket);
             }
         }
-        Console.WriteLine($"[Compress] Route: {phaseSw.ElapsedMilliseconds}ms, {fileChunks.Count} chunks → {agentChunkBuckets.Count} agents");
+        Console.WriteLine($"[Compress] Route: {phaseSw.ElapsedMilliseconds}ms, {representativeSet.Count} reps (of {fileChunks.Count} chunks) → {agentChunkBuckets.Count} agents");
 
         // ── Phase 2: Fire BatchGet per agent — each gets ONLY its own buckets ──
         var sorted = new QueryResponseObject?[fileChunks.Count];
@@ -451,9 +547,10 @@ public class CrossService : ICross
                 ("agents", agentChunkBuckets.Count), ("queries", fileChunks.Count));
         }
 
-        // Fill any chunks that NO agent had a match for → need to store on main agent
+        // Fill representatives that NO agent had a match for → need to store on main agent
         for (int i = 0; i < sorted.Length; i++)
         {
+            if (!representativeSet.Contains(i)) continue;
             if (sorted[i] == null)
             {
                 sorted[i] = new QueryResponseObject
@@ -464,6 +561,28 @@ public class CrossService : ICross
                     NeedToStore = true, TargetAgent = mainAgents[i]
                 };
             }
+        }
+
+        // Propagate representative results to non-representative group members.
+        // Each non-rep shares the same agent reference as its rep — the diff encoding
+        // will compute the byte-level difference against the rep's base chunk.
+        for (int i = 0; i < sorted.Length; i++)
+        {
+            if (representativeSet.Contains(i)) continue;
+            int rep = groupRepresentative[i];
+            var repResult = sorted[rep]!;
+            sorted[i] = new QueryResponseObject
+            {
+                BucketId = repResult.BucketId,
+                BucketKey = repResult.BucketKey,
+                Similarity = repResult.Similarity,
+                Chunk = repResult.Chunk,
+                Index = i,
+                Duplicate = true,
+                NeedToStore = false,
+                TargetAgent = repResult.TargetAgent,
+                StorageGuid = repResult.StorageGuid ?? ""
+            };
         }
 
         // ── BATCH STORE: one gRPC call per agent instead of one per chunk ──
@@ -595,6 +714,23 @@ public class CrossService : ICross
             Console.WriteLine($"[Compress] Store: {swStage.ElapsedMilliseconds}ms, {totalStored} chunks across {storeGroups.Count} agents");
             Observability.RecordStage("StoreChunks", swStage.Elapsed.TotalMilliseconds,
                 ("agents", storeGroups.Count), ("chunks_stored", totalStored));
+        }
+
+        // ── Post-store: propagate updated store results to non-rep group members ──
+        // After BatchStore, representatives now have final BucketId/BucketKey/StorageGuid.
+        // Non-reps need these values updated so their references point to the stored rep.
+        if (Globals.EnableChunkClustering)
+        {
+            for (int i = 0; i < sorted.Length; i++)
+            {
+                if (representativeSet.Contains(i)) continue;
+                int rep = groupRepresentative[i];
+                var repResult = sorted[rep]!;
+                sorted[i].BucketId = repResult.BucketId;
+                sorted[i].BucketKey = repResult.BucketKey;
+                sorted[i].StorageGuid = repResult.StorageGuid ?? "";
+                sorted[i].Chunk = repResult.Chunk;
+            }
         }
 
         // NOTE: "referencesFound" is computed AFTER BloatRestore (see below)
@@ -745,9 +881,11 @@ public class CrossService : ICross
                 }
             }
 
-            // ── Bloat guard pre-pass (count-only, no list allocation) ──
-            // We only need to detect chunks whose diff would be larger than the raw chunk.
-            // The actual diff is computed once in the flat encoding pass below.
+            // ── Bloat guard pre-pass ──
+            // Detect chunks whose diff would be larger than the raw chunk.
+            // For clustered non-reps, the base is the representative's base chunk.
+            // If a non-rep's diff exceeds threshold, eject it: store individually.
+            int maxAllowedDifferingBytes = (int)(Globals.chunkSize * Globals.BloatGuardThreshold);
             for (int i = 0; i < sorted.Length; i++)
             {
                 if (sorted[i].BucketId == 0 && sorted[i].BucketKey == 0)
@@ -756,24 +894,24 @@ public class CrossService : ICross
                     continue;
                 }
 
-                // Only skip for chunks WE stored (NeedToStore) — their base IS the original.
-                // For search matches, even similarity ≈ 1.0, bytes may differ → must diff.
                 if (sorted[i].NeedToStore && sorted[i].BucketId != 0)
                 {
                     emptyDiffCount++;
                     continue;
                 }
 
-                // Count diffs only — no list allocation needed
+                // Determine the base chunk for this chunk's diff
                 byte[] baseChunk;
-                if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
+                bool isNonRep = !representativeSet.Contains(i);
+                int rep = groupRepresentative[i];
+
+                if (isNonRep && sorted[rep].NeedToStore && sorted[rep].BucketId != 0)
+                    baseChunk = fileChunks[rep];
+                else if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
                     baseChunk = sorted[i].Chunk.ToByteArray();
                 else
                     baseChunk = new byte[Globals.chunkSize];
 
-                // Count actual differing bytes (not RLE runs) for bloat guard
-                // We want to allow up to 40% of bytes to differ (60% similarity threshold).
-                // Only re-store if MORE than 40% of bytes differ.
                 int differingByteCount = 0;
                 for (int j = 0; j < fileChunks[i].Length; j++)
                 {
@@ -781,15 +919,12 @@ public class CrossService : ICross
                         differingByteCount++;
                 }
 
-                // BLOAT GUARD: only re-store if chunks share less than 40% at the byte level.
-                // Allow up to 60% of bytes to differ — this is the CORE feature
-                // that lets us dedup chunks that are similar but not identical.
-                // User explicitly: "60% of bytes as diff... THATS FINE, I WANT THAT ALMOST"
-                int maxAllowedDifferingBytes = (int)(Globals.chunkSize * Globals.BloatGuardThreshold);
                 if (differingByteCount > maxAllowedDifferingBytes)
                 {
+                    // Eject: this chunk needs its own store (too different from base)
                     sorted[i].NeedToStore = true;
                     sorted[i].Similarity = 1.0f;
+                    sorted[i].TargetAgent = mainAgents[i];
                     bloatedDiffRestore.Add(i);
                     emptyDiffCount++;
                 }
@@ -928,11 +1063,44 @@ public class CrossService : ICross
             Console.WriteLine($"[Compress] BloatRestore: {phaseSw.ElapsedMilliseconds}ms, {bloatedDiffRestore.Count} chunks re-stored");
         }
 
+        // ── Post-BloatRestore: re-propagate rep results to non-reps ──
+        // If a representative was ejected by the bloat guard and re-stored, its
+        // BucketId/BucketKey/StorageGuid changed. Non-reps that reference that rep
+        // need the updated values.
+        if (Globals.EnableChunkClustering && bloatedDiffRestore.Count > 0)
+        {
+            var ejectedReps = new HashSet<int>();
+            foreach (var idx in bloatedDiffRestore)
+            {
+                if (representativeSet.Contains(idx))
+                    ejectedReps.Add(idx);
+            }
+            if (ejectedReps.Count > 0)
+            {
+                for (int i = 0; i < sorted.Length; i++)
+                {
+                    if (representativeSet.Contains(i)) continue;
+                    int rep = groupRepresentative[i];
+                    if (!ejectedReps.Contains(rep)) continue;
+                    sorted[i].BucketId = sorted[rep].BucketId;
+                    sorted[i].BucketKey = sorted[rep].BucketKey;
+                    sorted[i].StorageGuid = sorted[rep].StorageGuid ?? "";
+                    sorted[i].Chunk = sorted[rep].Chunk;
+                }
+            }
+        }
+
         // ── ACTUAL DEDUP STAT: computed AFTER BloatRestore so it reflects real savings ──
         // "referencesFound" = chunks that truly reuse an existing base (not stored fresh).
-        // matchCount = chunks with a valid reference AND not flagged for re-storage.
+        // With clustering, non-reps that weren't ejected count as references (they diff
+        // against the rep's base chunk and share its agent reference).
         int referencesFound = sorted.Count(r => r != null && !r.NeedToStore && r.BucketId != 0);
-        Console.WriteLine($"[Compress] Stats: initialLshMatches={initialMatches}, actualDedup={referencesFound}, totalChunks={totalChunks}");
+        int storedChunks = sorted.Count(r => r != null && r.NeedToStore && r.BucketId != 0);
+        int clusteredNonReps = Globals.EnableChunkClustering ? fileChunks.Count - representativeSet.Count : 0;
+        int ejectedByBloat = bloatedDiffRestore.Count(i => !representativeSet.Contains(i));
+        Console.WriteLine($"[Compress] Stats: initialLshMatches={initialMatches}, actualDedup={referencesFound}, " +
+            $"stored={storedChunks}, totalChunks={totalChunks}, " +
+            $"clusteredNonReps={clusteredNonReps}, ejectedByBloat={ejectedByBloat}");
 
         // ── Build references (once, after all re-stores are finalized) ──
         // v3.1.0: flag-based variable-size refs (saves ~23 bytes per self-stored chunk)
@@ -1009,17 +1177,21 @@ public class CrossService : ICross
                 Buffer.BlockCopy(fileChunks[i], 0, originalBuffer, off, Globals.chunkSize);
 
                 // Determine base chunk
-                // ONLY use original as base when WE stored it (NeedToStore) — storageGuid then
-                // points to original bytes. For search matches, ALWAYS use the matched chunk
-                // from the agent — vector similarity ≈ 1.0 does NOT mean byte-identical!
+                // Representatives that were stored: base == rep's own bytes (zero diff for rep itself).
+                // Non-reps whose rep was stored: base == rep's bytes (diff encodes distance to rep).
+                // Search matches: base == matched chunk from agent.
                 if (sorted[i].NeedToStore && sorted[i].BucketId != 0)
                 {
-                    // base == original → copy original (zero diff)
                     Buffer.BlockCopy(fileChunks[i], 0, baseBuffer, off, Globals.chunkSize);
+                }
+                else if (!representativeSet.Contains(i) && sorted[groupRepresentative[i]].NeedToStore
+                         && sorted[groupRepresentative[i]].BucketId != 0)
+                {
+                    // Non-rep whose rep was stored — base is the rep's actual bytes
+                    Buffer.BlockCopy(fileChunks[groupRepresentative[i]], 0, baseBuffer, off, Globals.chunkSize);
                 }
                 else if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
                 {
-                    // Matched chunk with base bytes from agent
                     var baseBytes = sorted[i].Chunk.ToByteArray();
                     Buffer.BlockCopy(baseBytes, 0, baseBuffer, off, Math.Min(baseBytes.Length, Globals.chunkSize));
                 }

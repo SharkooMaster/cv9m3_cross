@@ -24,6 +24,16 @@ public static class Globals
     /// </summary>
     public static float BloatGuardThreshold =
         float.TryParse(Environment.GetEnvironmentVariable("BLOAT_GUARD_THRESHOLD"), out var bgt) ? bgt : 0.60f;
+
+    /// <summary>
+    /// Local chunk clustering: group chunks with identical LSH bitstrings before
+    /// searching agents. Reduces agent I/O by 5-50x and captures intra-file dedup
+    /// that is otherwise impossible (chunks not yet stored when later chunks search).
+    /// Set DISABLE_CHUNK_CLUSTERING=true to revert to per-chunk agent search.
+    /// </summary>
+    public static bool EnableChunkClustering =
+        !string.Equals(Environment.GetEnvironmentVariable("DISABLE_CHUNK_CLUSTERING"), "true",
+            StringComparison.OrdinalIgnoreCase);
     //public static string GatewayLoadbalancer = "192.168.50.241";
     // Allow running outside Kubernetes/Docker by overriding via env var.
     // Examples:
