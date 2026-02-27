@@ -79,6 +79,10 @@
             "OpenTelemetry.Instrumentation.Runtime": {
               "target": "Package",
               "version": "[1.9.0, )"
+            },
+            "ZstdSharp.Port": {
+              "target": "Package",
+              "version": "[0.8.7, )"
             }
           },
           "imports": [

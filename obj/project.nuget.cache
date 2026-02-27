@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "dgSpecHash": "QCURoZSTopP5TM1OXudIJTwWiapxV7NN9iIQ4BnPUo6PmViZI5YYcv+3olK6t8klpvnJzhMMWpT/wRVbI4+/aA==",
+  "dgSpecHash": "4SCoZuC+aVCu1tMTLPC3PE5/zmeHdSXZ319LFLi9wklPOmWwkdd6vd/SMYKSDYswuhGjeR1tYlnSsp41MhojNg==",
   "success": true,
   "projectFilePath": "/home/sharku/Documents/Projects/CrossV9/cross/cross.csproj",
   "expectedPackageFiles": [
@@ -38,7 +38,8 @@
     "/home/sharku/.nuget/packages/opentelemetry.instrumentation.aspnetcore/1.9.0/opentelemetry.instrumentation.aspnetcore.1.9.0.nupkg.sha512",
     "/home/sharku/.nuget/packages/opentelemetry.instrumentation.http/1.9.0/opentelemetry.instrumentation.http.1.9.0.nupkg.sha512",
     "/home/sharku/.nuget/packages/opentelemetry.instrumentation.runtime/1.9.0/opentelemetry.instrumentation.runtime.1.9.0.nupkg.sha512",
-    "/home/sharku/.nuget/packages/system.diagnostics.diagnosticsource/8.0.0/system.diagnostics.diagnosticsource.8.0.0.nupkg.sha512"
+    "/home/sharku/.nuget/packages/system.diagnostics.diagnosticsource/8.0.0/system.diagnostics.diagnosticsource.8.0.0.nupkg.sha512",
+    "/home/sharku/.nuget/packages/zstdsharp.port/0.8.7/zstdsharp.port.0.8.7.nupkg.sha512"
   ],
   "logs": []
 }

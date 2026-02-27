@@ -9,6 +9,21 @@ public static class Globals
 {
     public static int chunkSize = int.TryParse(Environment.GetEnvironmentVariable("CHUNK_SIZE"), out var cs) ? cs : 5120;
     public static int k = 16;
+
+    /// <summary>
+    /// Minimum cosine similarity in LSH vector space for a search match to be considered.
+    /// Higher values → fewer matches but tighter byte-level correlation.
+    /// </summary>
+    public static float SearchSimilarityThreshold =
+        float.TryParse(Environment.GetEnvironmentVariable("SEARCH_SIMILARITY_THRESHOLD"), out var sst) ? sst : 0.60f;
+
+    /// <summary>
+    /// Maximum fraction of differing bytes allowed before a matched chunk is re-stored.
+    /// This is a BYTE-LEVEL metric (Hamming ratio), independent of the cosine similarity
+    /// threshold which operates in LSH vector space. The two can diverge significantly.
+    /// </summary>
+    public static float BloatGuardThreshold =
+        float.TryParse(Environment.GetEnvironmentVariable("BLOAT_GUARD_THRESHOLD"), out var bgt) ? bgt : 0.60f;
     //public static string GatewayLoadbalancer = "192.168.50.241";
     // Allow running outside Kubernetes/Docker by overriding via env var.
     // Examples:

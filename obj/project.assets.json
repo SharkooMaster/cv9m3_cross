@@ -625,6 +625,15 @@
         "build": {
           "buildTransitive/net6.0/_._": {}
         }
+      },
+      "ZstdSharp.Port/0.8.7": {
+        "type": "package",
+        "compile": {
+          "lib/net8.0/ZstdSharp.dll": {}
+        },
+        "runtime": {
+          "lib/net8.0/ZstdSharp.dll": {}
+        }
       }
     }
   },
@@ -1637,6 +1646,26 @@
         "system.diagnostics.diagnosticsource.nuspec",
         "useSharedDesignerContext.txt"
       ]
+    },
+    "ZstdSharp.Port/0.8.7": {
+      "sha512": "+4VpxvzEKaHpfTjsLRMhQHx6brqGBkIA+fjUM3wUW8ZoWpPFAeKrO2Nf4uZDeBjjzNDNxSRvLQH4b3S9Ku4JJQ==",
+      "type": "package",
+      "path": "zstdsharp.port/0.8.7",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "lib/net462/ZstdSharp.dll",
+        "lib/net5.0/ZstdSharp.dll",
+        "lib/net6.0/ZstdSharp.dll",
+        "lib/net7.0/ZstdSharp.dll",
+        "lib/net8.0/ZstdSharp.dll",
+        "lib/net9.0/ZstdSharp.dll",
+        "lib/netcoreapp3.1/ZstdSharp.dll",
+        "lib/netstandard2.0/ZstdSharp.dll",
+        "lib/netstandard2.1/ZstdSharp.dll",
+        "zstdsharp.port.0.8.7.nupkg.sha512",
+        "zstdsharp.port.nuspec"
+      ]
     }
   },
   "projectFileDependencyGroups": {
@@ -1650,7 +1679,8 @@
       "OpenTelemetry.Extensions.Hosting >= 1.9.0",
       "OpenTelemetry.Instrumentation.AspNetCore >= 1.9.0",
       "OpenTelemetry.Instrumentation.Http >= 1.9.0",
-      "OpenTelemetry.Instrumentation.Runtime >= 1.9.0"
+      "OpenTelemetry.Instrumentation.Runtime >= 1.9.0",
+      "ZstdSharp.Port >= 0.8.7"
     ]
   },
   "packageFolders": {
@@ -1731,6 +1761,10 @@
           "OpenTelemetry.Instrumentation.Runtime": {
             "target": "Package",
             "version": "[1.9.0, )"
+          },
+          "ZstdSharp.Port": {
+            "target": "Package",
+            "version": "[0.8.7, )"
           }
         },
         "imports": [
