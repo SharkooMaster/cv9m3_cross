@@ -319,9 +319,18 @@ public class CompressFileService : FileService.FileServiceBase
             }
         }
         catch (RpcException) { throw; }
+        catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
+        {
+            Console.WriteLine($"[DecompressStream] Client disconnected. Cleaning up.");
+        }
+        catch (IOException ex) when (ex.Message.Contains("reset", StringComparison.OrdinalIgnoreCase)
+                                  || ex.Message.Contains("aborted", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"[DecompressStream] Client reset stream: {ex.Message}");
+        }
         catch (Exception ex)
         {
-            Console.WriteLine($"[DecompressStream] FAILED: {ex.Message}");
+            Console.WriteLine($"[DecompressStream] FAILED: {ex.GetType().Name}: {ex.Message}");
             throw new RpcException(new Status(StatusCode.Internal, $"Decompression stream failed: {ex.Message}"));
         }
         finally
@@ -396,8 +405,23 @@ public class CompressFileService : FileService.FileServiceBase
             }
         }
         catch (RpcException) { throw; }
+        catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
+        {
+            Console.WriteLine($"[ProcessFileStream] Client disconnected (file={fileName ?? "?"}). Cleaning up.");
+        }
+        catch (IOException ex) when (ex.Message.Contains("reset", StringComparison.OrdinalIgnoreCase)
+                                  || ex.Message.Contains("aborted", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"[ProcessFileStream] Client reset stream (file={fileName ?? "?"}): {ex.Message}");
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("request is complete", StringComparison.OrdinalIgnoreCase)
+                                                 || ex.Message.Contains("Can't write", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"[ProcessFileStream] Client closed before response finished (file={fileName ?? "?"}): {ex.Message}");
+        }
         catch (Exception ex)
         {
+            Console.WriteLine($"[ProcessFileStream] FAILED (file={fileName ?? "?"}): {ex.GetType().Name}: {ex.Message}");
             throw new RpcException(new Status(StatusCode.Internal, $"Compression stream failed: {ex.Message}"));
         }
         finally
