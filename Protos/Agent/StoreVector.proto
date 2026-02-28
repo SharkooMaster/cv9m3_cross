@@ -22,6 +22,9 @@ message StoreVector_Res
     uint64 id = 1;
     uint64 index = 2;
     string storage_guid = 3;  // SHA256 of chunk bytes — content-addressable, globally unique
+    bool was_deduplicated = 4; // true = matched existing chunk in bucket (not stored fresh)
+    bytes base_chunk = 5;      // populated when was_deduplicated: base chunk bytes for diff encoding
+    float similarity = 6;     // cosine similarity to matched entry (only when was_deduplicated)
 }
 
 // ── Batch store: many chunks in one gRPC call ──

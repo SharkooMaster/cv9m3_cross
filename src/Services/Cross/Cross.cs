@@ -663,42 +663,72 @@ public class CrossService : ICross
                                 var batchRes = await client.BatchStoreAsync(batchReq,
                                     deadline: DateTime.UtcNow.AddSeconds(30));
 
+                                int freshlyStored = 0;
+                                int dedupedAtStore = 0;
                                 for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
                                 {
-                                    batchItems[j].response.BucketId = batchRes.Results[j].Id;
-                                    batchItems[j].response.BucketKey = batchRes.Results[j].Index;
-                                    batchItems[j].response.StorageGuid = batchRes.Results[j].StorageGuid ?? "";
+                                    var storeRes = batchRes.Results[j];
+                                    batchItems[j].response.BucketId = storeRes.Id;
+                                    batchItems[j].response.BucketKey = storeRes.Index;
+                                    batchItems[j].response.StorageGuid = storeRes.StorageGuid ?? "";
+
+                                    if (storeRes.WasDeduplicated)
+                                    {
+                                        batchItems[j].response.NeedToStore = false;
+                                        batchItems[j].response.Duplicate = true;
+                                        batchItems[j].response.Similarity = storeRes.Similarity;
+                                        if (storeRes.BaseChunk != null && storeRes.BaseChunk.Length > 0)
+                                            batchItems[j].response.Chunk = storeRes.BaseChunk;
+                                        dedupedAtStore++;
+                                    }
+                                    else
+                                    {
+                                        freshlyStored++;
+                                    }
                                 }
-                                Interlocked.Add(ref totalStored, batchItems.Count);
+                                Interlocked.Add(ref totalStored, freshlyStored);
+                                if (dedupedAtStore > 0)
+                                    Console.WriteLine($"[Compress] Store-time dedup on {agent}: {dedupedAtStore} chunks matched existing entries");
                             }
                             catch (Exception ex)
                             {
                                 Console.WriteLine($"[Compress] BatchStore to {agent} failed: {ex.Message}, retrying SAME agent...");
-                                // CRITICAL: NEVER store on a different agent!
-                                // PickAgent(bitstring) always routes to THIS agent during decompression.
-                                // Storing on a different agent means decompression can't find the chunk.
                                 try
                                 {
-                                    await Task.Delay(500); // Backoff before retry
+                                    await Task.Delay(500);
                                     var retryClient = GrpcChannelFactory.GetClient(
                                         target: agent,
                                         ctor: chan => new StoreVector.StoreVectorClient(chan),
                                         roundRobin: false, port: 5000);
                                     var retryRes = await retryClient.BatchStoreAsync(batchReq,
                                         deadline: DateTime.UtcNow.AddSeconds(30));
+                                    int freshlyStored = 0;
                                     for (int j = 0; j < batchItems.Count && j < retryRes.Results.Count; j++)
                                     {
-                                        batchItems[j].response.BucketId = retryRes.Results[j].Id;
-                                        batchItems[j].response.BucketKey = retryRes.Results[j].Index;
-                                        batchItems[j].response.StorageGuid = retryRes.Results[j].StorageGuid ?? "";
+                                        var storeRes = retryRes.Results[j];
+                                        batchItems[j].response.BucketId = storeRes.Id;
+                                        batchItems[j].response.BucketKey = storeRes.Index;
+                                        batchItems[j].response.StorageGuid = storeRes.StorageGuid ?? "";
+
+                                        if (storeRes.WasDeduplicated)
+                                        {
+                                            batchItems[j].response.NeedToStore = false;
+                                            batchItems[j].response.Duplicate = true;
+                                            batchItems[j].response.Similarity = storeRes.Similarity;
+                                            if (storeRes.BaseChunk != null && storeRes.BaseChunk.Length > 0)
+                                                batchItems[j].response.Chunk = storeRes.BaseChunk;
+                                        }
+                                        else
+                                        {
+                                            freshlyStored++;
+                                        }
                                     }
-                                    Interlocked.Add(ref totalStored, batchItems.Count);
+                                    Interlocked.Add(ref totalStored, freshlyStored);
                                     Console.WriteLine($"[Compress] Retry store to {agent} OK for {batchItems.Count} chunks");
                                 }
                                 catch (Exception retryEx)
                                 {
                                     Console.WriteLine($"[Compress] Retry store to {agent} also failed: {retryEx.Message}");
-                                    // Primary agent unreachable — clear refs AND Chunk so base=zeros matches zero-ref
                                     foreach (var item in batchItems)
                                     { item.response.BucketId = 0; item.response.BucketKey = 0; item.response.StorageGuid = ""; item.response.Chunk = ByteString.Empty; }
                                 }
@@ -1007,15 +1037,24 @@ public class CrossService : ICross
 
                             for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
                             {
-                                batchItems[j].response.BucketId = batchRes.Results[j].Id;
-                                batchItems[j].response.BucketKey = batchRes.Results[j].Index;
-                                batchItems[j].response.StorageGuid = batchRes.Results[j].StorageGuid ?? "";
+                                var storeRes = batchRes.Results[j];
+                                batchItems[j].response.BucketId = storeRes.Id;
+                                batchItems[j].response.BucketKey = storeRes.Index;
+                                batchItems[j].response.StorageGuid = storeRes.StorageGuid ?? "";
+
+                                if (storeRes.WasDeduplicated)
+                                {
+                                    batchItems[j].response.NeedToStore = false;
+                                    batchItems[j].response.Duplicate = true;
+                                    batchItems[j].response.Similarity = storeRes.Similarity;
+                                    if (storeRes.BaseChunk != null && storeRes.BaseChunk.Length > 0)
+                                        batchItems[j].response.Chunk = storeRes.BaseChunk;
+                                }
                             }
                         }
                         catch (Exception ex)
                         {
                             Console.WriteLine($"[Compress] Re-store to {agent} failed: {ex.Message}, retrying SAME agent...");
-                            // CRITICAL: NEVER store on a different agent — decompression routes by bitstring to THIS agent.
                             try
                             {
                                 await Task.Delay(500);
@@ -1027,16 +1066,26 @@ public class CrossService : ICross
                                     deadline: DateTime.UtcNow.AddSeconds(30));
                                 for (int j = 0; j < batchItems.Count && j < retryRes.Results.Count; j++)
                                 {
-                                    batchItems[j].response.BucketId = retryRes.Results[j].Id;
-                                    batchItems[j].response.BucketKey = retryRes.Results[j].Index;
-                                    batchItems[j].response.StorageGuid = retryRes.Results[j].StorageGuid ?? "";
+                                    var storeRes = retryRes.Results[j];
+                                    batchItems[j].response.BucketId = storeRes.Id;
+                                    batchItems[j].response.BucketKey = storeRes.Index;
+                                    batchItems[j].response.StorageGuid = storeRes.StorageGuid ?? "";
+
+                                    if (storeRes.WasDeduplicated)
+                                    {
+                                        batchItems[j].response.NeedToStore = false;
+                                        batchItems[j].response.Duplicate = true;
+                                        batchItems[j].response.Similarity = storeRes.Similarity;
+                                        if (storeRes.BaseChunk != null && storeRes.BaseChunk.Length > 0)
+                                            batchItems[j].response.Chunk = storeRes.BaseChunk;
+                                    }
                                 }
                                 Console.WriteLine($"[Compress] Retry re-store to {agent} OK for {batchItems.Count} chunks");
                             }
                             catch (Exception retryEx)
                             {
                                 Console.WriteLine(
-                                    $"[Compress] ⚠️ WARN: Bloat re-store FAILED for {batchItems.Count} chunks on agent {agent} " +
+                                    $"[Compress] WARN: Bloat re-store FAILED for {batchItems.Count} chunks on agent {agent} " +
                                     $"after 2 attempts: {retryEx.Message}. " +
                                     $"Chunks will use zero-ref (full diff encoding) — output file will be larger than optimal.");
                                 foreach (var item in batchItems)
