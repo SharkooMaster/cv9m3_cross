@@ -45,6 +45,32 @@ public static class Globals
     public static bool EnableChunkClustering =
         !string.Equals(Environment.GetEnvironmentVariable("DISABLE_CHUNK_CLUSTERING"), "true",
             StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Level 2 Mosaic Dedup: for high-entropy chunks that fail Level 1 whole-vector search,
+    /// decompose into 64 sub-regions and find the best donor per sub-region from the top-K
+    /// candidates. Produces a mosaic base that reduces error encoding size.
+    /// </summary>
+    public static bool EnableMosaicDedup =
+        string.Equals(Environment.GetEnvironmentVariable("ENABLE_MOSAIC_DEDUP"), "true",
+            StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Shannon entropy threshold (bits/byte) above which a chunk is considered high-entropy
+    /// and eligible for Level 2 mosaic dedup. Range 0.0-8.0. Default 7.0.
+    /// </summary>
+    public static float MosaicEntropyThreshold =
+        float.TryParse(Environment.GetEnvironmentVariable("MOSAIC_ENTROPY_THRESHOLD"), out var met) ? met : 7.0f;
+
+    /// <summary>
+    /// Number of top-K candidates to request from agents for high-entropy chunks.
+    /// More candidates = better mosaic quality but more data returned from agents.
+    /// </summary>
+    public static int MosaicTopK =
+        int.TryParse(Environment.GetEnvironmentVariable("MOSAIC_TOP_K"), out var mtk) ? mtk : 10;
+
+    public const int MosaicNComponents = 64;
+    public static int MosaicSubChunkSize => chunkSize / MosaicNComponents;
     //public static string GatewayLoadbalancer = "192.168.50.241";
     // Allow running outside Kubernetes/Docker by overriding via env var.
     // Examples:

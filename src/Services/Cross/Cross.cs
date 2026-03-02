@@ -14,6 +14,7 @@ using Google.Protobuf;
 using Google.Protobuf.WellKnownTypes;
 using ZstdSharp;
 
+using Cross.Models;
 using Cross.Services.Cache;
 using Grpc.Core;
 
@@ -289,6 +290,18 @@ public class CrossService : ICross
             Observability.RecordStage("ExtractBucketKeys", swStage.Elapsed.TotalMilliseconds, ("bucket_count", bitStrings.Count));
         }
 
+        // ── ENTROPY COMPUTATION (Level 2 Mosaic gate) ──
+        float[]? entropies = null;
+        if (Globals.EnableMosaicDedup)
+        {
+            var swEntropy = Stopwatch.StartNew();
+            entropies = Misc.ComputeEntropies(fileChunks);
+            swEntropy.Stop();
+            int highEntropyCount = entropies.Count(e => e >= Globals.MosaicEntropyThreshold);
+            Console.WriteLine($"[Compress] Entropy: {swEntropy.ElapsedMilliseconds}ms, " +
+                $"{highEntropyCount}/{fileChunks.Count} chunks above {Globals.MosaicEntropyThreshold:F1} threshold");
+        }
+
         // ── LOCAL CHUNK CLUSTERING ──
         // Group chunks with identical LSH bitstrings. Chunks sharing a bitstring have
         // the same LSH projection signs → high vector similarity. We pick one
@@ -412,6 +425,8 @@ public class CrossService : ICross
 
         // ── Phase 2: Fire BatchGet per agent — each gets ONLY its own buckets ──
         var sorted = new QueryResponseObject?[fileChunks.Count];
+        // Mosaic: collect top-K candidates per high-entropy chunk (keyed by chunk index)
+        var mosaicCandidates = new ConcurrentDictionary<int, List<SearchVectorObject>>();
         {
             using var stage = Observability.StartStage("SearchBuckets");
             phaseSw.Restart();
@@ -454,11 +469,14 @@ public class CrossService : ICross
 
                             foreach (var (chunkIdx, buckets) in batchQueries)
                             {
+                                bool isHighEntropy = entropies != null
+                                    && chunkIdx < entropies.Length
+                                    && entropies[chunkIdx] >= Globals.MosaicEntropyThreshold;
                                 var req = new SearchVector_Req
                                 {
                                     Index = chunkIdx,
                                     MinimumSimilarity = MIN_THRESH,
-                                    K = 1
+                                    K = isHighEntropy ? Globals.MosaicTopK : 1
                                 };
                                 req.Vector.AddRange(vectors[chunkIdx]);
                                 req.Bitstrings.AddRange(buckets);
@@ -529,6 +547,19 @@ public class CrossService : ICross
                                         }
                                     }
                                 }
+                                // Mosaic: agent returned Save=true with K candidates for high-entropy chunk
+                                else if (res.Save && res.Results.Count > 1)
+                                {
+                                    var list = mosaicCandidates.GetOrAdd(idx, _ => new List<SearchVectorObject>());
+                                    lock (list)
+                                    {
+                                        foreach (var cand in res.Results)
+                                        {
+                                            if (cand.Chunk != null && cand.Chunk.Length > 0)
+                                                list.Add(cand);
+                                        }
+                                    }
+                                }
                             }
                         }
                         catch (Exception ex)
@@ -583,6 +614,106 @@ public class CrossService : ICross
                 TargetAgent = repResult.TargetAgent,
                 StorageGuid = repResult.StorageGuid ?? ""
             };
+        }
+
+        // ── LEVEL 2 MOSAIC ASSEMBLY ──
+        // For high-entropy chunks that failed Level 1 (NeedToStore=true + have mosaic candidates),
+        // stitch a base chunk from donor sub-regions. The mosaic base replaces ByteString.Empty so
+        // error encoding produces a smaller diff.
+        var mosaicInfos = new ConcurrentDictionary<int, MosaicChunkInfo>();
+        if (Globals.EnableMosaicDedup && mosaicCandidates.Count > 0)
+        {
+            var swMosaic = Stopwatch.StartNew();
+            int subSize = Globals.MosaicSubChunkSize;
+            int nComp = Globals.MosaicNComponents;
+
+            Parallel.ForEach(mosaicCandidates, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, kv =>
+            {
+                int idx = kv.Key;
+                var candidateList = kv.Value;
+
+                if (sorted[idx] == null || !sorted[idx]!.NeedToStore) return;
+                if (!chunkMap.TryGetValue(idx, out var srcChunk) || srcChunk == null) return;
+
+                // Pre-convert all candidate ByteStrings to byte[] once (avoids 64 × K allocations)
+                List<(byte[] bytes, string guid, ulong bucketId)> preConverted;
+                lock (candidateList)
+                {
+                    preConverted = new List<(byte[], string, ulong)>(candidateList.Count);
+                    foreach (var cand in candidateList)
+                    {
+                        if (cand.Chunk == null || cand.Chunk.Length != srcChunk.Length) continue;
+                        preConverted.Add((cand.Chunk.ToByteArray(), cand.StorageGuid ?? "", cand.BucketId));
+                    }
+                }
+                if (preConverted.Count == 0) return;
+
+                // Build mosaic: for each sub-chunk element, find the best positional byte match
+                var donors = new List<(ulong BucketId, string StorageGuid, byte[] ChunkBytes)>();
+                var donorIndex = new Dictionary<string, int>(); // storageGuid → index in donors
+                var info = new MosaicChunkInfo();
+                int chunkSize = srcChunk.Length;
+                var stitched = new byte[chunkSize];
+                int matched = 0;
+
+                for (int e = 0; e < nComp && e * subSize < chunkSize; e++)
+                {
+                    int offset = e * subSize;
+                    int len = Math.Min(subSize, chunkSize - offset);
+
+                    int bestMatchBytes = -1;
+                    byte[]? bestDonorChunk = null;
+                    string bestGuid = "";
+                    ulong bestBucketId = 0;
+
+                    foreach (var (candBytes, guid, bucketId) in preConverted)
+                    {
+                        int matchCount = 0;
+                        for (int b = 0; b < len; b++)
+                        {
+                            if (srcChunk[offset + b] == candBytes[offset + b])
+                                matchCount++;
+                        }
+
+                        if (matchCount > bestMatchBytes)
+                        {
+                            bestMatchBytes = matchCount;
+                            bestDonorChunk = candBytes;
+                            bestGuid = guid;
+                            bestBucketId = bucketId;
+                        }
+                    }
+
+                    // Only use donor if it matches more than half the bytes at this position
+                    if (bestMatchBytes > len / 2 && bestDonorChunk != null && !string.IsNullOrEmpty(bestGuid))
+                    {
+                        if (!donorIndex.TryGetValue(bestGuid, out int dIdx))
+                        {
+                            if (donors.Count >= 15) continue; // Max 15 donors (4-bit selector)
+                            dIdx = donors.Count;
+                            donorIndex[bestGuid] = dIdx;
+                            donors.Add((bestBucketId, bestGuid, bestDonorChunk));
+                        }
+                        Buffer.BlockCopy(donors[dIdx].ChunkBytes, offset, stitched, offset, len);
+                        info.MatchBitmap |= (1UL << e);
+                        MosaicChunkInfo.SetSelector(info.Selectors, e, dIdx);
+                        matched++;
+                    }
+                    // Unmatched sub-chunks stay as zeros — error encoding covers them
+                }
+
+                if (matched == 0 || donors.Count == 0) return;
+
+                info.Donors = donors.Select(d => (d.BucketId, d.StorageGuid)).ToList();
+                info.StitchedBase = stitched;
+                mosaicInfos[idx] = info;
+
+                // Replace the empty base chunk with the stitched mosaic
+                sorted[idx]!.Chunk = ByteString.CopyFrom(stitched);
+            });
+
+            swMosaic.Stop();
+            Console.WriteLine($"[Compress] Mosaic L2: {swMosaic.ElapsedMilliseconds}ms, {mosaicInfos.Count}/{mosaicCandidates.Count} chunks assembled");
         }
 
         // ── BATCH STORE: one gRPC call per agent instead of one per chunk ──
@@ -744,6 +875,19 @@ public class CrossService : ICross
             Console.WriteLine($"[Compress] Store: {swStage.ElapsedMilliseconds}ms, {totalStored} chunks across {storeGroups.Count} agents");
             Observability.RecordStage("StoreChunks", swStage.Elapsed.TotalMilliseconds,
                 ("agents", storeGroups.Count), ("chunks_stored", totalStored));
+        }
+
+        // ── Post-store: clean up mosaic entries for chunks deduped at store time ──
+        // If the agent matched an existing stored chunk, the error encoding base is now
+        // the agent's matched chunk (storeRes.BaseChunk), NOT the stitched mosaic.
+        // Remove from mosaicInfos so the reference builder writes 0x01 instead of 0x03.
+        if (mosaicInfos.Count > 0)
+        {
+            foreach (var idx in mosaicInfos.Keys.ToList())
+            {
+                if (sorted[idx] != null && !sorted[idx]!.NeedToStore)
+                    mosaicInfos.TryRemove(idx, out _);
+            }
         }
 
         // ── Post-store: propagate updated store results to non-rep group members ──
@@ -1182,6 +1326,7 @@ public class CrossService : ICross
         //   flag=0x00: zero-ref (zeros base)         → 1 byte
         //   flag=0x01: full ref (bucketId+storageGuid) → 41 bytes
         //   flag=0x02: compact ref (bucketId+bucketIndex) → 17 bytes (self-stored only)
+        //   flag=0x03: mosaic ref (bitmap + selectors + donor list) → variable
         // v3.0.0: fixed 40 bytes per ref (bucketId+storageGuid)
         const int StorageGuidRawLen = 32;
         var references = new List<byte>(sorted.Length * 20); // average estimate
@@ -1190,6 +1335,28 @@ public class CrossService : ICross
         for (int i = 0; i < sorted.Length; i++)
         {
             bool isZero = sorted[i].BucketId == 0;
+
+            // Mosaic reference: chunk has a stitched base from multiple donors
+            if (mosaicInfos.TryGetValue(i, out var mosaic) && mosaic.Donors.Count > 0)
+            {
+                references.Add(0x03);
+                // Donor count (1 byte, max 15)
+                references.Add((byte)mosaic.Donors.Count);
+                // Each donor: 8 bytes bucketId + 32 bytes storageGuid
+                foreach (var (donorBucketId, donorGuid) in mosaic.Donors)
+                {
+                    references.AddRange(BitConverter.GetBytes(donorBucketId));
+                    byte[] dGuidRaw = (!string.IsNullOrEmpty(donorGuid) && donorGuid.Length == 64)
+                        ? Convert.FromHexString(donorGuid)
+                        : new byte[StorageGuidRawLen];
+                    references.AddRange(dGuidRaw);
+                }
+                // 8 bytes match bitmap
+                references.AddRange(BitConverter.GetBytes(mosaic.MatchBitmap));
+                // 32 bytes selectors (64 x 4-bit nibbles)
+                references.AddRange(mosaic.Selectors);
+                continue;
+            }
 
             if (isZero)
             {
@@ -1256,10 +1423,16 @@ public class CrossService : ICross
                 Buffer.BlockCopy(fileChunks[i], 0, originalBuffer, off, Globals.chunkSize);
 
                 // Determine base chunk
+                // Mosaic chunks: base == stitched mosaic from donors (what decompressor reconstructs via 0x03 ref)
                 // Representatives that were stored: base == rep's own bytes (zero diff for rep itself).
                 // Non-reps whose rep was stored: base == rep's bytes (diff encodes distance to rep).
                 // Search matches: base == matched chunk from agent.
-                if (sorted[i].NeedToStore && sorted[i].BucketId != 0)
+                if (mosaicInfos.TryGetValue(i, out var mosaicForDiff))
+                {
+                    Buffer.BlockCopy(mosaicForDiff.StitchedBase, 0, baseBuffer, off,
+                        Math.Min(mosaicForDiff.StitchedBase.Length, Globals.chunkSize));
+                }
+                else if (sorted[i].NeedToStore && sorted[i].BucketId != 0)
                 {
                     Buffer.BlockCopy(fileChunks[i], 0, baseBuffer, off, Globals.chunkSize);
                 }
@@ -1888,6 +2061,9 @@ public class CrossService : ICross
         string[] refStorageGuids;
         int chunkCount;
 
+        // Mosaic metadata for 0x03 refs (populated during parsing, used during fetch)
+        var mosaicRefs = new Dictionary<int, (List<(ulong BucketId, string StorageGuid)> Donors, ulong MatchBitmap, byte[] Selectors)>();
+
         if (header.Version == "v3.1.0")
         {
             // v3.1.0: flag-based variable-size refs
@@ -1895,6 +2071,7 @@ public class CrossService : ICross
             //   flag=0x00: zero-ref (1 byte)
             //   flag=0x01: full ref (1 + 8 bucketId + 32 storageGuid = 41 bytes)
             //   flag=0x02: compact ref (1 + 8 bucketId + 8 bucketIndex = 17 bytes)
+            //   flag=0x03: mosaic ref (donors + bitmap + selectors)
             int off = referencesOffset;
             chunkCount = BitConverter.ToInt32(file, off);
             off += sizeof(int);
@@ -1929,6 +2106,33 @@ public class CrossService : ICross
                         off += sizeof(ulong);
                         refStorageGuids[i] = ""; // decompressor uses bucketIndex path
                         break;
+                    case 0x03: // mosaic ref: donors + bitmap + selectors
+                    {
+                        int donorCount = file[off++];
+                        var donors = new List<(ulong BucketId, string StorageGuid)>(donorCount);
+                        for (int d = 0; d < donorCount; d++)
+                        {
+                            ulong dBucketId = BitConverter.ToUInt64(file, off);
+                            off += sizeof(ulong);
+                            var dGuidRaw = new byte[32];
+                            Buffer.BlockCopy(file, off, dGuidRaw, 0, 32);
+                            off += 32;
+                            bool dAllZero = true;
+                            for (int b = 0; b < 32; b++) { if (dGuidRaw[b] != 0) { dAllZero = false; break; } }
+                            string dGuid = dAllZero ? "" : Convert.ToHexString(dGuidRaw).ToLowerInvariant();
+                            donors.Add((dBucketId, dGuid));
+                        }
+                        ulong matchBitmap = BitConverter.ToUInt64(file, off);
+                        off += sizeof(ulong);
+                        var selectors = new byte[32];
+                        Buffer.BlockCopy(file, off, selectors, 0, 32);
+                        off += 32;
+
+                        mosaicRefs[i] = (donors, matchBitmap, selectors);
+                        refBucketIds[i] = ulong.MaxValue; // sentinel: ensures isZeroRef=false
+                        refStorageGuids[i] = "";
+                        break;
+                    }
                     default:
                         throw new InvalidDataException($"Unknown reference flag 0x{flag:X2} at chunk {i}");
                 }
@@ -2027,11 +2231,65 @@ public class CrossService : ICross
             bool isZeroRef = isV3
                 ? (bucketId == 0 && string.IsNullOrEmpty(refStorageGuids[i]))
                 : (bucketId == 0 && refBucketIndices[i] == 0);
+            bool isMosaicRef = mosaicRefs.ContainsKey(i);
 
             if (isZeroRef)
             {
                 baseChunks[i] = new byte[Globals.chunkSize];
                 fetchTasks[i] = Task.CompletedTask;
+            }
+            else if (isMosaicRef)
+            {
+                int idx = i;
+                var (donors, matchBitmap, selectors) = mosaicRefs[idx];
+                fetchTasks[i] = Task.Run(async () =>
+                {
+                    int subSize = Globals.MosaicSubChunkSize;
+                    int nComp = Globals.MosaicNComponents;
+                    int chSize = Globals.chunkSize;
+
+                    // Fetch all donor chunks in parallel
+                    var donorChunks = new byte[donors.Count][];
+                    var donorFetches = new Task[donors.Count];
+                    for (int d = 0; d < donors.Count; d++)
+                    {
+                        int dIdx = d;
+                        var (dBucketId, dGuid) = donors[dIdx];
+                        donorFetches[dIdx] = Task.Run(async () =>
+                        {
+                            string bitstring = UlongToBitstring(dBucketId);
+                            string targetAgent = RendezvousRouter.PickAgent(bitstring);
+                            byte[]? chunk = null;
+                            if (!string.IsNullOrEmpty(dGuid))
+                                chunk = await _chunkReferenceClient.GetChunkByStorageGuidAsync(dGuid, targetAgent);
+                            if (chunk == null && allAgentIps != null)
+                            {
+                                foreach (var agent in allAgentIps.Where(ip => ip != targetAgent))
+                                {
+                                    try { chunk = await _chunkReferenceClient.GetChunkByStorageGuidAsync(dGuid, agent); }
+                                    catch { /* try next */ }
+                                    if (chunk != null) break;
+                                }
+                            }
+                            donorChunks[dIdx] = chunk ?? new byte[chSize];
+                        });
+                    }
+                    await Task.WhenAll(donorFetches);
+
+                    // Stitch the mosaic base from donors based on bitmap and selectors
+                    var stitched = new byte[chSize];
+                    for (int e = 0; e < nComp && e * subSize < chSize; e++)
+                    {
+                        if ((matchBitmap & (1UL << e)) == 0) continue;
+                        int donorIdx = MosaicChunkInfo.GetSelector(selectors, e);
+                        if (donorIdx >= donorChunks.Length) continue;
+                        int offset = e * subSize;
+                        int len = Math.Min(subSize, chSize - offset);
+                        Buffer.BlockCopy(donorChunks[donorIdx], offset, stitched, offset, len);
+                    }
+                    baseChunks[idx] = stitched;
+                    Interlocked.Increment(ref primaryHits);
+                });
             }
             else
             {

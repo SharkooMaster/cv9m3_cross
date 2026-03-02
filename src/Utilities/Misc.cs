@@ -337,4 +337,40 @@ static public class Misc
         return double.Parse(parts[0]);
     }
 
+    /// <summary>
+    /// Shannon entropy of a byte buffer in bits per byte (0.0 = uniform, 8.0 = maximally random).
+    /// Used to gate Level 2 mosaic dedup: only high-entropy chunks (H >= threshold) attempt
+    /// sub-chunk matching, avoiding wasted effort on new low-entropy clusters.
+    /// </summary>
+    public static float ComputeShannonEntropy(byte[] data)
+    {
+        Span<int> freq = stackalloc int[256];
+        freq.Clear();
+        for (int i = 0; i < data.Length; i++)
+            freq[data[i]]++;
+
+        double h = 0.0;
+        double invLen = 1.0 / data.Length;
+        for (int i = 0; i < 256; i++)
+        {
+            if (freq[i] == 0) continue;
+            double p = freq[i] * invLen;
+            h -= p * Math.Log2(p);
+        }
+        return (float)h;
+    }
+
+    /// <summary>
+    /// Batch-parallel entropy computation across all chunks.
+    /// </summary>
+    public static float[] ComputeEntropies(IList<byte[]> chunks)
+    {
+        var results = new float[chunks.Count];
+        Parallel.For(0, chunks.Count, new ParallelOptions { MaxDegreeOfParallelism = -1 }, i =>
+        {
+            results[i] = ComputeShannonEntropy(chunks[i]);
+        });
+        return results;
+    }
+
 }
