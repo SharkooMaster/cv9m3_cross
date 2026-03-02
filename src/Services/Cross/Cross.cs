@@ -522,12 +522,11 @@ public class CrossService : ICross
                                     float sim = best.Similarity;
                                     if (sim >= MIN_THRESH && sim > bestSims[idx])
                                     {
-                                        // Thread-safe: compare-and-swap the best similarity
                                         float current;
                                         do
                                         {
                                             current = Volatile.Read(ref bestSims[idx]);
-                                            if (sim <= current) break; // Another agent found better
+                                            if (sim <= current) break;
                                         } while (Interlocked.CompareExchange(ref bestSims[idx], sim, current) != current);
 
                                         if (sim > current)
@@ -537,7 +536,7 @@ public class CrossService : ICross
                                                 BucketId = best.BucketId,
                                                 BucketKey = (ulong)best.BucketKey,
                                                 Similarity = sim,
-                                                Chunk = best.Chunk, // base chunk bytes from agent MRU cache
+                                                Chunk = best.Chunk,
                                                 Index = idx,
                                                 Duplicate = true,
                                                 NeedToStore = false,
@@ -546,8 +545,23 @@ public class CrossService : ICross
                                             };
                                         }
                                     }
+
+                                    // L1 match found, but also collect all K candidates for
+                                    // potential mosaic fallback if bloat guard rejects the L1 diff
+                                    if (res.Results.Count > 1)
+                                    {
+                                        var list = mosaicCandidates.GetOrAdd(idx, _ => new List<SearchVectorObject>());
+                                        lock (list)
+                                        {
+                                            foreach (var cand in res.Results)
+                                            {
+                                                if (cand.Chunk != null && cand.Chunk.Length > 0)
+                                                    list.Add(cand);
+                                            }
+                                        }
+                                    }
                                 }
-                                // Mosaic: agent returned Save=true with K candidates for high-entropy chunk
+                                // No L1 match — collect candidates for mosaic-only path
                                 else if (res.Save && res.Results.Count > 1)
                                 {
                                     var list = mosaicCandidates.GetOrAdd(idx, _ => new List<SearchVectorObject>());
@@ -1116,6 +1130,122 @@ public class CrossService : ICross
             Observability.RecordStage("DiffEncode", phaseSw.Elapsed.TotalMilliseconds,
                 ("chunk_count", sorted.Length), ("empty_diff", emptyDiffCount), ("non_empty_diff", diffCount),
                 ("zero_ref", zeroRefCount), ("bloated_restore", bloatedDiffRestore.Count));
+        }
+
+        // ── MOSAIC FALLBACK for bloat-rejected chunks ──
+        // Chunks that had an L1 match but failed the bloat guard. If they have mosaic candidates,
+        // try sub-chunk assembly. If the mosaic base produces a diff under the bloat threshold,
+        // use it instead of re-storing (saves datacenter storage).
+        if (Globals.EnableMosaicDedup && bloatedDiffRestore.Count > 0 && mosaicCandidates.Count > 0)
+        {
+            var swMosaicFallback = Stopwatch.StartNew();
+            int subSize = Globals.MosaicSubChunkSize;
+            int nComp = Globals.MosaicNComponents;
+            int mosaicSaved = 0;
+            var rescued = new ConcurrentBag<int>();
+
+            Parallel.ForEach(bloatedDiffRestore, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, i =>
+            {
+                if (!mosaicCandidates.TryGetValue(i, out var candidateList)) return;
+                if (!chunkMap.TryGetValue(i, out var srcChunk) || srcChunk == null) return;
+
+                List<(byte[] bytes, string guid, ulong bucketId)> preConverted;
+                lock (candidateList)
+                {
+                    preConverted = new List<(byte[], string, ulong)>(candidateList.Count);
+                    foreach (var cand in candidateList)
+                    {
+                        if (cand.Chunk == null || cand.Chunk.Length != srcChunk.Length) continue;
+                        preConverted.Add((cand.Chunk.ToByteArray(), cand.StorageGuid ?? "", cand.BucketId));
+                    }
+                }
+                if (preConverted.Count == 0) return;
+
+                var donors = new List<(ulong BucketId, string StorageGuid, byte[] ChunkBytes)>();
+                var donorIndex = new Dictionary<string, int>();
+                var info = new MosaicChunkInfo();
+                int chunkSize = srcChunk.Length;
+                var stitched = new byte[chunkSize];
+                int matched = 0;
+
+                for (int e = 0; e < nComp && e * subSize < chunkSize; e++)
+                {
+                    int offset = e * subSize;
+                    int len = Math.Min(subSize, chunkSize - offset);
+
+                    int bestMatchBytes = -1;
+                    byte[]? bestDonorChunk = null;
+                    string bestGuid = "";
+                    ulong bestBucketId = 0;
+
+                    foreach (var (candBytes, guid, bucketId) in preConverted)
+                    {
+                        int matchCount = 0;
+                        for (int b = 0; b < len; b++)
+                        {
+                            if (srcChunk[offset + b] == candBytes[offset + b])
+                                matchCount++;
+                        }
+                        if (matchCount > bestMatchBytes)
+                        {
+                            bestMatchBytes = matchCount;
+                            bestDonorChunk = candBytes;
+                            bestGuid = guid;
+                            bestBucketId = bucketId;
+                        }
+                    }
+
+                    if (bestMatchBytes > len / 2 && bestDonorChunk != null && !string.IsNullOrEmpty(bestGuid))
+                    {
+                        if (!donorIndex.TryGetValue(bestGuid, out int dIdx))
+                        {
+                            if (donors.Count >= 15) continue;
+                            dIdx = donors.Count;
+                            donorIndex[bestGuid] = dIdx;
+                            donors.Add((bestBucketId, bestGuid, bestDonorChunk));
+                        }
+                        Buffer.BlockCopy(donors[dIdx].ChunkBytes, offset, stitched, offset, len);
+                        info.MatchBitmap |= (1UL << e);
+                        MosaicChunkInfo.SetSelector(info.Selectors, e, dIdx);
+                        matched++;
+                    }
+                }
+
+                if (matched == 0 || donors.Count == 0) return;
+
+                // Check if the mosaic base actually produces a diff under the bloat threshold
+                int differingBytes = 0;
+                for (int j = 0; j < srcChunk.Length; j++)
+                {
+                    if (srcChunk[j] != stitched[j])
+                        differingBytes++;
+                }
+
+                int maxAllowed = (int)(Globals.chunkSize * Globals.BloatGuardThreshold);
+                if (differingBytes >= maxAllowed) return; // mosaic didn't help enough
+
+                info.Donors = donors.Select(d => (d.BucketId, d.StorageGuid)).ToList();
+                info.StitchedBase = stitched;
+                mosaicInfos[i] = info;
+
+                // Undo the bloat: restore to dedup state with mosaic base
+                sorted[i]!.NeedToStore = false;
+                sorted[i]!.Chunk = ByteString.CopyFrom(stitched);
+                rescued.Add(i);
+                Interlocked.Increment(ref mosaicSaved);
+            });
+
+            // Remove rescued chunks from bloatedDiffRestore
+            if (rescued.Count > 0)
+            {
+                var rescuedSet = new HashSet<int>(rescued);
+                bloatedDiffRestore.RemoveAll(idx => rescuedSet.Contains(idx));
+                diffCount += rescued.Count;
+                emptyDiffCount -= rescued.Count;
+            }
+
+            swMosaicFallback.Stop();
+            Console.WriteLine($"[Compress] Mosaic L2 fallback: {swMosaicFallback.ElapsedMilliseconds}ms, {mosaicSaved}/{bloatedDiffRestore.Count + mosaicSaved} bloated chunks rescued");
         }
 
         // ── RE-STORE pass for chunks whose diff would bloat the file ──
