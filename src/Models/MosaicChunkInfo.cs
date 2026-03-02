@@ -17,6 +17,12 @@ internal class MosaicChunkInfo
     /// <summary>32 bytes: 64 x 4-bit indices into Donors list. Nibble i = donor index for sub-chunk i.</summary>
     public byte[] Selectors = new byte[32];
 
+    /// <summary>
+    /// 64 bytes: for each element e, the donor's source position j (0-63) whose bytes were copied
+    /// into stitched position e. Enables cross-position matching where donor position j != e.
+    /// </summary>
+    public byte[] DonorPositions = new byte[64];
+
     /// <summary>The assembled mosaic base chunk (chunkSize bytes).</summary>
     public byte[] StitchedBase = Array.Empty<byte>();
 

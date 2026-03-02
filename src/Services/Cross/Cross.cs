@@ -662,7 +662,8 @@ public class CrossService : ICross
                 }
                 if (preConverted.Count == 0) return;
 
-                // Build mosaic: for each sub-chunk element, find the best positional byte match
+                // Build mosaic: for each source sub-chunk, find the best byte match
+                // at ANY position in any candidate (cross-position matching).
                 var donors = new List<(ulong BucketId, string StorageGuid, byte[] ChunkBytes)>();
                 var donorIndex = new Dictionary<string, int>(); // storageGuid → index in donors
                 var info = new MosaicChunkInfo();
@@ -672,48 +673,56 @@ public class CrossService : ICross
 
                 for (int e = 0; e < nComp && e * subSize < chunkSize; e++)
                 {
-                    int offset = e * subSize;
-                    int len = Math.Min(subSize, chunkSize - offset);
+                    int srcOffset = e * subSize;
+                    int len = Math.Min(subSize, chunkSize - srcOffset);
 
                     int bestMatchBytes = -1;
                     byte[]? bestDonorChunk = null;
                     string bestGuid = "";
                     ulong bestBucketId = 0;
+                    int bestDonorPos = e;
 
                     foreach (var (candBytes, guid, bucketId) in preConverted)
                     {
-                        int matchCount = 0;
-                        for (int b = 0; b < len; b++)
+                        for (int j = 0; j < nComp; j++)
                         {
-                            if (srcChunk[offset + b] == candBytes[offset + b])
-                                matchCount++;
-                        }
+                            int candOffset = j * subSize;
+                            int candLen = Math.Min(subSize, candBytes.Length - candOffset);
+                            if (candLen < len) continue;
 
-                        if (matchCount > bestMatchBytes)
-                        {
-                            bestMatchBytes = matchCount;
-                            bestDonorChunk = candBytes;
-                            bestGuid = guid;
-                            bestBucketId = bucketId;
+                            int matchCount = 0;
+                            for (int b = 0; b < len; b++)
+                            {
+                                if (srcChunk[srcOffset + b] == candBytes[candOffset + b])
+                                    matchCount++;
+                            }
+
+                            if (matchCount > bestMatchBytes)
+                            {
+                                bestMatchBytes = matchCount;
+                                bestDonorChunk = candBytes;
+                                bestGuid = guid;
+                                bestBucketId = bucketId;
+                                bestDonorPos = j;
+                            }
                         }
                     }
 
-                    // Only use donor if it matches more than half the bytes at this position
                     if (bestMatchBytes > len / 2 && bestDonorChunk != null && !string.IsNullOrEmpty(bestGuid))
                     {
                         if (!donorIndex.TryGetValue(bestGuid, out int dIdx))
                         {
-                            if (donors.Count >= 15) continue; // Max 15 donors (4-bit selector)
+                            if (donors.Count >= 15) continue;
                             dIdx = donors.Count;
                             donorIndex[bestGuid] = dIdx;
                             donors.Add((bestBucketId, bestGuid, bestDonorChunk));
                         }
-                        Buffer.BlockCopy(donors[dIdx].ChunkBytes, offset, stitched, offset, len);
+                        Buffer.BlockCopy(donors[dIdx].ChunkBytes, bestDonorPos * subSize, stitched, srcOffset, len);
                         info.MatchBitmap |= (1UL << e);
                         MosaicChunkInfo.SetSelector(info.Selectors, e, dIdx);
+                        info.DonorPositions[e] = (byte)bestDonorPos;
                         matched++;
                     }
-                    // Unmatched sub-chunks stay as zeros — error encoding covers them
                 }
 
                 if (matched == 0 || donors.Count == 0) return;
@@ -1170,28 +1179,37 @@ public class CrossService : ICross
 
                 for (int e = 0; e < nComp && e * subSize < chunkSize; e++)
                 {
-                    int offset = e * subSize;
-                    int len = Math.Min(subSize, chunkSize - offset);
+                    int srcOffset = e * subSize;
+                    int len = Math.Min(subSize, chunkSize - srcOffset);
 
                     int bestMatchBytes = -1;
                     byte[]? bestDonorChunk = null;
                     string bestGuid = "";
                     ulong bestBucketId = 0;
+                    int bestDonorPos = e;
 
                     foreach (var (candBytes, guid, bucketId) in preConverted)
                     {
-                        int matchCount = 0;
-                        for (int b = 0; b < len; b++)
+                        for (int cj = 0; cj < nComp; cj++)
                         {
-                            if (srcChunk[offset + b] == candBytes[offset + b])
-                                matchCount++;
-                        }
-                        if (matchCount > bestMatchBytes)
-                        {
-                            bestMatchBytes = matchCount;
-                            bestDonorChunk = candBytes;
-                            bestGuid = guid;
-                            bestBucketId = bucketId;
+                            int candOffset = cj * subSize;
+                            int candLen = Math.Min(subSize, candBytes.Length - candOffset);
+                            if (candLen < len) continue;
+
+                            int matchCount = 0;
+                            for (int b = 0; b < len; b++)
+                            {
+                                if (srcChunk[srcOffset + b] == candBytes[candOffset + b])
+                                    matchCount++;
+                            }
+                            if (matchCount > bestMatchBytes)
+                            {
+                                bestMatchBytes = matchCount;
+                                bestDonorChunk = candBytes;
+                                bestGuid = guid;
+                                bestBucketId = bucketId;
+                                bestDonorPos = cj;
+                            }
                         }
                     }
 
@@ -1204,9 +1222,10 @@ public class CrossService : ICross
                             donorIndex[bestGuid] = dIdx;
                             donors.Add((bestBucketId, bestGuid, bestDonorChunk));
                         }
-                        Buffer.BlockCopy(donors[dIdx].ChunkBytes, offset, stitched, offset, len);
+                        Buffer.BlockCopy(donors[dIdx].ChunkBytes, bestDonorPos * subSize, stitched, srcOffset, len);
                         info.MatchBitmap |= (1UL << e);
                         MosaicChunkInfo.SetSelector(info.Selectors, e, dIdx);
+                        info.DonorPositions[e] = (byte)bestDonorPos;
                         matched++;
                     }
                 }
@@ -1456,7 +1475,8 @@ public class CrossService : ICross
         //   flag=0x00: zero-ref (zeros base)         → 1 byte
         //   flag=0x01: full ref (bucketId+storageGuid) → 41 bytes
         //   flag=0x02: compact ref (bucketId+bucketIndex) → 17 bytes (self-stored only)
-        //   flag=0x03: mosaic ref (bitmap + selectors + donor list) → variable
+        //   flag=0x03: mosaic ref (bitmap + selectors + donor list) → variable (legacy positional)
+        //   flag=0x04: mosaic ref (bitmap + selectors + donor positions + donor list) → variable (cross-position)
         // v3.0.0: fixed 40 bytes per ref (bucketId+storageGuid)
         const int StorageGuidRawLen = 32;
         var references = new List<byte>(sorted.Length * 20); // average estimate
@@ -1467,9 +1487,10 @@ public class CrossService : ICross
             bool isZero = sorted[i].BucketId == 0;
 
             // Mosaic reference: chunk has a stitched base from multiple donors
+            // Flag 0x04: cross-position mosaic (donor position j may differ from element e)
             if (mosaicInfos.TryGetValue(i, out var mosaic) && mosaic.Donors.Count > 0)
             {
-                references.Add(0x03);
+                references.Add(0x04);
                 // Donor count (1 byte, max 15)
                 references.Add((byte)mosaic.Donors.Count);
                 // Each donor: 8 bytes bucketId + 32 bytes storageGuid
@@ -1485,6 +1506,8 @@ public class CrossService : ICross
                 references.AddRange(BitConverter.GetBytes(mosaic.MatchBitmap));
                 // 32 bytes selectors (64 x 4-bit nibbles)
                 references.AddRange(mosaic.Selectors);
+                // 64 bytes donor positions (cross-position: DonorPositions[e] = donor source position j)
+                references.AddRange(mosaic.DonorPositions);
                 continue;
             }
 
@@ -2191,8 +2214,8 @@ public class CrossService : ICross
         string[] refStorageGuids;
         int chunkCount;
 
-        // Mosaic metadata for 0x03 refs (populated during parsing, used during fetch)
-        var mosaicRefs = new Dictionary<int, (List<(ulong BucketId, string StorageGuid)> Donors, ulong MatchBitmap, byte[] Selectors)>();
+        // Mosaic metadata for 0x03/0x04 refs (populated during parsing, used during fetch)
+        var mosaicRefs = new Dictionary<int, (List<(ulong BucketId, string StorageGuid)> Donors, ulong MatchBitmap, byte[] Selectors, byte[]? DonorPositions)>();
 
         if (header.Version == "v3.1.0")
         {
@@ -2201,7 +2224,8 @@ public class CrossService : ICross
             //   flag=0x00: zero-ref (1 byte)
             //   flag=0x01: full ref (1 + 8 bucketId + 32 storageGuid = 41 bytes)
             //   flag=0x02: compact ref (1 + 8 bucketId + 8 bucketIndex = 17 bytes)
-            //   flag=0x03: mosaic ref (donors + bitmap + selectors)
+            //   flag=0x03: mosaic ref (donors + bitmap + selectors) — legacy positional
+            //   flag=0x04: mosaic ref (donors + bitmap + selectors + donorPositions) — cross-position
             int off = referencesOffset;
             chunkCount = BitConverter.ToInt32(file, off);
             off += sizeof(int);
@@ -2236,7 +2260,7 @@ public class CrossService : ICross
                         off += sizeof(ulong);
                         refStorageGuids[i] = ""; // decompressor uses bucketIndex path
                         break;
-                    case 0x03: // mosaic ref: donors + bitmap + selectors
+                    case 0x03: // legacy positional mosaic ref: donors + bitmap + selectors
                     {
                         int donorCount = file[off++];
                         var donors = new List<(ulong BucketId, string StorageGuid)>(donorCount);
@@ -2258,8 +2282,38 @@ public class CrossService : ICross
                         Buffer.BlockCopy(file, off, selectors, 0, 32);
                         off += 32;
 
-                        mosaicRefs[i] = (donors, matchBitmap, selectors);
-                        refBucketIds[i] = ulong.MaxValue; // sentinel: ensures isZeroRef=false
+                        mosaicRefs[i] = (donors, matchBitmap, selectors, null);
+                        refBucketIds[i] = ulong.MaxValue;
+                        refStorageGuids[i] = "";
+                        break;
+                    }
+                    case 0x04: // cross-position mosaic ref: donors + bitmap + selectors + donorPositions
+                    {
+                        int donorCount = file[off++];
+                        var donors = new List<(ulong BucketId, string StorageGuid)>(donorCount);
+                        for (int d = 0; d < donorCount; d++)
+                        {
+                            ulong dBucketId = BitConverter.ToUInt64(file, off);
+                            off += sizeof(ulong);
+                            var dGuidRaw = new byte[32];
+                            Buffer.BlockCopy(file, off, dGuidRaw, 0, 32);
+                            off += 32;
+                            bool dAllZero = true;
+                            for (int b = 0; b < 32; b++) { if (dGuidRaw[b] != 0) { dAllZero = false; break; } }
+                            string dGuid = dAllZero ? "" : Convert.ToHexString(dGuidRaw).ToLowerInvariant();
+                            donors.Add((dBucketId, dGuid));
+                        }
+                        ulong matchBitmap = BitConverter.ToUInt64(file, off);
+                        off += sizeof(ulong);
+                        var selectors = new byte[32];
+                        Buffer.BlockCopy(file, off, selectors, 0, 32);
+                        off += 32;
+                        var donorPositions = new byte[64];
+                        Buffer.BlockCopy(file, off, donorPositions, 0, 64);
+                        off += 64;
+
+                        mosaicRefs[i] = (donors, matchBitmap, selectors, donorPositions);
+                        refBucketIds[i] = ulong.MaxValue;
                         refStorageGuids[i] = "";
                         break;
                     }
@@ -2371,7 +2425,7 @@ public class CrossService : ICross
             else if (isMosaicRef)
             {
                 int idx = i;
-                var (donors, matchBitmap, selectors) = mosaicRefs[idx];
+                var (donors, matchBitmap, selectors, donorPositions) = mosaicRefs[idx];
                 fetchTasks[i] = Task.Run(async () =>
                 {
                     int subSize = Globals.MosaicSubChunkSize;
@@ -2406,16 +2460,21 @@ public class CrossService : ICross
                     }
                     await Task.WhenAll(donorFetches);
 
-                    // Stitch the mosaic base from donors based on bitmap and selectors
+                    // Stitch the mosaic base from donors based on bitmap, selectors, and donor positions.
+                    // donorPositions != null → cross-position (0x04): copy from donor position j.
+                    // donorPositions == null → legacy positional (0x03): copy from same position e.
                     var stitched = new byte[chSize];
                     for (int e = 0; e < nComp && e * subSize < chSize; e++)
                     {
                         if ((matchBitmap & (1UL << e)) == 0) continue;
                         int donorIdx = MosaicChunkInfo.GetSelector(selectors, e);
                         if (donorIdx >= donorChunks.Length) continue;
-                        int offset = e * subSize;
-                        int len = Math.Min(subSize, chSize - offset);
-                        Buffer.BlockCopy(donorChunks[donorIdx], offset, stitched, offset, len);
+                        int dstOffset = e * subSize;
+                        int srcPos = donorPositions != null ? donorPositions[e] : e;
+                        int srcOffset = srcPos * subSize;
+                        int len = Math.Min(subSize, chSize - dstOffset);
+                        if (srcOffset + len <= donorChunks[donorIdx].Length)
+                            Buffer.BlockCopy(donorChunks[donorIdx], srcOffset, stitched, dstOffset, len);
                     }
                     baseChunks[idx] = stitched;
                     Interlocked.Increment(ref primaryHits);
