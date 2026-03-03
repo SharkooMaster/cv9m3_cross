@@ -71,6 +71,17 @@ public static class Globals
 
     public const int MosaicNComponents = 64;
     public static int MosaicSubChunkSize => chunkSize / MosaicNComponents;
+
+    // ── Lane bucket index (Level 2 global sub-chunk search) ──
+    public static int LaneHashBits =
+        int.TryParse(Environment.GetEnvironmentVariable("LANE_HASH_BITS"), out var lhb) ? lhb : 16;
+
+    public static int LaneSearchMaxPerQuery =
+        int.TryParse(Environment.GetEnvironmentVariable("LANE_SEARCH_MAX"), out var lsm) ? lsm : 50;
+
+    public static bool EnableLaneSearch =
+        string.Equals(Environment.GetEnvironmentVariable("ENABLE_LANE_SEARCH"), "true",
+            StringComparison.OrdinalIgnoreCase);
     //public static string GatewayLoadbalancer = "192.168.50.241";
     // Allow running outside Kubernetes/Docker by overriding via env var.
     // Examples:

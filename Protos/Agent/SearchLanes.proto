@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+service SearchLanes {
+    rpc BatchSearch (BatchSearchLanesReq) returns (BatchSearchLanesRes);
+}
+
+message LaneQuery {
+    uint32 lane_hash = 1;
+    bytes source_lane_bytes = 2;
+    int32 query_index = 3;
+}
+
+message LaneMatch {
+    uint64 bucket_id = 1;
+    string storage_guid = 2;
+    uint32 lane_position = 3;
+    bytes donor_lane_bytes = 4;
+}
+
+message LaneQueryResult {
+    int32 query_index = 1;
+    repeated LaneMatch matches = 2;
+}
+
+message BatchSearchLanesReq {
+    repeated LaneQuery queries = 1;
+}
+
+message BatchSearchLanesRes {
+    repeated LaneQueryResult results = 1;
+}

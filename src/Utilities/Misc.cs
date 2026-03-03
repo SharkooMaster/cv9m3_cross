@@ -373,4 +373,90 @@ static public class Misc
         return results;
     }
 
+    // ══════════════════════════════════════════════════════════════
+    //  LANE LSH: Mini-LSH hashing for sub-chunk (lane) indexing
+    //  Seed 43 (distinct from main LSH seed 42) ensures independent
+    //  hash space while remaining deterministic across agent/cross.
+    // ══════════════════════════════════════════════════════════════
+
+    private static float[]? _cachedLaneProjection = null;
+    private static readonly object _laneProjectionLock = new();
+    private static int _cachedLaneHashBits = 0;
+    private static int _cachedLaneSubSize = 0;
+
+    private static float[] GetOrCreateLaneProjectionMatrix(int hashBits, int subSize)
+    {
+        if (_cachedLaneProjection == null || _cachedLaneHashBits != hashBits || _cachedLaneSubSize != subSize)
+        {
+            lock (_laneProjectionLock)
+            {
+                if (_cachedLaneProjection == null || _cachedLaneHashBits != hashBits || _cachedLaneSubSize != subSize)
+                {
+                    var flat = new float[hashBits * subSize];
+                    var rng = new Random(43);
+                    for (int row = 0; row < hashBits; row++)
+                    {
+                        int off = row * subSize;
+                        for (int col = 0; col < subSize; col++)
+                            flat[off + col] = (float)(rng.NextDouble() - 0.5);
+                    }
+                    _cachedLaneProjection = flat;
+                    _cachedLaneHashBits = hashBits;
+                    _cachedLaneSubSize = subSize;
+                }
+            }
+        }
+        return _cachedLaneProjection;
+    }
+
+    public static ushort ComputeSingleLaneBitstring(byte[] chunk, int offset, int len, float[] projection, int hashBits)
+    {
+        ushort bits = 0;
+        for (int row = 0; row < hashBits; row++)
+        {
+            float sum = 0f;
+            int rowOff = row * len;
+            for (int col = 0; col < len; col++)
+                sum += projection[rowOff + col] * chunk[offset + col];
+            if (sum >= 0f)
+                bits |= (ushort)(1 << row);
+        }
+        return bits;
+    }
+
+    /// <summary>
+    /// Compute mini-LSH bitstrings for all 64 lanes of a chunk.
+    /// Deterministic: same chunk bytes → same bitstrings on agent and cross (seed 43).
+    /// </summary>
+    public static ushort[] ComputeLaneBitstrings(byte[] chunk, int subSize, int nLanes, int hashBits)
+    {
+        var projection = GetOrCreateLaneProjectionMatrix(hashBits, subSize);
+        var result = new ushort[nLanes];
+        for (int lane = 0; lane < nLanes; lane++)
+        {
+            int offset = lane * subSize;
+            int len = Math.Min(subSize, chunk.Length - offset);
+            if (len <= 0) break;
+            if (len < subSize)
+            {
+                ushort bits = 0;
+                for (int row = 0; row < hashBits; row++)
+                {
+                    float sum = 0f;
+                    int rowOff = row * subSize;
+                    for (int col = 0; col < len; col++)
+                        sum += projection[rowOff + col] * chunk[offset + col];
+                    if (sum >= 0f)
+                        bits |= (ushort)(1 << row);
+                }
+                result[lane] = bits;
+            }
+            else
+            {
+                result[lane] = ComputeSingleLaneBitstring(chunk, offset, subSize, projection, hashBits);
+            }
+        }
+        return result;
+    }
+
 }

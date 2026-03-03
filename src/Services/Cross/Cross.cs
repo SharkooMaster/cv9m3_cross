@@ -739,6 +739,187 @@ public class CrossService : ICross
             Console.WriteLine($"[Compress] Mosaic L2: {swMosaic.ElapsedMilliseconds}ms, {mosaicInfos.Count}/{mosaicCandidates.Count} chunks assembled");
         }
 
+        // ── GLOBAL LANE SEARCH (Level 2 sub-chunk index) ──
+        // For chunks still needing storage after the top-K mosaic pass, query the lane
+        // bucket index on ALL agents to find globally similar sub-chunks.
+        if (Globals.EnableLaneSearch && Globals.EnableMosaicDedup)
+        {
+            var swLane = Stopwatch.StartNew();
+            int subSize = Globals.MosaicSubChunkSize;
+            int nComp = Globals.MosaicNComponents;
+            int laneHashBits = Globals.LaneHashBits;
+            int laneSaved = 0;
+
+            // Collect chunks that still need storage and have source bytes available
+            var laneTargets = new List<int>();
+            for (int i = 0; i < sorted.Length; i++)
+            {
+                if (sorted[i] == null || !sorted[i]!.NeedToStore) continue;
+                if (!chunkMap.TryGetValue(i, out var src) || src == null) continue;
+                // Skip chunks that already have a full mosaic assembly
+                if (mosaicInfos.ContainsKey(i)) continue;
+                laneTargets.Add(i);
+            }
+
+            if (laneTargets.Count > 0)
+            {
+                // Compute lane hashes for all target chunks' sub-regions
+                var allLaneQueries = new List<LaneQuery>();
+                var queryToChunk = new List<(int chunkIdx, int laneIdx)>();
+
+                foreach (int idx in laneTargets)
+                {
+                    var srcChunk = chunkMap[idx];
+                    var laneHashes = Misc.ComputeLaneBitstrings(srcChunk, subSize, nComp, laneHashBits);
+
+                    for (int lane = 0; lane < nComp && lane * subSize < srcChunk.Length; lane++)
+                    {
+                        int srcOffset = lane * subSize;
+                        int len = Math.Min(subSize, srcChunk.Length - srcOffset);
+                        var srcLaneBytes = new byte[len];
+                        Buffer.BlockCopy(srcChunk, srcOffset, srcLaneBytes, 0, len);
+
+                        allLaneQueries.Add(new LaneQuery
+                        {
+                            LaneHash = laneHashes[lane],
+                            SourceLaneBytes = ByteString.CopyFrom(srcLaneBytes),
+                            QueryIndex = allLaneQueries.Count
+                        });
+                        queryToChunk.Add((idx, lane));
+                    }
+                }
+
+                if (allLaneQueries.Count > 0)
+                {
+                    // Send BatchSearchLanes to ALL agents in parallel
+                    string[] agentIps;
+                    try { agentIps = RendezvousRouter.GetAllAgentIps(); }
+                    catch { agentIps = new[] { Globals.AgentsLoadbalancer }; }
+
+                    var allMatches = new ConcurrentBag<(int chunkIdx, int laneIdx, LaneMatch match)>();
+
+                    var laneTasks = agentIps.Select(agentIp => Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var client = GrpcChannelFactory.GetClient(
+                                target: agentIp,
+                                ctor: chan => new SearchLanes.SearchLanesClient(chan),
+                                roundRobin: false, port: 5000);
+
+                            var req = new BatchSearchLanesReq();
+                            req.Queries.AddRange(allLaneQueries);
+
+                            var res = await client.BatchSearchAsync(req,
+                                deadline: DateTime.UtcNow.AddSeconds(30));
+
+                            foreach (var qr in res.Results)
+                            {
+                                if (qr == null || qr.Matches.Count == 0) continue;
+                                int qi = qr.QueryIndex;
+                                if (qi < 0 || qi >= queryToChunk.Count) continue;
+                                var (chunkIdx, laneIdx) = queryToChunk[qi];
+
+                                foreach (var m in qr.Matches)
+                                    allMatches.Add((chunkIdx, laneIdx, m));
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[Compress] Lane search to {agentIp} failed: {ex.Message}");
+                        }
+                    })).ToArray();
+
+                    Task.WaitAll(laneTasks);
+
+                    // Group matches by chunk and assemble mosaic from globally-matched donors
+                    var matchesByChunk = allMatches
+                        .GroupBy(m => m.chunkIdx)
+                        .ToDictionary(g => g.Key, g => g.ToList());
+
+                    Parallel.ForEach(matchesByChunk, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, kv =>
+                    {
+                        int idx = kv.Key;
+                        var chunkMatches = kv.Value;
+                        if (!chunkMap.TryGetValue(idx, out var srcChunk) || srcChunk == null) return;
+
+                        var donors = new List<(ulong BucketId, string StorageGuid, byte[] ChunkBytes)>();
+                        var donorIndex = new Dictionary<string, int>();
+                        var info = new MosaicChunkInfo();
+                        int chunkSize = srcChunk.Length;
+                        var stitched = new byte[chunkSize];
+                        int matched = 0;
+
+                        // Group matches by lane index, pick best per lane
+                        var byLane = chunkMatches.GroupBy(m => m.laneIdx);
+                        foreach (var laneGroup in byLane)
+                        {
+                            int e = laneGroup.Key;
+                            int srcOffset = e * subSize;
+                            int len = Math.Min(subSize, chunkSize - srcOffset);
+                            if (len <= 0) continue;
+
+                            int bestMatchBytes = len / 2; // threshold: >50% match
+                            LaneMatch? bestMatch = null;
+
+                            foreach (var (_, _, m) in laneGroup)
+                            {
+                                if (m.DonorLaneBytes == null || m.DonorLaneBytes.Length < len) continue;
+                                var donorBytes = m.DonorLaneBytes.ToByteArray();
+
+                                int matchCount = 0;
+                                for (int b = 0; b < len; b++)
+                                {
+                                    if (srcChunk[srcOffset + b] == donorBytes[b])
+                                        matchCount++;
+                                }
+
+                                if (matchCount > bestMatchBytes)
+                                {
+                                    bestMatchBytes = matchCount;
+                                    bestMatch = m;
+                                }
+                            }
+
+                            if (bestMatch != null && !string.IsNullOrEmpty(bestMatch.StorageGuid))
+                            {
+                                string guid = bestMatch.StorageGuid;
+                                if (!donorIndex.TryGetValue(guid, out int dIdx))
+                                {
+                                    if (donors.Count >= 15) continue;
+                                    dIdx = donors.Count;
+                                    donorIndex[guid] = dIdx;
+                                    // We don't have full chunk bytes — use the lane bytes for stitching
+                                    donors.Add((bestMatch.BucketId, guid, Array.Empty<byte>()));
+                                }
+
+                                // Copy the donor lane bytes into the stitched base
+                                var donorLane = bestMatch.DonorLaneBytes.ToByteArray();
+                                Buffer.BlockCopy(donorLane, 0, stitched, srcOffset, len);
+                                info.MatchBitmap |= (1UL << e);
+                                MosaicChunkInfo.SetSelector(info.Selectors, e, dIdx);
+                                info.DonorPositions[e] = (byte)bestMatch.LanePosition;
+                                matched++;
+                            }
+                        }
+
+                        if (matched == 0 || donors.Count == 0) return;
+
+                        info.Donors = donors.Select(d => (d.BucketId, d.StorageGuid)).ToList();
+                        info.StitchedBase = stitched;
+                        mosaicInfos[idx] = info;
+
+                        sorted[idx]!.NeedToStore = false;
+                        sorted[idx]!.Chunk = ByteString.CopyFrom(stitched);
+                        Interlocked.Increment(ref laneSaved);
+                    });
+                }
+            }
+
+            swLane.Stop();
+            Console.WriteLine($"[Compress] Lane L2 global: {swLane.ElapsedMilliseconds}ms, {laneSaved}/{laneTargets.Count} chunks rescued via global lane search");
+        }
+
         // ── BATCH STORE: one gRPC call per agent instead of one per chunk ──
         // Rendezvous hash already told us which agent owns each chunk.
         // Group by agent, send ONE BatchStore per agent → ~5 calls instead of ~8,000.
@@ -1267,6 +1448,195 @@ public class CrossService : ICross
             Console.WriteLine($"[Compress] Mosaic L2 fallback: {swMosaicFallback.ElapsedMilliseconds}ms, {mosaicSaved}/{bloatedDiffRestore.Count + mosaicSaved} bloated chunks rescued");
         }
 
+        // ── LANE SEARCH FALLBACK for remaining bloated chunks ──
+        if (Globals.EnableLaneSearch && bloatedDiffRestore.Count > 0)
+        {
+            var swLaneFallback = Stopwatch.StartNew();
+            int subSize = Globals.MosaicSubChunkSize;
+            int nComp = Globals.MosaicNComponents;
+            int laneHashBits = Globals.LaneHashBits;
+            int laneFallbackSaved = 0;
+
+            // Collect bloated chunks that still need re-storing
+            var fallbackTargets = new List<int>();
+            foreach (var i in bloatedDiffRestore)
+            {
+                if (!chunkMap.TryGetValue(i, out var src) || src == null) continue;
+                if (mosaicInfos.ContainsKey(i)) continue; // already rescued by top-K mosaic fallback
+                fallbackTargets.Add(i);
+            }
+
+            if (fallbackTargets.Count > 0)
+            {
+                var allLaneQueries = new List<LaneQuery>();
+                var queryToChunk = new List<(int chunkIdx, int laneIdx)>();
+
+                foreach (int idx in fallbackTargets)
+                {
+                    var srcChunk = chunkMap[idx];
+                    var laneHashes = Misc.ComputeLaneBitstrings(srcChunk, subSize, nComp, laneHashBits);
+
+                    for (int lane = 0; lane < nComp && lane * subSize < srcChunk.Length; lane++)
+                    {
+                        int srcOffset = lane * subSize;
+                        int len = Math.Min(subSize, srcChunk.Length - srcOffset);
+                        var srcLaneBytes = new byte[len];
+                        Buffer.BlockCopy(srcChunk, srcOffset, srcLaneBytes, 0, len);
+
+                        allLaneQueries.Add(new LaneQuery
+                        {
+                            LaneHash = laneHashes[lane],
+                            SourceLaneBytes = ByteString.CopyFrom(srcLaneBytes),
+                            QueryIndex = allLaneQueries.Count
+                        });
+                        queryToChunk.Add((idx, lane));
+                    }
+                }
+
+                if (allLaneQueries.Count > 0)
+                {
+                    string[] agentIps;
+                    try { agentIps = RendezvousRouter.GetAllAgentIps(); }
+                    catch { agentIps = new[] { Globals.AgentsLoadbalancer }; }
+
+                    var allMatches = new ConcurrentBag<(int chunkIdx, int laneIdx, LaneMatch match)>();
+                    var laneTasks = agentIps.Select(agentIp => Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var client = GrpcChannelFactory.GetClient(
+                                target: agentIp,
+                                ctor: chan => new SearchLanes.SearchLanesClient(chan),
+                                roundRobin: false, port: 5000);
+
+                            var req = new BatchSearchLanesReq();
+                            req.Queries.AddRange(allLaneQueries);
+
+                            var res = await client.BatchSearchAsync(req,
+                                deadline: DateTime.UtcNow.AddSeconds(30));
+
+                            foreach (var qr in res.Results)
+                            {
+                                if (qr == null || qr.Matches.Count == 0) continue;
+                                int qi = qr.QueryIndex;
+                                if (qi < 0 || qi >= queryToChunk.Count) continue;
+                                var (chunkIdx, laneIdx) = queryToChunk[qi];
+                                foreach (var m in qr.Matches)
+                                    allMatches.Add((chunkIdx, laneIdx, m));
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[Compress] Lane fallback search to {agentIp} failed: {ex.Message}");
+                        }
+                    })).ToArray();
+
+                    Task.WaitAll(laneTasks);
+
+                    var matchesByChunk = allMatches
+                        .GroupBy(m => m.chunkIdx)
+                        .ToDictionary(g => g.Key, g => g.ToList());
+
+                    var rescued = new ConcurrentBag<int>();
+
+                    Parallel.ForEach(matchesByChunk, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, kv =>
+                    {
+                        int idx = kv.Key;
+                        var chunkMatches = kv.Value;
+                        if (!chunkMap.TryGetValue(idx, out var srcChunk) || srcChunk == null) return;
+
+                        var donors = new List<(ulong BucketId, string StorageGuid, byte[] ChunkBytes)>();
+                        var donorIndex = new Dictionary<string, int>();
+                        var info = new MosaicChunkInfo();
+                        int chunkSize = srcChunk.Length;
+                        var stitched = new byte[chunkSize];
+                        int matched = 0;
+
+                        var byLane = chunkMatches.GroupBy(m => m.laneIdx);
+                        foreach (var laneGroup in byLane)
+                        {
+                            int e = laneGroup.Key;
+                            int srcOffset = e * subSize;
+                            int len = Math.Min(subSize, chunkSize - srcOffset);
+                            if (len <= 0) continue;
+
+                            int bestMatchBytes = len / 2;
+                            LaneMatch? bestMatch = null;
+
+                            foreach (var (_, _, m) in laneGroup)
+                            {
+                                if (m.DonorLaneBytes == null || m.DonorLaneBytes.Length < len) continue;
+                                var donorBytes = m.DonorLaneBytes.ToByteArray();
+
+                                int matchCount = 0;
+                                for (int b = 0; b < len; b++)
+                                {
+                                    if (srcChunk[srcOffset + b] == donorBytes[b])
+                                        matchCount++;
+                                }
+
+                                if (matchCount > bestMatchBytes)
+                                {
+                                    bestMatchBytes = matchCount;
+                                    bestMatch = m;
+                                }
+                            }
+
+                            if (bestMatch != null && !string.IsNullOrEmpty(bestMatch.StorageGuid))
+                            {
+                                string guid = bestMatch.StorageGuid;
+                                if (!donorIndex.TryGetValue(guid, out int dIdx))
+                                {
+                                    if (donors.Count >= 15) continue;
+                                    dIdx = donors.Count;
+                                    donorIndex[guid] = dIdx;
+                                    donors.Add((bestMatch.BucketId, guid, Array.Empty<byte>()));
+                                }
+
+                                var donorLane = bestMatch.DonorLaneBytes.ToByteArray();
+                                Buffer.BlockCopy(donorLane, 0, stitched, srcOffset, len);
+                                info.MatchBitmap |= (1UL << e);
+                                MosaicChunkInfo.SetSelector(info.Selectors, e, dIdx);
+                                info.DonorPositions[e] = (byte)bestMatch.LanePosition;
+                                matched++;
+                            }
+                        }
+
+                        if (matched == 0 || donors.Count == 0) return;
+
+                        // Verify the mosaic base actually improves the diff
+                        int differingBytes = 0;
+                        for (int j = 0; j < srcChunk.Length; j++)
+                        {
+                            if (srcChunk[j] != stitched[j]) differingBytes++;
+                        }
+                        int maxAllowed = (int)(Globals.chunkSize * Globals.BloatGuardThreshold);
+                        if (differingBytes >= maxAllowed) return;
+
+                        info.Donors = donors.Select(d => (d.BucketId, d.StorageGuid)).ToList();
+                        info.StitchedBase = stitched;
+                        mosaicInfos[idx] = info;
+
+                        sorted[idx]!.NeedToStore = false;
+                        sorted[idx]!.Chunk = ByteString.CopyFrom(stitched);
+                        rescued.Add(idx);
+                        Interlocked.Increment(ref laneFallbackSaved);
+                    });
+
+                    // Remove rescued chunks from bloatedDiffRestore
+                    if (rescued.Count > 0)
+                    {
+                        var rescuedSet = new HashSet<int>(rescued);
+                        bloatedDiffRestore.RemoveAll(i => rescuedSet.Contains(i));
+                        emptyDiffCount -= rescued.Count;
+                    }
+                }
+            }
+
+            swLaneFallback.Stop();
+            Console.WriteLine($"[Compress] Lane L2 fallback: {swLaneFallback.ElapsedMilliseconds}ms, {laneFallbackSaved}/{fallbackTargets.Count} bloated chunks rescued via global lane search");
+        }
+
         // ── RE-STORE pass for chunks whose diff would bloat the file ──
         // These chunks matched a reference but the byte-level diff was larger than raw chunk.
         // Store them as their own base → empty diff. Grouped by agent for BatchStore.
@@ -1661,46 +2031,68 @@ public class CrossService : ICross
 
             // Serialize RLE: <int totalRunCount> + <int startPos><ushort runLength><short diffValue> × totalRunCount
             // Each run: 4 + 2 + 2 = 8 bytes (vs old 6 bytes per byte, but runs compress consecutive identical diffs)
-            using (var errorMs = new MemoryStream(4 + flatDiff.Count * 8))
+            // Runs longer than 65535 are split into consecutive sub-runs (ushort max).
+            // Count total serialized runs first (may be more than flatDiff.Count due to splits).
+            int serializedRunCount = 0;
+            foreach (var (_, runLength, _) in flatDiff)
+                serializedRunCount += (runLength + 65534) / 65535; // ceiling division
+
+            using (var errorMs = new MemoryStream(4 + serializedRunCount * 8))
             using (var errorWriter = new BinaryWriter(errorMs, Encoding.UTF8, leaveOpen: true))
             {
-                errorWriter.Write(flatDiff.Count);
+                errorWriter.Write(serializedRunCount);
                 foreach (var (startPos, runLength, diffValue) in flatDiff)
                 {
-                    errorWriter.Write(startPos); // 4 bytes: relative start position
-                    errorWriter.Write((ushort)runLength); // 2 bytes: run length (max 65,535)
-                    errorWriter.Write((short)diffValue); // 2 bytes: diff value
+                    int remaining = runLength;
+                    int relStart = startPos;
+                    while (remaining > 0)
+                    {
+                        int chunk = Math.Min(remaining, 65535);
+                        errorWriter.Write(relStart); // 4 bytes: relative start position
+                        errorWriter.Write((ushort)chunk); // 2 bytes: run length (max 65,535)
+                        errorWriter.Write((short)diffValue); // 2 bytes: diff value
+                        remaining -= chunk;
+                        relStart = 0; // continuation sub-runs start immediately after previous
+                    }
                 }
                 errorWriter.Flush();
                 errorDictionaryBytes = errorMs.ToArray();
             }
 
             // ── INTEGRITY CHECK 2: serialization round-trip ──
-            // Deserialize what we just wrote and verify it matches the source runs.
-            // Catches truncation (int→short overflow), off-by-one, or stream bugs.
+            // Deserialize what we just wrote, apply patches, and verify byte-for-byte
+            // match against originalBuffer. Catches any serialization bug including
+            // run-splitting errors.
             {
                 using var verifyMs = new MemoryStream(errorDictionaryBytes, writable: false);
                 using var verifyReader = new BinaryReader(verifyMs, Encoding.UTF8, leaveOpen: true);
                 int verifyCount = verifyReader.ReadInt32();
-                if (verifyCount != flatDiff.Count)
+                if (verifyCount != serializedRunCount)
                     throw new InvalidDataException(
-                        $"Serialization integrity: run count mismatch ({verifyCount} vs {flatDiff.Count}).");
+                        $"Serialization integrity: run count mismatch ({verifyCount} vs {serializedRunCount}).");
 
+                byte[] verifyBuf2 = new byte[baseBuffer.Length];
+                Buffer.BlockCopy(baseBuffer, 0, verifyBuf2, 0, baseBuffer.Length);
+                int cursor2 = 0;
                 for (int i = 0; i < verifyCount; i++)
                 {
                     int rStartPos = verifyReader.ReadInt32();
                     ushort rRunLength = verifyReader.ReadUInt16();
                     short rDiffValue = verifyReader.ReadInt16();
-                    if (rStartPos != flatDiff[i].startPos || rRunLength != flatDiff[i].runLength || rDiffValue != (short)flatDiff[i].diffValue)
-                        throw new InvalidDataException(
-                            $"Serialization integrity: run[{i}] mismatch. Expected ({flatDiff[i].startPos},{flatDiff[i].runLength},{flatDiff[i].diffValue}), got ({rStartPos},{rRunLength},{rDiffValue}).");
+                    cursor2 += rStartPos;
+                    for (int j = 0; j < rRunLength; j++)
+                        verifyBuf2[cursor2 + j] = (byte)(verifyBuf2[cursor2 + j] + rDiffValue);
+                    cursor2 += rRunLength;
                 }
+                if (!verifyBuf2.AsSpan().SequenceEqual(originalBuffer.AsSpan()))
+                    throw new InvalidDataException(
+                        "Serialization integrity: deserialized patches do not reconstruct original file.");
             }
 
             phaseSw.Stop();
-            Console.WriteLine($"[Compress] FlatEncode: {phaseSw.ElapsedMilliseconds}ms, pairs={flatDiff.Count}, bytes={errorDictionaryBytes.Length}");
+            Console.WriteLine($"[Compress] FlatEncode: {phaseSw.ElapsedMilliseconds}ms, runs={flatDiff.Count} (serialized={serializedRunCount}), bytes={errorDictionaryBytes.Length}");
             Observability.RecordStage("FlatEncode", phaseSw.Elapsed.TotalMilliseconds,
-                ("pairs", flatDiff.Count), ("bytes", errorDictionaryBytes.Length));
+                ("pairs", serializedRunCount), ("bytes", errorDictionaryBytes.Length));
         }
 
         byte[] toReturn;
