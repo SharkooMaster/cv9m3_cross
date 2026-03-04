@@ -48,8 +48,8 @@ public static class GrpcChannelFactory
         var options = new GrpcChannelOptions
         {
             HttpHandler = handler,
-            // LoggerFactory = Globals.GRPC_OPTIONS.LoggerFactory,
-
+            MaxReceiveMessageSize = 256 * 1024 * 1024,
+            MaxSendMessageSize = 256 * 1024 * 1024,
             Credentials = ChannelCredentials.Insecure
         };
 
@@ -103,7 +103,7 @@ public static class GrpcChannelFactory
                     InitialBackoff = sourceRetryPolicy?.InitialBackoff ?? TimeSpan.FromMilliseconds(200),
                     MaxBackoff = sourceRetryPolicy?.MaxBackoff ?? TimeSpan.FromSeconds(1),
                     BackoffMultiplier = sourceRetryPolicy?.BackoffMultiplier ?? 2,
-                    RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable, Grpc.Core.StatusCode.ResourceExhausted }
+                    RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable }
                 }
             };
             sc.MethodConfigs.Add(newMethodConfig);
@@ -127,7 +127,7 @@ public static class GrpcChannelFactory
                     InitialBackoff = sourceRetryPolicy?.InitialBackoff ?? TimeSpan.FromMilliseconds(200),
                     MaxBackoff = sourceRetryPolicy?.MaxBackoff ?? TimeSpan.FromSeconds(1),
                     BackoffMultiplier = sourceRetryPolicy?.BackoffMultiplier ?? 2,
-                    RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable, Grpc.Core.StatusCode.ResourceExhausted }
+                    RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable }
                 }
             };
             sc.MethodConfigs.Add(newMethodConfig);
