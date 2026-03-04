@@ -63,6 +63,8 @@ message CompressionStats {
   // Actual bytes stored on agents for this file (new chunks only, no replication,
   // after zstd compression). This is the real datacenter storage cost.
   uint64 datacenter_bytes_stored = 6;
+  // Pure server-side processing time in milliseconds (excludes network transfer).
+  double server_processing_ms = 7;
 }
 
 message Error {
