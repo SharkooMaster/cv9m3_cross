@@ -243,8 +243,8 @@ public class CompressFileService : FileService.FileServiceBase
                 _ = await peekFs.ReadAsync(magicBytes, 0, 4, context.CancellationToken);
             }
 
-            bool isV4 = MyCrossService.IsV4Format(magicBytes);
-            Console.WriteLine($"[DecompressStream] Format={(isV4 ? "v4.0.0 windowed" : "v3.0.0/v2.x monolithic")}");
+            bool isWindowed = MyCrossService.IsWindowedFormat(magicBytes);
+            Console.WriteLine($"[DecompressStream] Format={(isWindowed ? "windowed (CV4/CV5)" : "monolithic")}");
 
             // ── Concurrency gate: prevent OOM from parallel decompressions ──
             await _compressionGate.WaitAsync(context.CancellationToken);
@@ -252,7 +252,7 @@ public class CompressFileService : FileService.FileServiceBase
             {
                 var crossService = new MyCrossService();
 
-                if (isV4)
+                if (isWindowed)
                 {
                     var grpcStream = new GrpcResponseStream(responseStream, context.CancellationToken);
                     (long decompressedSize, byte[] decompressedHash) = await crossService.DecompressFileWindowedStreamAsync(

@@ -8,8 +8,8 @@ namespace Cross.Models;
 /// </summary>
 internal class MosaicChunkInfo
 {
-    /// <summary>Unique donor chunk references (BucketId + StorageGuid). Max 15 donors.</summary>
-    public List<(ulong BucketId, string StorageGuid)> Donors = new();
+    /// <summary>Unique donor chunk references (BucketId + BucketKey). Max 15 donors.</summary>
+    public List<(ulong BucketId, ulong BucketKey)> Donors = new();
 
     /// <summary>64-bit bitmap: bit i = 1 means sub-chunk i has a donor match, 0 = zeros base.</summary>
     public ulong MatchBitmap;

@@ -15,6 +15,7 @@ message LaneMatch {
     string storage_guid = 2;
     uint32 lane_position = 3;
     bytes donor_lane_bytes = 4;
+    uint64 bucket_key = 5;
 }
 
 message LaneQueryResult {

@@ -31,8 +31,11 @@ public class CrossService : ICross
     //         Decompression uses GetChunkByKey(storageGuid) for O(1) lookup. Safe multi-agent fallback.
     // v3.1.0: Error dictionary is zstd-compressed. Header stores compressed length;
     //         decompression inflates before applying patches.
-    private const string EncodingVersion = "v3.1.0";
-    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0" };
+    // v5.0.0: Entire block payload zstd-compressed. Ref table with (bucketId, uint32 bucketIndex)
+    //         replaces inline 32-byte SHA256 storageGuids. Per-chunk refs use uint16 table indices.
+    //         No per-block version string or SHA256 — detected by zstd frame magic at offset 0.
+    private const string EncodingVersion = "v5.0.0";
+    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0" };
     string headID = "";
     // OPTIMIZATION: Increased cache size from 10k to 100k for better hit rate
     private static readonly SearchCacheService _searchCache = new SearchCacheService(maxCacheSize: 100000);
@@ -134,6 +137,109 @@ public class CrossService : ICross
         bw.Flush();
 
         return ms.ToArray();
+    }
+
+    /// <summary>
+    /// v5.0.0: Build a compact block payload with ref table + zstd whole-payload compression.
+    /// Replaces BuildCompressedPayload for v5. Detected on decompression by zstd frame magic.
+    /// </summary>
+    private static byte[] BuildCompressedPayloadV5(
+        QueryResponseObject?[] sorted,
+        ConcurrentDictionary<int, MosaicChunkInfo> mosaicInfos,
+        byte[] errorDictionaryBytes,
+        byte[] trimChunk)
+    {
+        int chunkCount = sorted.Length;
+
+        // Phase 1: Collect unique (BucketId, BucketIndex) pairs into a ref table.
+        // Self-stored chunks get their own entry (unique BucketKey per chunk).
+        var refTable = new List<(ulong BucketId, uint BucketIndex)>();
+        var refTableLookup = new Dictionary<(ulong, uint), ushort>();
+
+        ushort GetOrAddRef(ulong bucketId, ulong bucketKey)
+        {
+            var key = (bucketId, (uint)bucketKey);
+            if (refTableLookup.TryGetValue(key, out ushort idx))
+                return idx;
+            ushort newIdx = (ushort)refTable.Count;
+            refTable.Add(key);
+            refTableLookup[key] = newIdx;
+            return newIdx;
+        }
+
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (sorted[i]!.BucketId == 0) continue;
+            if (mosaicInfos.TryGetValue(i, out var mosaic) && mosaic.Donors.Count > 0)
+            {
+                foreach (var (dBucketId, dBucketKey) in mosaic.Donors)
+                    GetOrAddRef(dBucketId, dBucketKey);
+            }
+            else
+            {
+                GetOrAddRef(sorted[i]!.BucketId, sorted[i]!.BucketKey);
+            }
+        }
+
+        // Phase 2: Serialize into raw buffer
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+
+        bw.Write(chunkCount);
+        bw.Write((ushort)refTable.Count);
+        foreach (var (bucketId, bucketIndex) in refTable)
+        {
+            bw.Write(bucketId);
+            bw.Write(bucketIndex);
+        }
+
+        // Per-chunk references
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (mosaicInfos.TryGetValue(i, out var mosaic) && mosaic.Donors.Count > 0)
+            {
+                bw.Write((byte)0x04);
+                bw.Write((byte)mosaic.Donors.Count);
+                foreach (var (dBucketId, dBucketKey) in mosaic.Donors)
+                    bw.Write(GetOrAddRef(dBucketId, dBucketKey));
+                bw.Write(mosaic.MatchBitmap);
+                bw.Write(mosaic.Selectors);
+                bw.Write(mosaic.DonorPositions);
+                continue;
+            }
+
+            if (sorted[i]!.BucketId == 0)
+            {
+                bw.Write((byte)0x00);
+                continue;
+            }
+
+            ushort tableIdx = GetOrAddRef(sorted[i]!.BucketId, sorted[i]!.BucketKey);
+            if (sorted[i]!.NeedToStore)
+            {
+                bw.Write((byte)0x02);
+                bw.Write(tableIdx);
+            }
+            else
+            {
+                bw.Write((byte)0x01);
+                bw.Write(tableIdx);
+            }
+        }
+
+        // Error encoding (raw — the outer zstd handles compression)
+        bw.Write(errorDictionaryBytes);
+
+        // Trim chunk
+        bw.Write(trimChunk.Length);
+        bw.Write(trimChunk);
+
+        bw.Flush();
+        byte[] rawPayload = ms.ToArray();
+
+        // Phase 3: zstd-compress entire payload (level 3)
+        using var compressor = new Compressor(3);
+        return compressor.Wrap(rawPayload).ToArray();
     }
 
     private static (string Version, int ReferencesLength, int ErrorLength, int ErrorOriginalLength, int TrimLength, int PayloadStart) ParseHeader(ReadOnlySpan<byte> payload)
@@ -650,21 +756,21 @@ public class CrossService : ICross
                 if (!chunkMap.TryGetValue(idx, out var srcChunk) || srcChunk == null) return;
 
                 // Pre-convert all candidate ByteStrings to byte[] once (avoids 64 × K allocations)
-                List<(byte[] bytes, string guid, ulong bucketId)> preConverted;
+                List<(byte[] bytes, string guid, ulong bucketId, ulong bucketKey)> preConverted;
                 lock (candidateList)
                 {
-                    preConverted = new List<(byte[], string, ulong)>(candidateList.Count);
+                    preConverted = new List<(byte[], string, ulong, ulong)>(candidateList.Count);
                     foreach (var cand in candidateList)
                     {
                         if (cand.Chunk == null || cand.Chunk.Length != srcChunk.Length) continue;
-                        preConverted.Add((cand.Chunk.ToByteArray(), cand.StorageGuid ?? "", cand.BucketId));
+                        preConverted.Add((cand.Chunk.ToByteArray(), cand.StorageGuid ?? "", cand.BucketId, (ulong)cand.BucketKey));
                     }
                 }
                 if (preConverted.Count == 0) return;
 
                 // Build mosaic: for each source sub-chunk, find the best byte match
                 // at ANY position in any candidate (cross-position matching).
-                var donors = new List<(ulong BucketId, string StorageGuid, byte[] ChunkBytes)>();
+                var donors = new List<(ulong BucketId, ulong BucketKey, string StorageGuid, byte[] ChunkBytes)>();
                 var donorIndex = new Dictionary<string, int>(); // storageGuid → index in donors
                 var info = new MosaicChunkInfo();
                 int chunkSize = srcChunk.Length;
@@ -680,9 +786,10 @@ public class CrossService : ICross
                     byte[]? bestDonorChunk = null;
                     string bestGuid = "";
                     ulong bestBucketId = 0;
+                    ulong bestBucketKey = 0;
                     int bestDonorPos = e;
 
-                    foreach (var (candBytes, guid, bucketId) in preConverted)
+                    foreach (var (candBytes, guid, bucketId, bucketKey) in preConverted)
                     {
                         for (int j = 0; j < nComp; j++)
                         {
@@ -703,6 +810,7 @@ public class CrossService : ICross
                                 bestDonorChunk = candBytes;
                                 bestGuid = guid;
                                 bestBucketId = bucketId;
+                                bestBucketKey = bucketKey;
                                 bestDonorPos = j;
                             }
                         }
@@ -715,7 +823,7 @@ public class CrossService : ICross
                             if (donors.Count >= 15) continue;
                             dIdx = donors.Count;
                             donorIndex[bestGuid] = dIdx;
-                            donors.Add((bestBucketId, bestGuid, bestDonorChunk));
+                            donors.Add((bestBucketId, bestBucketKey, bestGuid, bestDonorChunk));
                         }
                         Buffer.BlockCopy(donors[dIdx].ChunkBytes, bestDonorPos * subSize, stitched, srcOffset, len);
                         info.MatchBitmap |= (1UL << e);
@@ -727,7 +835,7 @@ public class CrossService : ICross
 
                 if (matched == 0 || donors.Count == 0) return;
 
-                info.Donors = donors.Select(d => (d.BucketId, d.StorageGuid)).ToList();
+                info.Donors = donors.Select(d => (d.BucketId, d.BucketKey)).ToList();
                 info.StitchedBase = stitched;
                 mosaicInfos[idx] = info;
 
@@ -843,7 +951,7 @@ public class CrossService : ICross
                         var chunkMatches = kv.Value;
                         if (!chunkMap.TryGetValue(idx, out var srcChunk) || srcChunk == null) return;
 
-                        var donors = new List<(ulong BucketId, string StorageGuid, byte[] ChunkBytes)>();
+                        var donors = new List<(ulong BucketId, ulong BucketKey, byte[] ChunkBytes)>();
                         var donorIndex = new Dictionary<string, int>();
                         var info = new MosaicChunkInfo();
                         int chunkSize = srcChunk.Length;
@@ -889,11 +997,9 @@ public class CrossService : ICross
                                     if (donors.Count >= 15) continue;
                                     dIdx = donors.Count;
                                     donorIndex[guid] = dIdx;
-                                    // We don't have full chunk bytes — use the lane bytes for stitching
-                                    donors.Add((bestMatch.BucketId, guid, Array.Empty<byte>()));
+                                    donors.Add((bestMatch.BucketId, bestMatch.BucketKey, Array.Empty<byte>()));
                                 }
 
-                                // Copy the donor lane bytes into the stitched base
                                 var donorLane = bestMatch.DonorLaneBytes.ToByteArray();
                                 Buffer.BlockCopy(donorLane, 0, stitched, srcOffset, len);
                                 info.MatchBitmap |= (1UL << e);
@@ -905,7 +1011,7 @@ public class CrossService : ICross
 
                         if (matched == 0 || donors.Count == 0) return;
 
-                        info.Donors = donors.Select(d => (d.BucketId, d.StorageGuid)).ToList();
+                        info.Donors = donors.Select(d => (d.BucketId, d.BucketKey)).ToList();
                         info.StitchedBase = stitched;
                         mosaicInfos[idx] = info;
 
@@ -1339,19 +1445,19 @@ public class CrossService : ICross
                 if (!mosaicCandidates.TryGetValue(i, out var candidateList)) return;
                 if (!chunkMap.TryGetValue(i, out var srcChunk) || srcChunk == null) return;
 
-                List<(byte[] bytes, string guid, ulong bucketId)> preConverted;
+                List<(byte[] bytes, string guid, ulong bucketId, ulong bucketKey)> preConverted;
                 lock (candidateList)
                 {
-                    preConverted = new List<(byte[], string, ulong)>(candidateList.Count);
+                    preConverted = new List<(byte[], string, ulong, ulong)>(candidateList.Count);
                     foreach (var cand in candidateList)
                     {
                         if (cand.Chunk == null || cand.Chunk.Length != srcChunk.Length) continue;
-                        preConverted.Add((cand.Chunk.ToByteArray(), cand.StorageGuid ?? "", cand.BucketId));
+                        preConverted.Add((cand.Chunk.ToByteArray(), cand.StorageGuid ?? "", cand.BucketId, (ulong)cand.BucketKey));
                     }
                 }
                 if (preConverted.Count == 0) return;
 
-                var donors = new List<(ulong BucketId, string StorageGuid, byte[] ChunkBytes)>();
+                var donors = new List<(ulong BucketId, ulong BucketKey, string StorageGuid, byte[] ChunkBytes)>();
                 var donorIndex = new Dictionary<string, int>();
                 var info = new MosaicChunkInfo();
                 int chunkSize = srcChunk.Length;
@@ -1367,9 +1473,10 @@ public class CrossService : ICross
                     byte[]? bestDonorChunk = null;
                     string bestGuid = "";
                     ulong bestBucketId = 0;
+                    ulong bestBucketKey = 0;
                     int bestDonorPos = e;
 
-                    foreach (var (candBytes, guid, bucketId) in preConverted)
+                    foreach (var (candBytes, guid, bucketId, bucketKey) in preConverted)
                     {
                         for (int cj = 0; cj < nComp; cj++)
                         {
@@ -1389,6 +1496,7 @@ public class CrossService : ICross
                                 bestDonorChunk = candBytes;
                                 bestGuid = guid;
                                 bestBucketId = bucketId;
+                                bestBucketKey = bucketKey;
                                 bestDonorPos = cj;
                             }
                         }
@@ -1401,7 +1509,7 @@ public class CrossService : ICross
                             if (donors.Count >= 15) continue;
                             dIdx = donors.Count;
                             donorIndex[bestGuid] = dIdx;
-                            donors.Add((bestBucketId, bestGuid, bestDonorChunk));
+                            donors.Add((bestBucketId, bestBucketKey, bestGuid, bestDonorChunk));
                         }
                         Buffer.BlockCopy(donors[dIdx].ChunkBytes, bestDonorPos * subSize, stitched, srcOffset, len);
                         info.MatchBitmap |= (1UL << e);
@@ -1424,7 +1532,7 @@ public class CrossService : ICross
                 int maxAllowed = (int)(Globals.chunkSize * Globals.BloatGuardThreshold);
                 if (differingBytes >= maxAllowed) return; // mosaic didn't help enough
 
-                info.Donors = donors.Select(d => (d.BucketId, d.StorageGuid)).ToList();
+                info.Donors = donors.Select(d => (d.BucketId, d.BucketKey)).ToList();
                 info.StitchedBase = stitched;
                 mosaicInfos[i] = info;
 
@@ -1545,7 +1653,7 @@ public class CrossService : ICross
                         var chunkMatches = kv.Value;
                         if (!chunkMap.TryGetValue(idx, out var srcChunk) || srcChunk == null) return;
 
-                        var donors = new List<(ulong BucketId, string StorageGuid, byte[] ChunkBytes)>();
+                        var donors = new List<(ulong BucketId, ulong BucketKey, byte[] ChunkBytes)>();
                         var donorIndex = new Dictionary<string, int>();
                         var info = new MosaicChunkInfo();
                         int chunkSize = srcChunk.Length;
@@ -1590,7 +1698,7 @@ public class CrossService : ICross
                                     if (donors.Count >= 15) continue;
                                     dIdx = donors.Count;
                                     donorIndex[guid] = dIdx;
-                                    donors.Add((bestMatch.BucketId, guid, Array.Empty<byte>()));
+                                    donors.Add((bestMatch.BucketId, bestMatch.BucketKey, Array.Empty<byte>()));
                                 }
 
                                 var donorLane = bestMatch.DonorLaneBytes.ToByteArray();
@@ -1613,7 +1721,7 @@ public class CrossService : ICross
                         int maxAllowed = (int)(Globals.chunkSize * Globals.BloatGuardThreshold);
                         if (differingBytes >= maxAllowed) return;
 
-                        info.Donors = donors.Select(d => (d.BucketId, d.StorageGuid)).ToList();
+                        info.Donors = donors.Select(d => (d.BucketId, d.BucketKey)).ToList();
                         info.StitchedBase = stitched;
                         mosaicInfos[idx] = info;
 
@@ -1840,90 +1948,7 @@ public class CrossService : ICross
             $"clusteredNonReps={clusteredNonReps}, ejectedByBloat={ejectedByBloat}, " +
             $"rawStoredBytes={rawStoredBytes}, datacenterBytesZstd={datacenterBytesStored}");
 
-        // ── Build references (once, after all re-stores are finalized) ──
-        // v3.1.0: flag-based variable-size refs (saves ~23 bytes per self-stored chunk)
-        //   flag=0x00: zero-ref (zeros base)         → 1 byte
-        //   flag=0x01: full ref (bucketId+storageGuid) → 41 bytes
-        //   flag=0x02: compact ref (bucketId+bucketIndex) → 17 bytes (self-stored only)
-        //   flag=0x03: mosaic ref (bitmap + selectors + donor list) → variable (legacy positional)
-        //   flag=0x04: mosaic ref (bitmap + selectors + donor positions + donor list) → variable (cross-position)
-        // v3.0.0: fixed 40 bytes per ref (bucketId+storageGuid)
-        const int StorageGuidRawLen = 32;
-        var references = new List<byte>(sorted.Length * 20); // average estimate
-        // Prefix: chunk count (so decompressor knows how many refs to read)
-        references.AddRange(BitConverter.GetBytes(sorted.Length));
-        for (int i = 0; i < sorted.Length; i++)
-        {
-            bool isZero = sorted[i].BucketId == 0;
-
-            // Mosaic reference: chunk has a stitched base from multiple donors
-            // Flag 0x04: cross-position mosaic (donor position j may differ from element e)
-            if (mosaicInfos.TryGetValue(i, out var mosaic) && mosaic.Donors.Count > 0)
-            {
-                references.Add(0x04);
-                // Donor count (1 byte, max 15)
-                references.Add((byte)mosaic.Donors.Count);
-                // Each donor: 8 bytes bucketId + 32 bytes storageGuid
-                foreach (var (donorBucketId, donorGuid) in mosaic.Donors)
-                {
-                    references.AddRange(BitConverter.GetBytes(donorBucketId));
-                    byte[] dGuidRaw = (!string.IsNullOrEmpty(donorGuid) && donorGuid.Length == 64)
-                        ? Convert.FromHexString(donorGuid)
-                        : new byte[StorageGuidRawLen];
-                    references.AddRange(dGuidRaw);
-                }
-                // 8 bytes match bitmap
-                references.AddRange(BitConverter.GetBytes(mosaic.MatchBitmap));
-                // 32 bytes selectors (64 x 4-bit nibbles)
-                references.AddRange(mosaic.Selectors);
-                // 64 bytes donor positions (cross-position: DonorPositions[e] = donor source position j)
-                references.AddRange(mosaic.DonorPositions);
-                continue;
-            }
-
-            if (isZero)
-            {
-                references.Add(0x00); // zero-ref
-                continue;
-            }
-
-            // Self-stored chunks: compact ref (bucketId + bucketIndex)
-            // Decompressor uses GetChunkByReferenceAsync(bucketId, bucketIndex)
-            if (sorted[i].NeedToStore)
-            {
-                references.Add(0x02);
-                references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
-                references.AddRange(BitConverter.GetBytes((ulong)sorted[i].BucketKey));
-                continue;
-            }
-
-            // Search match: full ref (bucketId + storageGuid)
-            references.Add(0x01);
-            references.AddRange(BitConverter.GetBytes(sorted[i].BucketId));
-
-            string storageGuid = sorted[i].StorageGuid;
-
-            if ((string.IsNullOrEmpty(storageGuid) || storageGuid.Length != 64)
-                && sorted[i].BucketId != 0)
-            {
-                byte[]? baseForHash = null;
-                if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
-                    baseForHash = sorted[i].Chunk.ToByteArray();
-                else if (!representativeSet.Contains(i)
-                         && sorted[groupRepresentative[i]].NeedToStore
-                         && sorted[groupRepresentative[i]].BucketId != 0)
-                    baseForHash = fileChunks[groupRepresentative[i]];
-                if (baseForHash != null)
-                    storageGuid = Convert.ToHexString(SHA256.HashData(baseForHash)).ToLowerInvariant();
-            }
-
-            byte[] guidRaw;
-            if (!string.IsNullOrEmpty(storageGuid) && storageGuid.Length == 64)
-                guidRaw = Convert.FromHexString(storageGuid);
-            else
-                guidRaw = new byte[StorageGuidRawLen];
-            references.AddRange(guidRaw);
-        }
+        // v5.0.0: references are built inside BuildCompressedPayloadV5 (ref table + compact indices)
 
         // ── FLAT ERROR ENCODING (v2.0.0) ──
         // Stitch all original chunks and all base chunks into two continuous buffers,
@@ -2099,14 +2124,11 @@ public class CrossService : ICross
         {
             using var stage = Observability.StartStage("Serialize");
             var swStage = Stopwatch.StartNew();
-            // SHA256 integrity hash of the ORIGINAL file — verified during decompression
-            byte[] originalHash = SHA256.HashData(_file);
-            toReturn = BuildCompressedPayload(
-                EncodingVersion,
-                references.ToArray(),
+            toReturn = BuildCompressedPayloadV5(
+                sorted,
+                mosaicInfos,
                 errorDictionaryBytes,
-                trimmedChunk.ToArray(),
-                originalHash);
+                trimmedChunk.ToArray());
             swStage.Stop();
             Observability.RecordStage("Serialize", swStage.Elapsed.TotalMilliseconds, ("output_bytes", toReturn.Length));
         }
@@ -2141,6 +2163,7 @@ public class CrossService : ICross
     // DecompressFile work per-block with zero changes.
 
     private static readonly byte[] V4Magic = "CV4\0"u8.ToArray();
+    private static readonly byte[] V5Magic = "CV5\0"u8.ToArray();
 
     /// <summary>Default window size for windowed compression (64 MiB).</summary>
     public static int WindowSize
@@ -2196,8 +2219,8 @@ public class CrossService : ICross
                              FileShare.None, bufferSize: 1024 * 1024, useAsync: true);
         using var bw = new BinaryWriter(outputFs, Encoding.UTF8, leaveOpen: true);
 
-        // Header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes (hash is written as trailer)
-        bw.Write(V4Magic);
+        // Header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes
+        bw.Write(V5Magic);
         bw.Write(originalFileSize);
         bw.Write(blockCount);
         await outputFs.FlushAsync(ct);
@@ -2228,18 +2251,17 @@ public class CrossService : ICross
 
             Console.WriteLine($"[CompressWindowed] Block {block + 1}/{blockCount}: {totalRead} bytes");
 
-            // Compress this window using the existing v3.0.0 pipeline (unchanged!)
             var (compressedBlock, refs, chunks, _) = await CompressFileWithStats(windowData);
             totalRefs += refs;
             totalChunks += chunks;
 
-            // Write block: [compressedLen][originalLen][compressed data]
-            bw.Write((long)compressedBlock.Length);
-            bw.Write((long)totalRead);
+            // v5: int32 block headers (blocks can't exceed window size)
+            bw.Write((int)compressedBlock.Length);
+            bw.Write((int)totalRead);
             await outputFs.WriteAsync(compressedBlock, 0, compressedBlock.Length, ct);
             await outputFs.FlushAsync(ct);
 
-            totalCompressedSize += 8 + 8 + compressedBlock.Length;
+            totalCompressedSize += 4 + 4 + compressedBlock.Length;
 
             Console.WriteLine($"[CompressWindowed] Block {block + 1}/{blockCount}: compressed {totalRead} → {compressedBlock.Length} (ratio {(double)compressedBlock.Length / Math.Max(1, totalRead):F3})");
         }
@@ -2282,13 +2304,13 @@ public class CrossService : ICross
         using var bw = new BinaryWriter(outputStream, Encoding.UTF8, leaveOpen: true);
         using var sha = System.Security.Cryptography.SHA256.Create();
 
-        // Header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes
-        bw.Write(V4Magic);
+        // v5 header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes
+        bw.Write(V5Magic);
         bw.Write(originalFileSize);
         bw.Write(blockCount);
         await outputStream.FlushAsync(ct);
 
-        long headerBytes = 4 + 8 + 4; // magic + size + blockCount
+        long headerBytes = 4 + 8 + 4;
         totalCompressedSize += headerBytes;
 
         byte[] windowBuffer = new byte[windowSize];
@@ -2377,13 +2399,13 @@ public class CrossService : ICross
             totalRefs += refs;
             totalChunks += chunks;
 
-            // Write block: [compressedLen][originalLen][compressed data] - IN ORDER
-            bw.Write((long)compressedBlock.Length);
-            bw.Write((long)totalRead);
+            // v5: int32 block headers
+            bw.Write((int)compressedBlock.Length);
+            bw.Write((int)totalRead);
             await outputStream.WriteAsync(compressedBlock, 0, compressedBlock.Length, ct);
             await outputStream.FlushAsync(ct);
 
-            totalCompressedSize += 8 + 8 + compressedBlock.Length;
+            totalCompressedSize += 4 + 4 + compressedBlock.Length;
 
             Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: compressed {totalRead} → {compressedBlock.Length} (ratio {(double)compressedBlock.Length / Math.Max(1, totalRead):F3}) → STREAMED");
         }
@@ -2416,17 +2438,17 @@ public class CrossService : ICross
                              FileShare.None, bufferSize: 1024 * 1024, useAsync: true);
         using var br = new BinaryReader(inputFs, Encoding.UTF8, leaveOpen: true);
 
-        // ── 1. Read header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes ──
         byte[] magic = br.ReadBytes(4);
-        if (!magic.AsSpan().SequenceEqual(V4Magic))
-            throw new InvalidDataException("Not a v4.0.0 windowed compressed file (bad magic).");
+        bool isV5Container = magic.AsSpan().SequenceEqual(V5Magic);
+        bool isV4Container = magic.AsSpan().SequenceEqual(V4Magic);
+        if (!isV5Container && !isV4Container)
+            throw new InvalidDataException("Not a v4/v5 windowed compressed file (bad magic).");
 
         long originalFileSize = br.ReadInt64();
         int blockCount = br.ReadInt32();
 
-        Console.WriteLine($"[DecompressWindowed] originalSize={originalFileSize}, blocks={blockCount}");
+        Console.WriteLine($"[DecompressWindowed] format={( isV5Container ? "CV5" : "CV4" )}, originalSize={originalFileSize}, blocks={blockCount}");
 
-        // ── 2. Decompress each block ──
         long totalDecompressed = 0;
         using var sha = System.Security.Cryptography.SHA256.Create();
 
@@ -2434,10 +2456,18 @@ public class CrossService : ICross
         {
             ct.ThrowIfCancellationRequested();
 
-            long compressedLen = br.ReadInt64();
-            long originalLen = br.ReadInt64();
+            long compressedLen, originalLen;
+            if (isV5Container)
+            {
+                compressedLen = br.ReadInt32();
+                originalLen = br.ReadInt32();
+            }
+            else
+            {
+                compressedLen = br.ReadInt64();
+                originalLen = br.ReadInt64();
+            }
 
-            // Read the v3.0.0 .ccf block
             byte[] compressedBlock = new byte[compressedLen];
             int totalRead = 0;
             while (totalRead < compressedLen)
@@ -2449,7 +2479,6 @@ public class CrossService : ICross
 
             Console.WriteLine($"[DecompressWindowed] Block {block + 1}/{blockCount}: {compressedLen} compressed → decompressing...");
 
-            // Decompress using existing v3.0.0 pipeline (unchanged!)
             byte[] decompressedBlock = await DecompressFile(compressedBlock);
 
             if (decompressedBlock.Length != originalLen)
@@ -2499,17 +2528,17 @@ public class CrossService : ICross
                              FileShare.Read, bufferSize: 1024 * 1024, useAsync: true);
         using var br = new BinaryReader(inputFs, Encoding.UTF8, leaveOpen: true);
 
-        // ── 1. Read header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes ──
         byte[] magic = br.ReadBytes(4);
-        if (!magic.AsSpan().SequenceEqual(V4Magic))
-            throw new InvalidDataException("Not a v4.0.0 windowed compressed file (bad magic).");
+        bool isV5Container = magic.AsSpan().SequenceEqual(V5Magic);
+        bool isV4Container = magic.AsSpan().SequenceEqual(V4Magic);
+        if (!isV5Container && !isV4Container)
+            throw new InvalidDataException("Not a v4/v5 windowed compressed file (bad magic).");
 
         long originalFileSize = br.ReadInt64();
         int blockCount = br.ReadInt32();
 
-        Console.WriteLine($"[DecompressWindowedStream] originalSize={originalFileSize}, blocks={blockCount}");
+        Console.WriteLine($"[DecompressWindowedStream] format={( isV5Container ? "CV5" : "CV4" )}, originalSize={originalFileSize}, blocks={blockCount}");
 
-        // ── 2. Decompress each block and stream directly to output ──
         long totalDecompressed = 0;
         using var sha = System.Security.Cryptography.SHA256.Create();
 
@@ -2517,10 +2546,18 @@ public class CrossService : ICross
         {
             ct.ThrowIfCancellationRequested();
 
-            long compressedLen = br.ReadInt64();
-            long originalLen = br.ReadInt64();
+            long compressedLen, originalLen;
+            if (isV5Container)
+            {
+                compressedLen = br.ReadInt32();
+                originalLen = br.ReadInt32();
+            }
+            else
+            {
+                compressedLen = br.ReadInt64();
+                originalLen = br.ReadInt64();
+            }
 
-            // Read the v3.0.0 .ccf block
             byte[] compressedBlock = new byte[compressedLen];
             int totalRead = 0;
             while (totalRead < compressedLen)
@@ -2532,7 +2569,6 @@ public class CrossService : ICross
 
             Console.WriteLine($"[DecompressWindowedStream] Block {block + 1}/{blockCount}: {compressedLen} compressed → decompressing...");
 
-            // Decompress using existing v3.0.0 pipeline (unchanged!)
             byte[] decompressedBlock = await DecompressFile(compressedBlock);
 
             if (decompressedBlock.Length != originalLen)
@@ -2578,11 +2614,25 @@ public class CrossService : ICross
         return headerBytes.Length >= 4 && headerBytes.AsSpan(0, 4).SequenceEqual(V4Magic);
     }
 
+    public static bool IsV5Format(byte[] headerBytes)
+    {
+        return headerBytes.Length >= 4 && headerBytes.AsSpan(0, 4).SequenceEqual(V5Magic);
+    }
+
+    public static bool IsWindowedFormat(byte[] headerBytes)
+    {
+        return IsV4Format(headerBytes) || IsV5Format(headerBytes);
+    }
+
     public async Task<byte[]> DecompressFile(byte[] file)
     {
         using var rootSpan = Observability.StartStage("DecompressFile");
         if (file == null || file.Length == 0)
             throw new ArgumentException("Compressed input is empty.", nameof(file));
+
+        // v5.0.0 detection: payload starts with zstd frame magic 0xFD2FB528
+        if (file.Length >= 4 && BitConverter.ToUInt32(file, 0) == 0xFD2FB528)
+            return await DecompressFileV5(file);
 
         var parseSw = Stopwatch.StartNew();
         var header = ParseHeader(file);
@@ -3066,6 +3116,248 @@ public class CrossService : ICross
         applySw.Stop();
         Observability.RecordStage("ApplyPatchAndEgress", applySw.Elapsed.TotalMilliseconds,
             ("chunk_count", chunkCount), ("patches", patches.Length));
+
+        return result;
+    }
+
+    /// <summary>
+    /// v5.0.0 decompression: zstd-decompress the payload, parse ref table + compact refs,
+    /// fetch base chunks by (bucketId, bucketIndex), apply error patches, assemble output.
+    /// </summary>
+    private async Task<byte[]> DecompressFileV5(byte[] file)
+    {
+        var parseSw = Stopwatch.StartNew();
+
+        // Decompress the entire payload
+        byte[] raw;
+        using (var decompressor = new Decompressor())
+            raw = decompressor.Unwrap(file).ToArray();
+
+        using var ms = new MemoryStream(raw, writable: false);
+        using var br = new BinaryReader(ms, Encoding.UTF8, leaveOpen: true);
+
+        int chunkCount = br.ReadInt32();
+        ushort refTableSize = br.ReadUInt16();
+
+        var refTable = new (ulong BucketId, uint BucketIndex)[refTableSize];
+        for (int i = 0; i < refTableSize; i++)
+        {
+            ulong bucketId = br.ReadUInt64();
+            uint bucketIndex = br.ReadUInt32();
+            refTable[i] = (bucketId, bucketIndex);
+        }
+
+        // Parse per-chunk references
+        var refBucketIds = new ulong[chunkCount];
+        var refBucketIndices = new ulong[chunkCount];
+        var mosaicRefs = new Dictionary<int, (List<(ulong BucketId, ulong BucketIndex)> Donors, ulong MatchBitmap, byte[] Selectors, byte[] DonorPositions)>();
+
+        for (int i = 0; i < chunkCount; i++)
+        {
+            byte flag = br.ReadByte();
+            switch (flag)
+            {
+                case 0x00:
+                    refBucketIds[i] = 0;
+                    refBucketIndices[i] = 0;
+                    break;
+                case 0x01:
+                case 0x02:
+                {
+                    ushort tableIdx = br.ReadUInt16();
+                    if (tableIdx >= refTableSize)
+                        throw new InvalidDataException($"v5 ref table index {tableIdx} out of range ({refTableSize} entries)");
+                    refBucketIds[i] = refTable[tableIdx].BucketId;
+                    refBucketIndices[i] = refTable[tableIdx].BucketIndex;
+                    break;
+                }
+                case 0x04:
+                {
+                    int donorCount = br.ReadByte();
+                    var donors = new List<(ulong BucketId, ulong BucketIndex)>(donorCount);
+                    for (int d = 0; d < donorCount; d++)
+                    {
+                        ushort tableIdx = br.ReadUInt16();
+                        if (tableIdx >= refTableSize)
+                            throw new InvalidDataException($"v5 mosaic donor table index {tableIdx} out of range");
+                        donors.Add((refTable[tableIdx].BucketId, refTable[tableIdx].BucketIndex));
+                    }
+                    ulong matchBitmap = br.ReadUInt64();
+                    byte[] selectors = br.ReadBytes(32);
+                    byte[] donorPositions = br.ReadBytes(64);
+                    mosaicRefs[i] = (donors, matchBitmap, selectors, donorPositions);
+                    refBucketIds[i] = ulong.MaxValue;
+                    break;
+                }
+                default:
+                    throw new InvalidDataException($"v5: unknown reference flag 0x{flag:X2} at chunk {i}");
+            }
+        }
+
+        // Parse error encoding (same RLE format, but embedded raw — not separately zstd'd)
+        int totalRunCount = br.ReadInt32();
+        if (totalRunCount < 0)
+            throw new InvalidDataException($"v5: invalid negative run count {totalRunCount}");
+        var patches = new (int startPos, int runLength, short diffValue)[totalRunCount];
+        for (int i = 0; i < totalRunCount; i++)
+        {
+            int startPos = br.ReadInt32();
+            ushort runLength = br.ReadUInt16();
+            short diffValue = br.ReadInt16();
+            patches[i] = (startPos, runLength, diffValue);
+        }
+
+        // Trim chunk
+        int trimLength = br.ReadInt32();
+        byte[] trimChunk = trimLength > 0 ? br.ReadBytes(trimLength) : Array.Empty<byte>();
+
+        parseSw.Stop();
+        Observability.RecordStage("DeserializeV5", parseSw.Elapsed.TotalMilliseconds);
+
+        // Fetch all base chunks in parallel via (bucketId, bucketIndex)
+        var fetchSw = Stopwatch.StartNew();
+        var baseChunks = new byte[chunkCount][];
+        var fetchTasks = new Task[chunkCount];
+        int primaryHits = 0, fallbackHits = 0;
+
+        for (int i = 0; i < chunkCount; i++)
+        {
+            ulong bucketId = refBucketIds[i];
+            bool isZeroRef = bucketId == 0 && refBucketIndices[i] == 0;
+            bool isMosaicRef = mosaicRefs.ContainsKey(i);
+
+            if (isZeroRef)
+            {
+                baseChunks[i] = new byte[Globals.chunkSize];
+                fetchTasks[i] = Task.CompletedTask;
+            }
+            else if (isMosaicRef)
+            {
+                int idx = i;
+                var (donors, matchBitmap, selectors, donorPositions) = mosaicRefs[idx];
+                fetchTasks[i] = Task.Run(async () =>
+                {
+                    int subSize = Globals.MosaicSubChunkSize;
+                    int nComp = Globals.MosaicNComponents;
+                    int chSize = Globals.chunkSize;
+
+                    var donorChunks = new byte[donors.Count][];
+                    var donorFetches = new Task[donors.Count];
+                    for (int d = 0; d < donors.Count; d++)
+                    {
+                        int dIdx = d;
+                        var (dBucketId, dBucketIndex) = donors[dIdx];
+                        donorFetches[dIdx] = Task.Run(async () =>
+                        {
+                            string bitstring = UlongToBitstring(dBucketId);
+                            string targetAgent = RendezvousRouter.PickAgent(bitstring);
+                            byte[]? chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(dBucketId, dBucketIndex, targetAgent);
+                            if (chunk == null)
+                            {
+                                for (int retry = 0; retry < 3; retry++)
+                                {
+                                    await Task.Delay(100 * (retry + 1));
+                                    chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(dBucketId, dBucketIndex, targetAgent);
+                                    if (chunk != null) break;
+                                }
+                            }
+                            donorChunks[dIdx] = chunk ?? new byte[chSize];
+                        });
+                    }
+                    await Task.WhenAll(donorFetches);
+
+                    var stitched = new byte[chSize];
+                    for (int e = 0; e < nComp && e * subSize < chSize; e++)
+                    {
+                        if ((matchBitmap & (1UL << e)) == 0) continue;
+                        int donorIdx = MosaicChunkInfo.GetSelector(selectors, e);
+                        if (donorIdx >= donorChunks.Length) continue;
+                        int dstOffset = e * subSize;
+                        int srcPos = donorPositions[e];
+                        int srcOffset = srcPos * subSize;
+                        int len = Math.Min(subSize, chSize - dstOffset);
+                        if (srcOffset + len <= donorChunks[donorIdx].Length)
+                            Buffer.BlockCopy(donorChunks[donorIdx], srcOffset, stitched, dstOffset, len);
+                    }
+                    baseChunks[idx] = stitched;
+                    Interlocked.Increment(ref primaryHits);
+                });
+            }
+            else
+            {
+                int idx = i;
+                ulong bId = bucketId;
+                ulong bIdx = refBucketIndices[idx];
+                fetchTasks[i] = Task.Run(async () =>
+                {
+                    string bitstring = UlongToBitstring(bId);
+                    string targetAgent = RendezvousRouter.PickAgent(bitstring);
+                    byte[]? chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(bId, bIdx, targetAgent);
+                    if (chunk != null)
+                    {
+                        Interlocked.Increment(ref primaryHits);
+                    }
+                    else
+                    {
+                        for (int retry = 0; retry < 3; retry++)
+                        {
+                            await Task.Delay(100 * (retry + 1));
+                            chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(bId, bIdx, targetAgent);
+                            if (chunk != null) { Interlocked.Increment(ref fallbackHits); break; }
+                        }
+                    }
+                    if (chunk == null)
+                        throw new InvalidDataException(
+                            $"v5: missing base chunk for ({bId}, {bIdx}). Agent={targetAgent}");
+                    baseChunks[idx] = chunk;
+                });
+            }
+        }
+        await Task.WhenAll(fetchTasks);
+        fetchSw.Stop();
+        int zeroRefCount = Enumerable.Range(0, chunkCount).Count(i => refBucketIds[i] == 0 && refBucketIndices[i] == 0);
+        Console.WriteLine($"[Decompress v5] FetchBaseChunks: {fetchSw.ElapsedMilliseconds}ms, {chunkCount} chunks, primary={primaryHits}, fallback={fallbackHits}, zeroRef={zeroRefCount}");
+        Observability.RecordStage("FetchBaseChunksV5", fetchSw.Elapsed.TotalMilliseconds, ("chunk_count", chunkCount));
+
+        // Stitch base chunks into one continuous buffer
+        var applySw = Stopwatch.StartNew();
+        byte[] baseBuffer = new byte[chunkCount * Globals.chunkSize];
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (baseChunks[i].Length != Globals.chunkSize)
+                throw new InvalidDataException($"v5: base chunk {i} has length {baseChunks[i].Length}, expected {Globals.chunkSize}.");
+            Buffer.BlockCopy(baseChunks[i], 0, baseBuffer, i * Globals.chunkSize, Globals.chunkSize);
+        }
+
+        // Apply flat error encoding (RLE)
+        int cursor = 0;
+        foreach (var (startPos, runLength, diffValue) in patches)
+        {
+            cursor += startPos;
+            if (cursor < 0 || cursor >= baseBuffer.Length)
+                throw new InvalidDataException($"v5: patch cursor {cursor} out of range (buffer {baseBuffer.Length}).");
+            for (int j = 0; j < runLength; j++)
+            {
+                if (cursor + j >= baseBuffer.Length)
+                    throw new InvalidDataException($"v5: run extends beyond buffer at cursor {cursor}.");
+                int patched = baseBuffer[cursor + j] + diffValue;
+                if (patched < 0 || patched > 255)
+                    throw new InvalidDataException($"v5: patched byte {patched} out of range at {cursor + j}.");
+                baseBuffer[cursor + j] = (byte)patched;
+            }
+            cursor += runLength;
+        }
+
+        // Assemble: reconstructed buffer + trim chunk
+        byte[] result = new byte[baseBuffer.Length + trimLength];
+        Buffer.BlockCopy(baseBuffer, 0, result, 0, baseBuffer.Length);
+        if (trimLength > 0)
+            Buffer.BlockCopy(trimChunk, 0, result, baseBuffer.Length, trimLength);
+
+        applySw.Stop();
+        Observability.RecordStage("ApplyPatchV5", applySw.Elapsed.TotalMilliseconds,
+            ("chunk_count", chunkCount), ("patches", patches.Length));
+        Console.WriteLine($"[Decompress v5] DONE: {chunkCount} chunks, {patches.Length} runs, output={result.Length} bytes");
 
         return result;
     }
