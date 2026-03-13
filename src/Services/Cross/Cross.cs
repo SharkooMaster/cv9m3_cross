@@ -31,9 +31,9 @@ public class CrossService : ICross
     //         Decompression uses GetChunkByKey(storageGuid) for O(1) lookup. Safe multi-agent fallback.
     // v3.1.0: Error dictionary is zstd-compressed. Header stores compressed length;
     //         decompression inflates before applying patches.
-    // v5.0.0: Entire block payload zstd-compressed. Ref table with (bucketId, uint32 bucketIndex)
-    //         replaces inline 32-byte SHA256 storageGuids. Per-chunk refs use uint16 table indices.
-    //         No per-block version string or SHA256 — detected by zstd frame magic at offset 0.
+    // v5.0.0: Compact ref table with (bucketId, uint32 bucketIndex) replaces inline 32-byte
+    //         SHA256 storageGuids. Per-chunk refs use uint16 table indices into the ref table.
+    //         Uses standard header (ParseHeader), zstd on error dict, SHA256 hash — same as v3.1.0.
     private const string EncodingVersion = "v5.0.0";
     private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0" };
     string headID = "";
@@ -115,7 +115,7 @@ public class CrossService : ICross
 
         // v3.1.0+: zstd-compress the error dictionary (RLE runs are highly compressible)
         byte[] errorPayload;
-        if (version == "v3.1.0")
+        if (version == "v3.1.0" || version == "v5.0.0")
         {
             using var compressor = new Compressor(3);
             errorPayload = compressor.Wrap(errorDictionary).ToArray();
@@ -140,19 +140,16 @@ public class CrossService : ICross
     }
 
     /// <summary>
-    /// v5.0.0: Build a compact block payload with ref table + zstd whole-payload compression.
-    /// Replaces BuildCompressedPayload for v5. Detected on decompression by zstd frame magic.
+    /// v5.0.0: Build compact references as byte[] using a ref table + ushort indices.
+    /// The caller passes this to BuildCompressedPayload which handles the standard header,
+    /// error-dict zstd, SHA256 hash, etc.
     /// </summary>
-    private static byte[] BuildCompressedPayloadV5(
+    private static byte[] BuildV5References(
         QueryResponseObject?[] sorted,
-        ConcurrentDictionary<int, MosaicChunkInfo> mosaicInfos,
-        byte[] errorDictionaryBytes,
-        byte[] trimChunk)
+        ConcurrentDictionary<int, MosaicChunkInfo> mosaicInfos)
     {
         int chunkCount = sorted.Length;
 
-        // Phase 1: Collect unique (BucketId, BucketIndex) pairs into a ref table.
-        // Self-stored chunks get their own entry (unique BucketKey per chunk).
         var refTable = new List<(ulong BucketId, uint BucketIndex)>();
         var refTableLookup = new Dictionary<(ulong, uint), ushort>();
 
@@ -167,6 +164,7 @@ public class CrossService : ICross
             return newIdx;
         }
 
+        // Pre-populate ref table
         for (int i = 0; i < chunkCount; i++)
         {
             if (sorted[i]!.BucketId == 0) continue;
@@ -181,10 +179,10 @@ public class CrossService : ICross
             }
         }
 
-        // Phase 2: Serialize into raw buffer
         using var ms = new MemoryStream();
         using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
 
+        // Header: chunkCount + refTableSize + ref table entries
         bw.Write(chunkCount);
         bw.Write((ushort)refTable.Count);
         foreach (var (bucketId, bucketIndex) in refTable)
@@ -227,19 +225,8 @@ public class CrossService : ICross
             }
         }
 
-        // Error encoding (raw — the outer zstd handles compression)
-        bw.Write(errorDictionaryBytes);
-
-        // Trim chunk
-        bw.Write(trimChunk.Length);
-        bw.Write(trimChunk);
-
         bw.Flush();
-        byte[] rawPayload = ms.ToArray();
-
-        // Phase 3: zstd-compress entire payload (level 3)
-        using var compressor = new Compressor(3);
-        return compressor.Wrap(rawPayload).ToArray();
+        return ms.ToArray();
     }
 
     private static (string Version, int ReferencesLength, int ErrorLength, int ErrorOriginalLength, int TrimLength, int PayloadStart) ParseHeader(ReadOnlySpan<byte> payload)
@@ -266,7 +253,7 @@ public class CrossService : ICross
 
         // v3.1.0: error dictionary is zstd-compressed; header has [compressedLen][originalLen]
         int errorOriginalLength = errorLength; // for uncompressed versions, original == stored
-        if (version == "v3.1.0")
+        if (version == "v3.1.0" || version == "v5.0.0")
         {
             errorOriginalLength = BitConverter.ToInt32(payload.Slice(offset, IntSize));
             offset += IntSize;
@@ -274,7 +261,7 @@ public class CrossService : ICross
 
         // v2.1.0+: trim chunk length is stored in the header
         int trimLength = -1; // -1 means "not present" (v2.0.0 compat)
-        if (version == "v2.1.0" || version == "v3.0.0" || version == "v3.1.0")
+        if (version == "v2.1.0" || version == "v3.0.0" || version == "v3.1.0" || version == "v5.0.0")
         {
             trimLength = BitConverter.ToInt32(payload.Slice(offset, IntSize));
             offset += IntSize;
@@ -1948,7 +1935,7 @@ public class CrossService : ICross
             $"clusteredNonReps={clusteredNonReps}, ejectedByBloat={ejectedByBloat}, " +
             $"rawStoredBytes={rawStoredBytes}, datacenterBytesZstd={datacenterBytesStored}");
 
-        // v5.0.0: references are built inside BuildCompressedPayloadV5 (ref table + compact indices)
+        // v5.0.0: references are built by BuildV5References (ref table + compact indices)
 
         // ── FLAT ERROR ENCODING (v2.0.0) ──
         // Stitch all original chunks and all base chunks into two continuous buffers,
@@ -2124,11 +2111,14 @@ public class CrossService : ICross
         {
             using var stage = Observability.StartStage("Serialize");
             var swStage = Stopwatch.StartNew();
-            toReturn = BuildCompressedPayloadV5(
-                sorted,
-                mosaicInfos,
+            byte[] refBytes = BuildV5References(sorted, mosaicInfos);
+            byte[] fileHash = SHA256.HashData(_file);
+            toReturn = BuildCompressedPayload(
+                EncodingVersion,
+                refBytes,
                 errorDictionaryBytes,
-                trimmedChunk.ToArray());
+                trimmedChunk.ToArray(),
+                fileHash);
             swStage.Stop();
             Observability.RecordStage("Serialize", swStage.Elapsed.TotalMilliseconds, ("output_bytes", toReturn.Length));
         }
@@ -2630,10 +2620,6 @@ public class CrossService : ICross
         if (file == null || file.Length == 0)
             throw new ArgumentException("Compressed input is empty.", nameof(file));
 
-        // v5.0.0 detection: payload starts with zstd frame magic 0xFD2FB528
-        if (file.Length >= 4 && BitConverter.ToUInt32(file, 0) == 0xFD2FB528)
-            return await DecompressFileV5(file);
-
         var parseSw = Stopwatch.StartNew();
         var header = ParseHeader(file);
         parseSw.Stop();
@@ -2657,9 +2643,89 @@ public class CrossService : ICross
         int chunkCount;
 
         // Mosaic metadata for 0x03/0x04 refs (populated during parsing, used during fetch)
-        var mosaicRefs = new Dictionary<int, (List<(ulong BucketId, string StorageGuid)> Donors, ulong MatchBitmap, byte[] Selectors, byte[]? DonorPositions)>();
+        // BucketIndex is used by v5 (fetched via GetChunkByReferenceAsync); v3.x sets it to 0 and uses StorageGuid instead.
+        var mosaicRefs = new Dictionary<int, (List<(ulong BucketId, string StorageGuid, ulong BucketIndex)> Donors, ulong MatchBitmap, byte[] Selectors, byte[]? DonorPositions)>();
 
-        if (header.Version == "v3.1.0")
+        if (header.Version == "v5.0.0")
+        {
+            // v5.0.0: compact ref table + ushort indices
+            // [4 bytes: chunkCount] [2 bytes: refTableSize]
+            // [refTableSize × (8 bytes bucketId + 4 bytes bucketIndex)]
+            // then per-chunk: flag byte + ushort table index (or mosaic data)
+            int off = referencesOffset;
+            chunkCount = BitConverter.ToInt32(file, off);
+            off += sizeof(int);
+            ushort refTableSize = BitConverter.ToUInt16(file, off);
+            off += sizeof(ushort);
+
+            var refTable = new (ulong BucketId, uint BucketIndex)[refTableSize];
+            for (int i = 0; i < refTableSize; i++)
+            {
+                ulong bucketId = BitConverter.ToUInt64(file, off);
+                off += sizeof(ulong);
+                uint bucketIndex = BitConverter.ToUInt32(file, off);
+                off += sizeof(uint);
+                refTable[i] = (bucketId, bucketIndex);
+            }
+
+            refBucketIds = new ulong[chunkCount];
+            refBucketIndices = new ulong[chunkCount];
+            refStorageGuids = new string[chunkCount];
+
+            for (int i = 0; i < chunkCount; i++)
+            {
+                byte flag = file[off++];
+                switch (flag)
+                {
+                    case 0x00:
+                        refBucketIds[i] = 0;
+                        refBucketIndices[i] = 0;
+                        refStorageGuids[i] = "";
+                        break;
+                    case 0x01:
+                    case 0x02:
+                    {
+                        ushort tableIdx = BitConverter.ToUInt16(file, off);
+                        off += sizeof(ushort);
+                        if (tableIdx >= refTableSize)
+                            throw new InvalidDataException($"v5 ref table index {tableIdx} out of range ({refTableSize} entries)");
+                        refBucketIds[i] = refTable[tableIdx].BucketId;
+                        refBucketIndices[i] = refTable[tableIdx].BucketIndex;
+                        refStorageGuids[i] = "";
+                        break;
+                    }
+                    case 0x04:
+                    {
+                        int donorCount = file[off++];
+                        var donors = new List<(ulong BucketId, string StorageGuid, ulong BucketIndex)>(donorCount);
+                        for (int d = 0; d < donorCount; d++)
+                        {
+                            ushort tableIdx = BitConverter.ToUInt16(file, off);
+                            off += sizeof(ushort);
+                            if (tableIdx >= refTableSize)
+                                throw new InvalidDataException($"v5 mosaic donor table index {tableIdx} out of range");
+                            donors.Add((refTable[tableIdx].BucketId, "", refTable[tableIdx].BucketIndex));
+                        }
+                        ulong matchBitmap = BitConverter.ToUInt64(file, off);
+                        off += sizeof(ulong);
+                        var selectors = new byte[32];
+                        Buffer.BlockCopy(file, off, selectors, 0, 32);
+                        off += 32;
+                        var donorPositions = new byte[64];
+                        Buffer.BlockCopy(file, off, donorPositions, 0, 64);
+                        off += 64;
+
+                        mosaicRefs[i] = (donors, matchBitmap, selectors, donorPositions);
+                        refBucketIds[i] = ulong.MaxValue;
+                        refStorageGuids[i] = "";
+                        break;
+                    }
+                    default:
+                        throw new InvalidDataException($"v5: unknown reference flag 0x{flag:X2} at chunk {i}");
+                }
+            }
+        }
+        else if (header.Version == "v3.1.0")
         {
             // v3.1.0: flag-based variable-size refs
             // [4 bytes: chunkCount] then per-chunk:
@@ -2705,7 +2771,7 @@ public class CrossService : ICross
                     case 0x03: // legacy positional mosaic ref: donors + bitmap + selectors
                     {
                         int donorCount = file[off++];
-                        var donors = new List<(ulong BucketId, string StorageGuid)>(donorCount);
+                        var donors = new List<(ulong BucketId, string StorageGuid, ulong BucketIndex)>(donorCount);
                         for (int d = 0; d < donorCount; d++)
                         {
                             ulong dBucketId = BitConverter.ToUInt64(file, off);
@@ -2716,7 +2782,7 @@ public class CrossService : ICross
                             bool dAllZero = true;
                             for (int b = 0; b < 32; b++) { if (dGuidRaw[b] != 0) { dAllZero = false; break; } }
                             string dGuid = dAllZero ? "" : Convert.ToHexString(dGuidRaw).ToLowerInvariant();
-                            donors.Add((dBucketId, dGuid));
+                            donors.Add((dBucketId, dGuid, 0));
                         }
                         ulong matchBitmap = BitConverter.ToUInt64(file, off);
                         off += sizeof(ulong);
@@ -2732,7 +2798,7 @@ public class CrossService : ICross
                     case 0x04: // cross-position mosaic ref: donors + bitmap + selectors + donorPositions
                     {
                         int donorCount = file[off++];
-                        var donors = new List<(ulong BucketId, string StorageGuid)>(donorCount);
+                        var donors = new List<(ulong BucketId, string StorageGuid, ulong BucketIndex)>(donorCount);
                         for (int d = 0; d < donorCount; d++)
                         {
                             ulong dBucketId = BitConverter.ToUInt64(file, off);
@@ -2743,7 +2809,7 @@ public class CrossService : ICross
                             bool dAllZero = true;
                             for (int b = 0; b < 32; b++) { if (dGuidRaw[b] != 0) { dAllZero = false; break; } }
                             string dGuid = dAllZero ? "" : Convert.ToHexString(dGuidRaw).ToLowerInvariant();
-                            donors.Add((dBucketId, dGuid));
+                            donors.Add((dBucketId, dGuid, 0));
                         }
                         ulong matchBitmap = BitConverter.ToUInt64(file, off);
                         off += sizeof(ulong);
@@ -2808,7 +2874,7 @@ public class CrossService : ICross
         // <int totalRunCount> then <int startPos><ushort runLength><short diffValue> × totalRunCount
         (int startPos, int runLength, short diffValue)[] patches;
         byte[] errorBytes;
-        if (header.Version == "v3.1.0")
+        if (header.Version == "v3.1.0" || header.Version == "v5.0.0")
         {
             using var decompressor = new Decompressor();
             errorBytes = decompressor.Unwrap(
@@ -2880,21 +2946,36 @@ public class CrossService : ICross
                     for (int d = 0; d < donors.Count; d++)
                     {
                         int dIdx = d;
-                        var (dBucketId, dGuid) = donors[dIdx];
+                        var (dBucketId, dGuid, dBucketIdx) = donors[dIdx];
                         donorFetches[dIdx] = Task.Run(async () =>
                         {
                             string bitstring = UlongToBitstring(dBucketId);
                             string targetAgent = RendezvousRouter.PickAgent(bitstring);
                             byte[]? chunk = null;
                             if (!string.IsNullOrEmpty(dGuid))
-                                chunk = await _chunkReferenceClient.GetChunkByStorageGuidAsync(dGuid, targetAgent);
-                            if (chunk == null && allAgentIps != null)
                             {
-                                foreach (var agent in allAgentIps.Where(ip => ip != targetAgent))
+                                chunk = await _chunkReferenceClient.GetChunkByStorageGuidAsync(dGuid, targetAgent);
+                                if (chunk == null && allAgentIps != null)
                                 {
-                                    try { chunk = await _chunkReferenceClient.GetChunkByStorageGuidAsync(dGuid, agent); }
-                                    catch { /* try next */ }
-                                    if (chunk != null) break;
+                                    foreach (var agent in allAgentIps.Where(ip => ip != targetAgent))
+                                    {
+                                        try { chunk = await _chunkReferenceClient.GetChunkByStorageGuidAsync(dGuid, agent); }
+                                        catch { /* try next */ }
+                                        if (chunk != null) break;
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(dBucketId, dBucketIdx, targetAgent);
+                                if (chunk == null)
+                                {
+                                    for (int retry = 0; retry < 3; retry++)
+                                    {
+                                        await Task.Delay(100 * (retry + 1));
+                                        chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(dBucketId, dBucketIdx, targetAgent);
+                                        if (chunk != null) break;
+                                    }
                                 }
                             }
                             donorChunks[dIdx] = chunk ?? new byte[chSize];
@@ -3116,248 +3197,6 @@ public class CrossService : ICross
         applySw.Stop();
         Observability.RecordStage("ApplyPatchAndEgress", applySw.Elapsed.TotalMilliseconds,
             ("chunk_count", chunkCount), ("patches", patches.Length));
-
-        return result;
-    }
-
-    /// <summary>
-    /// v5.0.0 decompression: zstd-decompress the payload, parse ref table + compact refs,
-    /// fetch base chunks by (bucketId, bucketIndex), apply error patches, assemble output.
-    /// </summary>
-    private async Task<byte[]> DecompressFileV5(byte[] file)
-    {
-        var parseSw = Stopwatch.StartNew();
-
-        // Decompress the entire payload
-        byte[] raw;
-        using (var decompressor = new Decompressor())
-            raw = decompressor.Unwrap(file).ToArray();
-
-        using var ms = new MemoryStream(raw, writable: false);
-        using var br = new BinaryReader(ms, Encoding.UTF8, leaveOpen: true);
-
-        int chunkCount = br.ReadInt32();
-        ushort refTableSize = br.ReadUInt16();
-
-        var refTable = new (ulong BucketId, uint BucketIndex)[refTableSize];
-        for (int i = 0; i < refTableSize; i++)
-        {
-            ulong bucketId = br.ReadUInt64();
-            uint bucketIndex = br.ReadUInt32();
-            refTable[i] = (bucketId, bucketIndex);
-        }
-
-        // Parse per-chunk references
-        var refBucketIds = new ulong[chunkCount];
-        var refBucketIndices = new ulong[chunkCount];
-        var mosaicRefs = new Dictionary<int, (List<(ulong BucketId, ulong BucketIndex)> Donors, ulong MatchBitmap, byte[] Selectors, byte[] DonorPositions)>();
-
-        for (int i = 0; i < chunkCount; i++)
-        {
-            byte flag = br.ReadByte();
-            switch (flag)
-            {
-                case 0x00:
-                    refBucketIds[i] = 0;
-                    refBucketIndices[i] = 0;
-                    break;
-                case 0x01:
-                case 0x02:
-                {
-                    ushort tableIdx = br.ReadUInt16();
-                    if (tableIdx >= refTableSize)
-                        throw new InvalidDataException($"v5 ref table index {tableIdx} out of range ({refTableSize} entries)");
-                    refBucketIds[i] = refTable[tableIdx].BucketId;
-                    refBucketIndices[i] = refTable[tableIdx].BucketIndex;
-                    break;
-                }
-                case 0x04:
-                {
-                    int donorCount = br.ReadByte();
-                    var donors = new List<(ulong BucketId, ulong BucketIndex)>(donorCount);
-                    for (int d = 0; d < donorCount; d++)
-                    {
-                        ushort tableIdx = br.ReadUInt16();
-                        if (tableIdx >= refTableSize)
-                            throw new InvalidDataException($"v5 mosaic donor table index {tableIdx} out of range");
-                        donors.Add((refTable[tableIdx].BucketId, refTable[tableIdx].BucketIndex));
-                    }
-                    ulong matchBitmap = br.ReadUInt64();
-                    byte[] selectors = br.ReadBytes(32);
-                    byte[] donorPositions = br.ReadBytes(64);
-                    mosaicRefs[i] = (donors, matchBitmap, selectors, donorPositions);
-                    refBucketIds[i] = ulong.MaxValue;
-                    break;
-                }
-                default:
-                    throw new InvalidDataException($"v5: unknown reference flag 0x{flag:X2} at chunk {i}");
-            }
-        }
-
-        // Parse error encoding (same RLE format, but embedded raw — not separately zstd'd)
-        int totalRunCount = br.ReadInt32();
-        if (totalRunCount < 0)
-            throw new InvalidDataException($"v5: invalid negative run count {totalRunCount}");
-        var patches = new (int startPos, int runLength, short diffValue)[totalRunCount];
-        for (int i = 0; i < totalRunCount; i++)
-        {
-            int startPos = br.ReadInt32();
-            ushort runLength = br.ReadUInt16();
-            short diffValue = br.ReadInt16();
-            patches[i] = (startPos, runLength, diffValue);
-        }
-
-        // Trim chunk
-        int trimLength = br.ReadInt32();
-        byte[] trimChunk = trimLength > 0 ? br.ReadBytes(trimLength) : Array.Empty<byte>();
-
-        parseSw.Stop();
-        Observability.RecordStage("DeserializeV5", parseSw.Elapsed.TotalMilliseconds);
-
-        // Fetch all base chunks in parallel via (bucketId, bucketIndex)
-        var fetchSw = Stopwatch.StartNew();
-        var baseChunks = new byte[chunkCount][];
-        var fetchTasks = new Task[chunkCount];
-        int primaryHits = 0, fallbackHits = 0;
-
-        for (int i = 0; i < chunkCount; i++)
-        {
-            ulong bucketId = refBucketIds[i];
-            bool isZeroRef = bucketId == 0 && refBucketIndices[i] == 0;
-            bool isMosaicRef = mosaicRefs.ContainsKey(i);
-
-            if (isZeroRef)
-            {
-                baseChunks[i] = new byte[Globals.chunkSize];
-                fetchTasks[i] = Task.CompletedTask;
-            }
-            else if (isMosaicRef)
-            {
-                int idx = i;
-                var (donors, matchBitmap, selectors, donorPositions) = mosaicRefs[idx];
-                fetchTasks[i] = Task.Run(async () =>
-                {
-                    int subSize = Globals.MosaicSubChunkSize;
-                    int nComp = Globals.MosaicNComponents;
-                    int chSize = Globals.chunkSize;
-
-                    var donorChunks = new byte[donors.Count][];
-                    var donorFetches = new Task[donors.Count];
-                    for (int d = 0; d < donors.Count; d++)
-                    {
-                        int dIdx = d;
-                        var (dBucketId, dBucketIndex) = donors[dIdx];
-                        donorFetches[dIdx] = Task.Run(async () =>
-                        {
-                            string bitstring = UlongToBitstring(dBucketId);
-                            string targetAgent = RendezvousRouter.PickAgent(bitstring);
-                            byte[]? chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(dBucketId, dBucketIndex, targetAgent);
-                            if (chunk == null)
-                            {
-                                for (int retry = 0; retry < 3; retry++)
-                                {
-                                    await Task.Delay(100 * (retry + 1));
-                                    chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(dBucketId, dBucketIndex, targetAgent);
-                                    if (chunk != null) break;
-                                }
-                            }
-                            donorChunks[dIdx] = chunk ?? new byte[chSize];
-                        });
-                    }
-                    await Task.WhenAll(donorFetches);
-
-                    var stitched = new byte[chSize];
-                    for (int e = 0; e < nComp && e * subSize < chSize; e++)
-                    {
-                        if ((matchBitmap & (1UL << e)) == 0) continue;
-                        int donorIdx = MosaicChunkInfo.GetSelector(selectors, e);
-                        if (donorIdx >= donorChunks.Length) continue;
-                        int dstOffset = e * subSize;
-                        int srcPos = donorPositions[e];
-                        int srcOffset = srcPos * subSize;
-                        int len = Math.Min(subSize, chSize - dstOffset);
-                        if (srcOffset + len <= donorChunks[donorIdx].Length)
-                            Buffer.BlockCopy(donorChunks[donorIdx], srcOffset, stitched, dstOffset, len);
-                    }
-                    baseChunks[idx] = stitched;
-                    Interlocked.Increment(ref primaryHits);
-                });
-            }
-            else
-            {
-                int idx = i;
-                ulong bId = bucketId;
-                ulong bIdx = refBucketIndices[idx];
-                fetchTasks[i] = Task.Run(async () =>
-                {
-                    string bitstring = UlongToBitstring(bId);
-                    string targetAgent = RendezvousRouter.PickAgent(bitstring);
-                    byte[]? chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(bId, bIdx, targetAgent);
-                    if (chunk != null)
-                    {
-                        Interlocked.Increment(ref primaryHits);
-                    }
-                    else
-                    {
-                        for (int retry = 0; retry < 3; retry++)
-                        {
-                            await Task.Delay(100 * (retry + 1));
-                            chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(bId, bIdx, targetAgent);
-                            if (chunk != null) { Interlocked.Increment(ref fallbackHits); break; }
-                        }
-                    }
-                    if (chunk == null)
-                        throw new InvalidDataException(
-                            $"v5: missing base chunk for ({bId}, {bIdx}). Agent={targetAgent}");
-                    baseChunks[idx] = chunk;
-                });
-            }
-        }
-        await Task.WhenAll(fetchTasks);
-        fetchSw.Stop();
-        int zeroRefCount = Enumerable.Range(0, chunkCount).Count(i => refBucketIds[i] == 0 && refBucketIndices[i] == 0);
-        Console.WriteLine($"[Decompress v5] FetchBaseChunks: {fetchSw.ElapsedMilliseconds}ms, {chunkCount} chunks, primary={primaryHits}, fallback={fallbackHits}, zeroRef={zeroRefCount}");
-        Observability.RecordStage("FetchBaseChunksV5", fetchSw.Elapsed.TotalMilliseconds, ("chunk_count", chunkCount));
-
-        // Stitch base chunks into one continuous buffer
-        var applySw = Stopwatch.StartNew();
-        byte[] baseBuffer = new byte[chunkCount * Globals.chunkSize];
-        for (int i = 0; i < chunkCount; i++)
-        {
-            if (baseChunks[i].Length != Globals.chunkSize)
-                throw new InvalidDataException($"v5: base chunk {i} has length {baseChunks[i].Length}, expected {Globals.chunkSize}.");
-            Buffer.BlockCopy(baseChunks[i], 0, baseBuffer, i * Globals.chunkSize, Globals.chunkSize);
-        }
-
-        // Apply flat error encoding (RLE)
-        int cursor = 0;
-        foreach (var (startPos, runLength, diffValue) in patches)
-        {
-            cursor += startPos;
-            if (cursor < 0 || cursor >= baseBuffer.Length)
-                throw new InvalidDataException($"v5: patch cursor {cursor} out of range (buffer {baseBuffer.Length}).");
-            for (int j = 0; j < runLength; j++)
-            {
-                if (cursor + j >= baseBuffer.Length)
-                    throw new InvalidDataException($"v5: run extends beyond buffer at cursor {cursor}.");
-                int patched = baseBuffer[cursor + j] + diffValue;
-                if (patched < 0 || patched > 255)
-                    throw new InvalidDataException($"v5: patched byte {patched} out of range at {cursor + j}.");
-                baseBuffer[cursor + j] = (byte)patched;
-            }
-            cursor += runLength;
-        }
-
-        // Assemble: reconstructed buffer + trim chunk
-        byte[] result = new byte[baseBuffer.Length + trimLength];
-        Buffer.BlockCopy(baseBuffer, 0, result, 0, baseBuffer.Length);
-        if (trimLength > 0)
-            Buffer.BlockCopy(trimChunk, 0, result, baseBuffer.Length, trimLength);
-
-        applySw.Stop();
-        Observability.RecordStage("ApplyPatchV5", applySw.Elapsed.TotalMilliseconds,
-            ("chunk_count", chunkCount), ("patches", patches.Length));
-        Console.WriteLine($"[Decompress v5] DONE: {chunkCount} chunks, {patches.Length} runs, output={result.Length} bytes");
 
         return result;
     }
