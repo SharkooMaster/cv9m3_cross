@@ -37,8 +37,6 @@ public class CrossService : ICross
     private const string EncodingVersion = "v5.0.0";
     private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0" };
     string headID = "";
-    // OPTIMIZATION: Increased cache size from 10k to 100k for better hit rate
-    private static readonly SearchCacheService _searchCache = new SearchCacheService(maxCacheSize: 100000);
     private readonly global::Cross.Services.Grpc.Agent.ChunkReferenceServiceClient _chunkReferenceClient = new();
 
     /// <summary>
@@ -727,6 +725,10 @@ public class CrossService : ICross
                 StorageGuid = repResult.StorageGuid ?? ""
             };
         }
+
+        // Release search-phase allocations early (async state machine keeps locals alive otherwise)
+        allBuckets = null!;
+        agentChunkBuckets = null!;
 
         // ── LEVEL 2 MOSAIC ASSEMBLY ──
         // For high-entropy chunks that failed Level 1 (NeedToStore=true + have mosaic candidates),
@@ -2117,6 +2119,20 @@ public class CrossService : ICross
             using var stage = Observability.StartStage("Serialize");
             var swStage = Stopwatch.StartNew();
             byte[] refBytes = BuildV5References(sorted, mosaicInfos);
+            int storedForLog = sorted.Count(r => r != null && r.NeedToStore);
+
+            // Release all heavy collections now that refs/errors are computed
+            fileChunks = null!;
+            vectors = null!;
+            bitStrings = null!;
+            mainAgents = null!;
+            chunkMap = null!;
+            mosaicCandidates = null!;
+            mosaicInfos = null!;
+            sorted = null!;
+            representativeSet = null!;
+            groupRepresentative = null!;
+
             byte[] fileHash = SHA256.HashData(_file);
             toReturn = BuildCompressedPayload(
                 EncodingVersion,
@@ -2126,11 +2142,11 @@ public class CrossService : ICross
                 fileHash);
             swStage.Stop();
             Observability.RecordStage("Serialize", swStage.Elapsed.TotalMilliseconds, ("output_bytes", toReturn.Length));
+
+            totalSw.Stop();
+            Console.WriteLine($"[Compress] DONE: {totalSw.ElapsedMilliseconds}ms total, in={_file.Length} out={toReturn.Length} ratio={toReturn.Length/(double)_file.Length:F3}, dedup={referencesFound}, lshMatches={initialMatches}, stored={storedForLog}");
         }
 
-        // Return
-        totalSw.Stop();
-        Console.WriteLine($"[Compress] DONE: {totalSw.ElapsedMilliseconds}ms total, in={_file.Length} out={toReturn.Length} ratio={toReturn.Length/(double)_file.Length:F3}, dedup={referencesFound}, lshMatches={initialMatches}, stored={sorted.Count(r => r != null && r.NeedToStore)}");
         return (toReturn, referencesFound, totalChunks, datacenterBytesStored);
     }
 
@@ -2440,11 +2456,6 @@ public class CrossService : ICross
             throw new InvalidDataException("Not a v4/v5 windowed compressed file (bad magic).");
 
         long originalFileSize = br.ReadInt64();
-
-        byte[]? v4HeaderHash = null;
-        if (isV4Container)
-            v4HeaderHash = br.ReadBytes(32);
-
         int blockCount = br.ReadInt32();
 
         Console.WriteLine($"[DecompressWindowed] format={( isV5Container ? "CV5" : "CV4" )}, originalSize={originalFileSize}, blocks={blockCount}");
@@ -2493,18 +2504,10 @@ public class CrossService : ICross
             Console.WriteLine($"[DecompressWindowed] Block {block + 1}/{blockCount}: OK ({decompressedBlock.Length} bytes)");
         }
 
-        // ── 3. Read SHA256 hash: V4 = from header (already read), V5 = from trailer ──
-        byte[] expectedHash;
-        if (isV4Container)
-        {
-            expectedHash = v4HeaderHash!;
-        }
-        else
-        {
-            expectedHash = br.ReadBytes(32);
-            if (expectedHash.Length != 32)
-                throw new InvalidDataException("Missing SHA256 trailer in compressed file.");
-        }
+        // ── 3. Read SHA256 hash from trailer (after all blocks) ──
+        byte[] expectedHash = br.ReadBytes(32);
+        if (expectedHash.Length != 32)
+            throw new InvalidDataException("Missing SHA256 trailer in compressed file.");
 
         // ── 4. Verify whole-file SHA256 ──
         sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
@@ -2543,11 +2546,6 @@ public class CrossService : ICross
             throw new InvalidDataException("Not a v4/v5 windowed compressed file (bad magic).");
 
         long originalFileSize = br.ReadInt64();
-
-        byte[]? v4HeaderHash = null;
-        if (isV4Container)
-            v4HeaderHash = br.ReadBytes(32);
-
         int blockCount = br.ReadInt32();
 
         Console.WriteLine($"[DecompressWindowedStream] format={( isV5Container ? "CV5" : "CV4" )}, originalSize={originalFileSize}, blocks={blockCount}");
@@ -2597,18 +2595,10 @@ public class CrossService : ICross
             Console.WriteLine($"[DecompressWindowedStream] Block {block + 1}/{blockCount}: OK ({decompressedBlock.Length} bytes) → streamed");
         }
 
-        // ── 3. Read SHA256 hash: V4 = from header (already read), V5 = from trailer ──
-        byte[] expectedHash;
-        if (isV4Container)
-        {
-            expectedHash = v4HeaderHash!;
-        }
-        else
-        {
-            expectedHash = br.ReadBytes(32);
-            if (expectedHash.Length != 32)
-                throw new InvalidDataException("Missing SHA256 trailer in compressed file.");
-        }
+        // ── 3. Read SHA256 hash from trailer (after all blocks) ──
+        byte[] expectedHash = br.ReadBytes(32);
+        if (expectedHash.Length != 32)
+            throw new InvalidDataException("Missing SHA256 trailer in compressed file.");
 
         // ── 4. Verify whole-file SHA256 ──
         sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);

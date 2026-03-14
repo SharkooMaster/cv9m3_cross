@@ -178,20 +178,16 @@ public class CompressFileService : FileService.FileServiceBase
         return GetMaxUploadBytes();
     }
 
-    public override async Task<FileResponse> ProcessFile(FileRequest request, ServerCallContext context)
+    public override Task<FileResponse> ProcessFile(FileRequest request, ServerCallContext context)
     {
-        Console.WriteLine("REQUEST RECIEVED");
-        var crossService = new MyCrossService();
-        var to_return = new FileResponse();
-        to_return.FileContent = ByteString.CopyFrom(await crossService.CompressFile(request.FileContent.ToByteArray()));
-        return to_return;
+        throw new RpcException(new Status(StatusCode.Unimplemented,
+            "Unary ProcessFile is disabled to prevent OOM. Use ProcessFileStream instead."));
     }
 
-    public override async Task<FileResponse> DecompressFile(FileRequest request, ServerCallContext context)
+    public override Task<FileResponse> DecompressFile(FileRequest request, ServerCallContext context)
     {
-        var crossService = new MyCrossService();
-        var decompressed = await crossService.DecompressFile(request.FileContent.ToByteArray());
-        return new FileResponse { FileContent = ByteString.CopyFrom(decompressed) };
+        throw new RpcException(new Status(StatusCode.Unimplemented,
+            "Unary DecompressFile is disabled to prevent OOM. Use DecompressFileStream instead."));
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -589,9 +585,9 @@ public class CompressFileService : FileService.FileServiceBase
     {
         var crossService = new MyCrossService();
 
-        // ── Write v4 header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes ──
+        // ── Write v5 header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes ──
         byte[] header = new byte[4 + 8 + 4];
-        byte[] magic = "CV4\0"u8.ToArray();
+        byte[] magic = "CV5\0"u8.ToArray();
         Buffer.BlockCopy(magic, 0, header, 0, 4);
         BitConverter.TryWriteBytes(header.AsSpan(4), declaredFileSize);
         BitConverter.TryWriteBytes(header.AsSpan(12), blockCount);
@@ -623,12 +619,15 @@ public class CompressFileService : FileService.FileServiceBase
                         sw.Stop();
                         Console.WriteLine($"[Pipeline] Block {item.Index + 1}/{blockCount}: {item.Data.Length} → {compressed.Length} ({sw.ElapsedMilliseconds}ms)");
 
-                        completedBlocks[item.Index] = (compressed, item.Data.Length);
+                        int blockIndex = item.Index;
+                        int dataLen = item.Data.Length;
+                        completedBlocks[blockIndex] = (compressed, dataLen);
                         Interlocked.Add(ref totalRefs, refs);
                         Interlocked.Add(ref totalChunks, chunks);
                         Interlocked.Add(ref totalDatacenterBytes, dcBytes);
                         Interlocked.Add(ref totalCompressionTicks, sw.ElapsedTicks);
                         blockReady.Release();
+                        GC.Collect(2, GCCollectionMode.Optimized, false);
                     }
                 }
             }, ct);
@@ -640,14 +639,14 @@ public class CompressFileService : FileService.FileServiceBase
             await blockReady.WaitAsync(ct);
             while (completedBlocks.TryRemove(nextToWrite, out var block))
             {
-                // Block format: compressedLen(8) + originalLen(8) + compressed data
-                byte[] blockHeader = new byte[16];
-                BitConverter.TryWriteBytes(blockHeader.AsSpan(0), (long)block.Compressed.Length);
-                BitConverter.TryWriteBytes(blockHeader.AsSpan(8), (long)block.OriginalLen);
-                await grpcStream.WriteAsync(blockHeader, 0, 16, ct);
+                // V5 block format: compressedLen(4) + originalLen(4) + compressed data
+                byte[] blockHeader = new byte[8];
+                BitConverter.TryWriteBytes(blockHeader.AsSpan(0), (int)block.Compressed.Length);
+                BitConverter.TryWriteBytes(blockHeader.AsSpan(4), block.OriginalLen);
+                await grpcStream.WriteAsync(blockHeader, 0, 8, ct);
                 await grpcStream.WriteAsync(block.Compressed, 0, block.Compressed.Length, ct);
 
-                totalCompressedSize += 16 + block.Compressed.Length;
+                totalCompressedSize += 8 + block.Compressed.Length;
                 Console.WriteLine($"[Pipeline] ✅ Block {nextToWrite + 1}/{blockCount} streamed ({block.OriginalLen} → {block.Compressed.Length})");
                 nextToWrite++;
             }
@@ -724,6 +723,7 @@ public class CompressFileService : FileService.FileServiceBase
         var compressSw = System.Diagnostics.Stopwatch.StartNew();
         (byte[] compressedBytes, int referencesFound, int totalChunks, long dcBytesStored) = await crossService.CompressFileWithStats(fileBytes);
         compressSw.Stop();
+        fileBytes = null!;
 
         byte[] compressedHash;
         using (var compressedSha = SHA256.Create())
@@ -734,7 +734,7 @@ public class CompressFileService : FileService.FileServiceBase
         {
             Stats = new CompressionStats
             {
-                OriginalSize = (ulong)fileBytes.Length,
+                OriginalSize = (ulong)receivedBytes,
                 CompressedSize = (ulong)compressedBytes.Length,
                 ReferencesFound = (uint)Math.Max(0, referencesFound),
                 TotalChunks = (uint)Math.Max(0, totalChunks),
@@ -765,6 +765,8 @@ public class CompressFileService : FileService.FileServiceBase
         });
 
         Console.WriteLine($"[ProcessFileStream] Monolithic DONE: {receivedBytes} → {compressedBytes.Length}");
+        compressedBytes = null!;
+        GC.Collect(2, GCCollectionMode.Optimized, false);
     }
 
     /// <summary>

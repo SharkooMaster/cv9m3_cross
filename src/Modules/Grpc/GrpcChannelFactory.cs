@@ -48,8 +48,8 @@ public static class GrpcChannelFactory
         var options = new GrpcChannelOptions
         {
             HttpHandler = handler,
-            MaxReceiveMessageSize = 256 * 1024 * 1024,
-            MaxSendMessageSize = 256 * 1024 * 1024,
+            MaxReceiveMessageSize = 32 * 1024 * 1024,
+            MaxSendMessageSize = 32 * 1024 * 1024,
             Credentials = ChannelCredentials.Insecure
         };
 
