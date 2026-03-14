@@ -31,7 +31,7 @@ public class CrossService : ICross
     //         Decompression uses GetChunkByKey(storageGuid) for O(1) lookup. Safe multi-agent fallback.
     // v3.1.0: Error dictionary is zstd-compressed. Header stores compressed length;
     //         decompression inflates before applying patches.
-    // v5.0.0: Compact ref table with (bucketId, uint32 bucketIndex) replaces inline 32-byte
+    // v5.0.0: Compact ref table with (bucketId, bucketIndex) as ulong pairs replaces inline 32-byte
     //         SHA256 storageGuids. Per-chunk refs use uint16 table indices into the ref table.
     //         Uses standard header (ParseHeader), zstd on error dict, SHA256 hash — same as v3.1.0.
     private const string EncodingVersion = "v5.0.0";
@@ -150,12 +150,12 @@ public class CrossService : ICross
     {
         int chunkCount = sorted.Length;
 
-        var refTable = new List<(ulong BucketId, uint BucketIndex)>();
-        var refTableLookup = new Dictionary<(ulong, uint), ushort>();
+        var refTable = new List<(ulong BucketId, ulong BucketIndex)>();
+        var refTableLookup = new Dictionary<(ulong, ulong), ushort>();
 
         ushort GetOrAddRef(ulong bucketId, ulong bucketKey)
         {
-            var key = (bucketId, (uint)bucketKey);
+            var key = (bucketId, bucketKey);
             if (refTableLookup.TryGetValue(key, out ushort idx))
                 return idx;
             ushort newIdx = (ushort)refTable.Count;
@@ -181,6 +181,11 @@ public class CrossService : ICross
 
         using var ms = new MemoryStream();
         using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+
+        if (refTable.Count > ushort.MaxValue)
+            throw new InvalidOperationException(
+                $"v5 ref table has {refTable.Count} entries, exceeding the ushort max of {ushort.MaxValue}. " +
+                "This block cannot be encoded in v5 format.");
 
         // Header: chunkCount + refTableSize + ref table entries
         bw.Write(chunkCount);
@@ -2435,6 +2440,11 @@ public class CrossService : ICross
             throw new InvalidDataException("Not a v4/v5 windowed compressed file (bad magic).");
 
         long originalFileSize = br.ReadInt64();
+
+        byte[]? v4HeaderHash = null;
+        if (isV4Container)
+            v4HeaderHash = br.ReadBytes(32);
+
         int blockCount = br.ReadInt32();
 
         Console.WriteLine($"[DecompressWindowed] format={( isV5Container ? "CV5" : "CV4" )}, originalSize={originalFileSize}, blocks={blockCount}");
@@ -2483,10 +2493,18 @@ public class CrossService : ICross
             Console.WriteLine($"[DecompressWindowed] Block {block + 1}/{blockCount}: OK ({decompressedBlock.Length} bytes)");
         }
 
-        // ── 3. Read SHA256 hash from trailer (last 32 bytes after all blocks) ──
-        byte[] expectedHash = br.ReadBytes(32);
-        if (expectedHash.Length != 32)
-            throw new InvalidDataException("Missing SHA256 trailer in compressed file.");
+        // ── 3. Read SHA256 hash: V4 = from header (already read), V5 = from trailer ──
+        byte[] expectedHash;
+        if (isV4Container)
+        {
+            expectedHash = v4HeaderHash!;
+        }
+        else
+        {
+            expectedHash = br.ReadBytes(32);
+            if (expectedHash.Length != 32)
+                throw new InvalidDataException("Missing SHA256 trailer in compressed file.");
+        }
 
         // ── 4. Verify whole-file SHA256 ──
         sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
@@ -2525,6 +2543,11 @@ public class CrossService : ICross
             throw new InvalidDataException("Not a v4/v5 windowed compressed file (bad magic).");
 
         long originalFileSize = br.ReadInt64();
+
+        byte[]? v4HeaderHash = null;
+        if (isV4Container)
+            v4HeaderHash = br.ReadBytes(32);
+
         int blockCount = br.ReadInt32();
 
         Console.WriteLine($"[DecompressWindowedStream] format={( isV5Container ? "CV5" : "CV4" )}, originalSize={originalFileSize}, blocks={blockCount}");
@@ -2574,10 +2597,18 @@ public class CrossService : ICross
             Console.WriteLine($"[DecompressWindowedStream] Block {block + 1}/{blockCount}: OK ({decompressedBlock.Length} bytes) → streamed");
         }
 
-        // ── 3. Read SHA256 hash from trailer (last 32 bytes after all blocks) ──
-        byte[] expectedHash = br.ReadBytes(32);
-        if (expectedHash.Length != 32)
-            throw new InvalidDataException("Missing SHA256 trailer in compressed file.");
+        // ── 3. Read SHA256 hash: V4 = from header (already read), V5 = from trailer ──
+        byte[] expectedHash;
+        if (isV4Container)
+        {
+            expectedHash = v4HeaderHash!;
+        }
+        else
+        {
+            expectedHash = br.ReadBytes(32);
+            if (expectedHash.Length != 32)
+                throw new InvalidDataException("Missing SHA256 trailer in compressed file.");
+        }
 
         // ── 4. Verify whole-file SHA256 ──
         sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
@@ -2650,7 +2681,7 @@ public class CrossService : ICross
         {
             // v5.0.0: compact ref table + ushort indices
             // [4 bytes: chunkCount] [2 bytes: refTableSize]
-            // [refTableSize × (8 bytes bucketId + 4 bytes bucketIndex)]
+            // [refTableSize × (8 bytes bucketId + 8 bytes bucketIndex)]
             // then per-chunk: flag byte + ushort table index (or mosaic data)
             int off = referencesOffset;
             chunkCount = BitConverter.ToInt32(file, off);
@@ -2658,13 +2689,13 @@ public class CrossService : ICross
             ushort refTableSize = BitConverter.ToUInt16(file, off);
             off += sizeof(ushort);
 
-            var refTable = new (ulong BucketId, uint BucketIndex)[refTableSize];
+            var refTable = new (ulong BucketId, ulong BucketIndex)[refTableSize];
             for (int i = 0; i < refTableSize; i++)
             {
                 ulong bucketId = BitConverter.ToUInt64(file, off);
                 off += sizeof(ulong);
-                uint bucketIndex = BitConverter.ToUInt32(file, off);
-                off += sizeof(uint);
+                ulong bucketIndex = BitConverter.ToUInt64(file, off);
+                off += sizeof(ulong);
                 refTable[i] = (bucketId, bucketIndex);
             }
 
