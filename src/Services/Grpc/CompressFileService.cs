@@ -358,11 +358,13 @@ public class CompressFileService : FileService.FileServiceBase
                 throw new RpcException(new Status(StatusCode.InvalidArgument, "Empty request stream."));
 
             var firstMsg = requestStream.Current;
+            float maxErrorRate = 0f;
             if (firstMsg.PayloadCase == FileUploadRequest.PayloadOneofCase.Metadata)
             {
                 fileName = firstMsg.Metadata.FileName;
                 declaredSize = firstMsg.Metadata.OriginalSize;
                 declaredSha256 = firstMsg.Metadata.Sha256;
+                maxErrorRate = firstMsg.Metadata.MaxErrorRate;
             }
 
             bool willUseWindowed = declaredSize > (ulong)windowedThreshold;
@@ -384,7 +386,7 @@ public class CompressFileService : FileService.FileServiceBase
                     //  RAM ≈ (parallelism + channelCapacity) × windowSize ≈ 512-768 MB
                     // ═══════════════════════════════════════════════════════════
                     await HandleWindowedPipeline(requestStream, responseStream, context,
-                        (long)declaredSize, declaredSha256, effectiveLimit);
+                        (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate);
                 }
                 else
                 {
@@ -392,7 +394,7 @@ public class CompressFileService : FileService.FileServiceBase
                     //  MONOLITHIC v3.0.0 — temp file, single-shot compression
                     // ═══════════════════════════════════════════════════════════
                     await HandleMonolithicCompression(requestStream, responseStream, context,
-                        tempPath, (long)declaredSize, declaredSha256, effectiveLimit);
+                        tempPath, (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate);
                 }
             }
             finally
@@ -437,7 +439,8 @@ public class CompressFileService : FileService.FileServiceBase
         ServerCallContext context,
         long declaredSize,
         ByteString? declaredSha256,
-        long effectiveLimit)
+        long effectiveLimit,
+        float maxErrorRate = 0f)
     {
         int windowSize = MyCrossService.WindowSize;
         int parallelism = GetPipelineParallelism();
@@ -459,7 +462,7 @@ public class CompressFileService : FileService.FileServiceBase
 
         // ── Start compression pipeline (runs concurrently with receive) ──
         var pipelineTask = RunCompressionPipeline(
-            windowChannel.Reader, grpcStream, declaredSize, blockCount, parallelism, context.CancellationToken);
+            windowChannel.Reader, grpcStream, declaredSize, blockCount, parallelism, context.CancellationToken, maxErrorRate);
 
         // ── Receive loop: accumulate gRPC chunks into window buffers ──
         byte[] currentBuf = new byte[windowSize];
@@ -581,7 +584,8 @@ public class CompressFileService : FileService.FileServiceBase
         long declaredFileSize,
         int blockCount,
         int parallelism,
-        CancellationToken ct)
+        CancellationToken ct,
+        float maxErrorRate = 0f)
     {
         var crossService = new MyCrossService();
 
@@ -615,7 +619,7 @@ public class CompressFileService : FileService.FileServiceBase
                     {
                         Console.WriteLine($"[Pipeline] Compressing block {item.Index + 1}/{blockCount} ({item.Data.Length} bytes)...");
                         var sw = System.Diagnostics.Stopwatch.StartNew();
-                        (byte[] compressed, int refs, int chunks, long dcBytes) = await crossService.CompressFileWithStats(item.Data);
+                        (byte[] compressed, int refs, int chunks, long dcBytes) = await crossService.CompressFileWithStats(item.Data, maxErrorRate);
                         sw.Stop();
                         Console.WriteLine($"[Pipeline] Block {item.Index + 1}/{blockCount}: {item.Data.Length} → {compressed.Length} ({sw.ElapsedMilliseconds}ms)");
 
@@ -667,7 +671,8 @@ public class CompressFileService : FileService.FileServiceBase
         string tempPath,
         long declaredSize,
         ByteString? declaredSha256,
-        long effectiveLimit)
+        long effectiveLimit,
+        float maxErrorRate = 0f)
     {
         long receivedBytes = 0;
         byte[] uploadedSha256;
@@ -721,7 +726,7 @@ public class CompressFileService : FileService.FileServiceBase
         byte[] fileBytes = await File.ReadAllBytesAsync(tempPath, context.CancellationToken);
 
         var compressSw = System.Diagnostics.Stopwatch.StartNew();
-        (byte[] compressedBytes, int referencesFound, int totalChunks, long dcBytesStored) = await crossService.CompressFileWithStats(fileBytes);
+        (byte[] compressedBytes, int referencesFound, int totalChunks, long dcBytesStored) = await crossService.CompressFileWithStats(fileBytes, maxErrorRate);
         compressSw.Stop();
         fileBytes = null!;
 

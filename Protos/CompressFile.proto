@@ -38,6 +38,9 @@ message FileMetadata {
   uint32 chunk_size = 3;
   // Optional: 32-byte SHA-256 of original file. If empty, server won't validate.
   bytes sha256 = 4;
+  // Max fraction of differing bytes allowed per chunk (0.0-1.0). 0 = use server default.
+  // E.g. 0.40 means reject matches where >40% of bytes differ.
+  float max_error_rate = 5;
 }
 
 message FileChunk {

@@ -34,10 +34,35 @@ public class CrossService : ICross
     // v5.0.0: Compact ref table with (bucketId, bucketIndex) as ulong pairs replaces inline 32-byte
     //         SHA256 storageGuids. Per-chunk refs use uint16 table indices into the ref table.
     //         Uses standard header (ParseHeader), zstd on error dict, SHA256 hash — same as v3.1.0.
-    private const string EncodingVersion = "v5.0.0";
-    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0" };
+    private const string EncodingVersion = "v5.2.0";
+    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0", "v5.1.0", "v5.2.0" };
     string headID = "";
     private readonly global::Cross.Services.Grpc.Agent.ChunkReferenceServiceClient _chunkReferenceClient = new();
+
+    private static void WriteVarint(Stream s, uint value)
+    {
+        while (value >= 0x80)
+        {
+            s.WriteByte((byte)(value | 0x80));
+            value >>= 7;
+        }
+        s.WriteByte((byte)value);
+    }
+
+    private static uint ReadVarint(Stream s)
+    {
+        uint result = 0;
+        int shift = 0;
+        while (true)
+        {
+            int b = s.ReadByte();
+            if (b < 0) throw new InvalidDataException("Unexpected end of stream reading varint.");
+            result |= (uint)(b & 0x7F) << shift;
+            if ((b & 0x80) == 0) return result;
+            shift += 7;
+            if (shift > 28) throw new InvalidDataException("Varint too large.");
+        }
+    }
 
     /// <summary>
     /// Convert a ulong back to a 64-char '0'/'1' bitstring.
@@ -112,9 +137,9 @@ public class CrossService : ICross
         bw.Write(references.Length);
 
         byte[] errorPayload;
-        if (version == "v3.1.0" || version == "v5.0.0")
+        if (version == "v3.1.0" || version == "v5.0.0" || version == "v5.1.0" || version == "v5.2.0")
         {
-            int zstdLevel = (version == "v5.0.0") ? 9 : 3;
+            int zstdLevel = version == "v5.2.0" ? 19 : version == "v5.1.0" ? 19 : version == "v5.0.0" ? 9 : 3;
             using var compressor = new Compressor(zstdLevel);
             errorPayload = compressor.Wrap(errorDictionary).ToArray();
             bw.Write(errorPayload.Length);      // compressed length (stored in header)
@@ -254,9 +279,9 @@ public class CrossService : ICross
         if (referencesLength < 0 || errorLength < 0)
             throw new InvalidDataException("Negative section length in compressed payload.");
 
-        // v3.1.0: error dictionary is zstd-compressed; header has [compressedLen][originalLen]
+        // v3.1.0+: error dictionary is zstd-compressed; header has [compressedLen][originalLen]
         int errorOriginalLength = errorLength; // for uncompressed versions, original == stored
-        if (version == "v3.1.0" || version == "v5.0.0")
+        if (version == "v3.1.0" || version == "v5.0.0" || version == "v5.1.0" || version == "v5.2.0")
         {
             errorOriginalLength = BitConverter.ToInt32(payload.Slice(offset, IntSize));
             offset += IntSize;
@@ -264,7 +289,7 @@ public class CrossService : ICross
 
         // v2.1.0+: trim chunk length is stored in the header
         int trimLength = -1; // -1 means "not present" (v2.0.0 compat)
-        if (version == "v2.1.0" || version == "v3.0.0" || version == "v3.1.0" || version == "v5.0.0")
+        if (version == "v2.1.0" || version == "v3.0.0" || version == "v3.1.0" || version == "v5.0.0" || version == "v5.1.0" || version == "v5.2.0")
         {
             trimLength = BitConverter.ToInt32(payload.Slice(offset, IntSize));
             offset += IntSize;
@@ -348,8 +373,11 @@ public class CrossService : ICross
     }
 
     // Local/in-process helper: returns compressed bytes plus per-file reference stats
-    public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks, long DatacenterBytesStored)> CompressFileWithStats(byte[] _file)
+    public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks, long DatacenterBytesStored)> CompressFileWithStats(byte[] _file, float maxErrorRate = 0f)
     {
+        float bloatThreshold = maxErrorRate > 0f && maxErrorRate <= 1f
+            ? maxErrorRate
+            : Globals.BloatGuardThreshold;
         using var rootSpan = Observability.StartStage("CompressFileWithStats");
         // Divide into (N) chunks
         var totalSw = Stopwatch.StartNew();
@@ -1366,7 +1394,7 @@ public class CrossService : ICross
             // (new store), while keeping it only increases client .ccf diff size.
             // Since datacenter growth is the priority metric, we tolerate bigger diffs
             // for non-reps before ejecting.
-            int maxAllowedRegular = (int)(Globals.chunkSize * Globals.BloatGuardThreshold);
+            int maxAllowedRegular = (int)(Globals.chunkSize * bloatThreshold);
             int maxAllowedCluster = (int)(Globals.chunkSize * Globals.ClusterBloatGuardThreshold);
             for (int i = 0; i < sorted.Length; i++)
             {
@@ -1523,7 +1551,7 @@ public class CrossService : ICross
                         differingBytes++;
                 }
 
-                int maxAllowed = (int)(Globals.chunkSize * Globals.BloatGuardThreshold);
+                int maxAllowed = (int)(Globals.chunkSize * bloatThreshold);
                 if (differingBytes >= maxAllowed) return; // mosaic didn't help enough
 
                 info.Donors = donors.Select(d => (d.BucketId, d.BucketKey)).ToList();
@@ -1712,7 +1740,7 @@ public class CrossService : ICross
                         {
                             if (srcChunk[j] != stitched[j]) differingBytes++;
                         }
-                        int maxAllowed = (int)(Globals.chunkSize * Globals.BloatGuardThreshold);
+                        int maxAllowed = (int)(Globals.chunkSize * bloatThreshold);
                         if (differingBytes >= maxAllowed) return;
 
                         info.Donors = donors.Select(d => (d.BucketId, d.BucketKey)).ToList();
@@ -1944,82 +1972,89 @@ public class CrossService : ICross
 
         // v5.0.0: references are built by BuildV5References (ref table + compact indices)
 
-        // ── FLAT ERROR ENCODING (v2.0.0) ──
-        // Stitch all original chunks and all base chunks into two continuous buffers,
-        // run GetErrorEncoding once across the whole thing. Identical chunks contribute
-        // zero entries. No per-chunk overhead — just the diffs that exist.
+        // ── ERROR ENCODING (v5.2.0): varint(skip) + byte(xor) pairs ──
+        // For each byte where original != base, emit the delta-encoded skip
+        // (distance from last diff) as a varint, then the XOR value.
+        // Identical bytes just increment skip. Stored chunks XOR to zero
+        // and are skipped entirely.
         byte[] errorDictionaryBytes;
         {
-            using var stage = Observability.StartStage("FlatEncode");
+            using var stage = Observability.StartStage("PatchEncode");
             phaseSw.Restart();
 
             int totalBytes = sorted.Length * Globals.chunkSize;
-            byte[] originalBuffer = new byte[totalBytes];
-            byte[] baseBuffer = new byte[totalBytes];
+
+            using var patchMs = new MemoryStream();
+            using var pw = new BinaryWriter(patchMs, Encoding.UTF8, leaveOpen: true);
+
+            long countPos = patchMs.Position;
+            pw.Write((int)0);        // placeholder for patchCount
+            pw.Write(totalBytes);    // originalSize for decompressor
+
+            int patchCount = 0;
+            uint skip = 0;
+            int cs = Globals.chunkSize;
 
             for (int i = 0; i < sorted.Length; i++)
             {
-                int off = i * Globals.chunkSize;
+                byte[] original = fileChunks[i];
+                byte[] baseChunk;
 
-                // Original chunk
-                Buffer.BlockCopy(fileChunks[i], 0, originalBuffer, off, Globals.chunkSize);
-
-                // Determine base chunk
-                // Mosaic chunks: base == stitched mosaic from donors (what decompressor reconstructs via 0x03 ref)
-                // Representatives that were stored: base == rep's own bytes (zero diff for rep itself).
-                // Non-reps whose rep was stored: base == rep's bytes (diff encodes distance to rep).
-                // Search matches: base == matched chunk from agent.
                 if (mosaicInfos.TryGetValue(i, out var mosaicForDiff))
                 {
-                    Buffer.BlockCopy(mosaicForDiff.StitchedBase, 0, baseBuffer, off,
-                        Math.Min(mosaicForDiff.StitchedBase.Length, Globals.chunkSize));
+                    baseChunk = mosaicForDiff.StitchedBase;
                 }
                 else if (sorted[i].NeedToStore && sorted[i].BucketId != 0)
                 {
-                    Buffer.BlockCopy(fileChunks[i], 0, baseBuffer, off, Globals.chunkSize);
+                    baseChunk = fileChunks[i];
                 }
                 else if (!representativeSet.Contains(i) && sorted[groupRepresentative[i]].NeedToStore
                          && sorted[groupRepresentative[i]].BucketId != 0)
                 {
-                    // Non-rep whose rep was stored — base is the rep's actual bytes
-                    Buffer.BlockCopy(fileChunks[groupRepresentative[i]], 0, baseBuffer, off, Globals.chunkSize);
+                    baseChunk = fileChunks[groupRepresentative[i]];
                 }
                 else if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
                 {
-                    var baseBytes = sorted[i].Chunk.ToByteArray();
-                    Buffer.BlockCopy(baseBytes, 0, baseBuffer, off, Math.Min(baseBytes.Length, Globals.chunkSize));
+                    baseChunk = sorted[i].Chunk.ToByteArray();
                 }
-                // else: base is zeros (already zeroed by new byte[])
-            }
-
-            // XOR patch: originalBuffer ^ baseBuffer → sparse buffer (mostly zeros), Zstd-friendly
-            errorDictionaryBytes = new byte[totalBytes];
-            int nonZeroCount = 0;
-            for (int i = 0; i < totalBytes; i++)
-            {
-                errorDictionaryBytes[i] = (byte)(originalBuffer[i] ^ baseBuffer[i]);
-                if (errorDictionaryBytes[i] != 0) nonZeroCount++;
-            }
-
-            // ── INTEGRITY CHECK: verify base ^ xorPatch == original ──
-            for (int i = 0; i < totalBytes; i++)
-            {
-                byte reconstructed = (byte)(baseBuffer[i] ^ errorDictionaryBytes[i]);
-                if (reconstructed != originalBuffer[i])
+                else
                 {
-                    int chunkIdx = i / Globals.chunkSize;
-                    Console.WriteLine($"[Compress] INTEGRITY FAIL: byte {i} (chunk {chunkIdx}): " +
-                        $"base=0x{baseBuffer[i]:X2} ^ xor=0x{errorDictionaryBytes[i]:X2} = 0x{reconstructed:X2}, " +
-                        $"expected 0x{originalBuffer[i]:X2}");
-                    throw new InvalidDataException(
-                        "XOR patch integrity check failed: base ^ patch does not reconstruct original.");
+                    baseChunk = Array.Empty<byte>();
+                }
+
+                int baseLen = Math.Min(baseChunk.Length, cs);
+                for (int b = 0; b < cs; b++)
+                {
+                    byte orig = original[b];
+                    byte bas = b < baseLen ? baseChunk[b] : (byte)0;
+                    byte xor = (byte)(orig ^ bas);
+                    if (xor == 0)
+                    {
+                        skip++;
+                    }
+                    else
+                    {
+                        WriteVarint(patchMs, skip);
+                        patchMs.WriteByte(xor);
+                        skip = 0;
+                        patchCount++;
+                    }
                 }
             }
+
+            pw.Flush();
+            patchMs.Position = countPos;
+            pw.Write(patchCount);
+            patchMs.Position = patchMs.Length;
+
+            errorDictionaryBytes = patchMs.ToArray();
 
             phaseSw.Stop();
-            Console.WriteLine($"[Compress] FlatEncode: {phaseSw.ElapsedMilliseconds}ms, xorPatch={totalBytes} bytes, nonZero={nonZeroCount} ({100.0 * nonZeroCount / totalBytes:F1}%)");
-            Observability.RecordStage("FlatEncode", phaseSw.Elapsed.TotalMilliseconds,
-                ("xor_bytes", totalBytes), ("nonzero_bytes", nonZeroCount));
+            Console.WriteLine($"[Compress] PatchEncode: {phaseSw.ElapsedMilliseconds}ms, " +
+                $"totalBytes={totalBytes}, patches={patchCount} ({100.0 * patchCount / totalBytes:F1}%), " +
+                $"rawSize={errorDictionaryBytes.Length}");
+            Observability.RecordStage("PatchEncode", phaseSw.Elapsed.TotalMilliseconds,
+                ("total_bytes", totalBytes), ("patch_count", patchCount), ("raw_bytes", errorDictionaryBytes.Length));
         }
 
         byte[] toReturn;
@@ -2575,9 +2610,9 @@ public class CrossService : ICross
         // BucketIndex is used by v5 (fetched via GetChunkByReferenceAsync); v3.x sets it to 0 and uses StorageGuid instead.
         var mosaicRefs = new Dictionary<int, (List<(ulong BucketId, string StorageGuid, ulong BucketIndex)> Donors, ulong MatchBitmap, byte[] Selectors, byte[]? DonorPositions)>();
 
-        if (header.Version == "v5.0.0")
+        if (header.Version == "v5.0.0" || header.Version == "v5.1.0" || header.Version == "v5.2.0")
         {
-            // v5.0.0: compact ref table + ushort indices
+            // v5.x: compact ref table + ushort indices
             // [4 bytes: chunkCount] [2 bytes: refTableSize]
             // [refTableSize × (8 bytes bucketId + 8 bytes bucketIndex)]
             // then per-chunk: flag byte + ushort table index (or mosaic data)
@@ -2799,13 +2834,17 @@ public class CrossService : ICross
         }
 
         // ── Parse error encoding ──
-        // v5.0.0: XOR patch (Zstd-compressed raw buffer, base ^ original)
+        // v5.2.0: varint(skip) + byte(xor) pairs (Zstd-19 compressed)
+        // v5.1.0: uint32(skip) + byte(xor) pairs (Zstd-19 compressed)
+        // v5.0.0: flat XOR patch (Zstd-9 compressed)
         // v3.1.0: RLE runs (Zstd-compressed), older: raw RLE
         byte[] errorBytes;
         bool isXorPatch = (header.Version == "v5.0.0");
+        bool isSkipXorPatch = (header.Version == "v5.1.0");
+        bool isRunXorPatch = (header.Version == "v5.2.0");
         (int startPos, int runLength, short diffValue)[]? patches = null;
 
-        if (header.Version == "v3.1.0" || header.Version == "v5.0.0")
+        if (header.Version == "v3.1.0" || header.Version == "v5.0.0" || header.Version == "v5.1.0" || header.Version == "v5.2.0")
         {
             using var decompressor = new Decompressor();
             errorBytes = decompressor.Unwrap(
@@ -2817,7 +2856,7 @@ public class CrossService : ICross
             Buffer.BlockCopy(file, errorOffset, errorBytes, 0, header.ErrorLength);
         }
 
-        if (!isXorPatch)
+        if (!isXorPatch && !isSkipXorPatch && !isRunXorPatch)
         {
             using var errorMs = new MemoryStream(errorBytes, writable: false);
             using var reader = new BinaryReader(errorMs, Encoding.UTF8, leaveOpen: true);
@@ -3058,8 +3097,54 @@ public class CrossService : ICross
         }
 
         // ── Apply error encoding ──
-        if (isXorPatch)
+        if (isRunXorPatch)
         {
+            // v5.2.0: varint(skip) + byte(xor) pairs
+            var patchStream = new MemoryStream(errorBytes, writable: false);
+            using var patchReader = new BinaryReader(patchStream);
+            int patchCount = patchReader.ReadInt32();
+            int originalSize = patchReader.ReadInt32();
+            if (originalSize != baseBuffer.Length)
+                throw new InvalidDataException(
+                    $"v5.2.0 originalSize {originalSize} does not match base buffer {baseBuffer.Length}.");
+            int cursor = 0;
+            for (int p = 0; p < patchCount; p++)
+            {
+                uint skip = ReadVarint(patchStream);
+                byte xorByte = (byte)patchStream.ReadByte();
+                cursor += (int)skip;
+                if (cursor < 0 || cursor >= baseBuffer.Length)
+                    throw new InvalidDataException(
+                        $"v5.2.0 patch {p}/{patchCount}: cursor {cursor} out of range (buffer {baseBuffer.Length}, skip {skip}).");
+                baseBuffer[cursor] ^= xorByte;
+                cursor++;
+            }
+        }
+        else if (isSkipXorPatch)
+        {
+            // v5.1.0: (skip, xor_byte) pairs — walk the base buffer in-place
+            using var patchReader = new BinaryReader(new MemoryStream(errorBytes, writable: false));
+            int patchCount = patchReader.ReadInt32();
+            int originalSize = patchReader.ReadInt32();
+            if (originalSize != baseBuffer.Length)
+                throw new InvalidDataException(
+                    $"v5.1.0 originalSize {originalSize} does not match base buffer {baseBuffer.Length}.");
+            int cursor = 0;
+            for (int p = 0; p < patchCount; p++)
+            {
+                uint skip = patchReader.ReadUInt32();
+                byte xorByte = patchReader.ReadByte();
+                cursor += (int)skip;
+                if (cursor < 0 || cursor >= baseBuffer.Length)
+                    throw new InvalidDataException(
+                        $"v5.1.0 patch cursor {cursor} out of range (buffer size {baseBuffer.Length}, patch {p}/{patchCount}, skip {skip}).");
+                baseBuffer[cursor] ^= xorByte;
+                cursor++;
+            }
+        }
+        else if (isXorPatch)
+        {
+            // v5.0.0: flat XOR buffer
             if (errorBytes.Length != baseBuffer.Length)
                 throw new InvalidDataException(
                     $"XOR patch size {errorBytes.Length} does not match base buffer {baseBuffer.Length}.");
@@ -3068,6 +3153,7 @@ public class CrossService : ICross
         }
         else
         {
+            // v3.x: arithmetic RLE patches
             int cursor = 0;
             foreach (var (startPos, runLength, diffValue) in patches!)
             {
@@ -3137,7 +3223,7 @@ public class CrossService : ICross
 
         applySw.Stop();
         Observability.RecordStage("ApplyPatchAndEgress", applySw.Elapsed.TotalMilliseconds,
-            ("chunk_count", chunkCount), ("patches", patches.Length));
+            ("chunk_count", chunkCount), ("patches", patches?.Length ?? 0));
 
         return result;
     }

@@ -23,7 +23,7 @@ public static class Globals
     /// threshold which operates in LSH vector space. The two can diverge significantly.
     /// </summary>
     public static float BloatGuardThreshold =
-        float.TryParse(Environment.GetEnvironmentVariable("BLOAT_GUARD_THRESHOLD"), out var bgt) ? bgt : 0.60f;
+        float.TryParse(Environment.GetEnvironmentVariable("BLOAT_GUARD_THRESHOLD"), out var bgt) ? bgt : 0.40f;
 
     /// <summary>
     /// Bloat guard threshold for clustered non-representative chunks. These chunks
