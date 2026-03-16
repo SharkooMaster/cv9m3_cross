@@ -381,7 +381,7 @@ public class CrossService : ICross
     }
 
     // Local/in-process helper: returns compressed bytes plus per-file reference stats
-    public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks, long DatacenterBytesStored)> CompressFileWithStats(byte[] _file, float maxErrorRate = 0f)
+    public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks, long DatacenterBytesStored, float AverageErrorRate, long ErrorPayloadBytes)> CompressFileWithStats(byte[] _file, float maxErrorRate = 0f)
     {
         float bloatThreshold = maxErrorRate > 0f && maxErrorRate <= 1f
             ? maxErrorRate
@@ -1260,6 +1260,7 @@ public class CrossService : ICross
         int diffCount = 0;
         int emptyDiffCount = 0;
         int zeroRefCount = 0;
+        float averageErrorRate = 0f;
         var bloatedDiffRestore = new List<int>();
         {
             using var stage = Observability.StartStage("DiffEncode");
@@ -1404,6 +1405,17 @@ public class CrossService : ICross
             // for non-reps before ejecting.
             int maxAllowedRegular = (int)(Globals.chunkSize * bloatThreshold);
             int maxAllowedCluster = (int)(Globals.chunkSize * Globals.ClusterBloatGuardThreshold);
+
+            long totalDifferingBytes = 0;
+            int reusedChunkWithDiffsCount = 0;
+            int[] errorRateHistogram = new int[10]; // 0-10%, 10-20%, ..., 90-100%
+
+            // Multi-reference overlap diagnostic accumulators
+            long mrefTotalErrorsBest = 0;
+            long mrefTotalErrorsBoth = 0;
+            long mrefTotalFixedBySecond = 0;
+            int mrefChunksWithTwoCandidates = 0;
+
             for (int i = 0; i < sorted.Length; i++)
             {
                 if (sorted[i].BucketId == 0 && sorted[i].BucketKey == 0)
@@ -1447,15 +1459,86 @@ public class CrossService : ICross
                 }
                 else
                 {
-                    if (differingByteCount == 0) emptyDiffCount++;
-                    else diffCount++;
+                    if (differingByteCount == 0)
+                    {
+                        emptyDiffCount++;
+                    }
+                    else
+                    {
+                        diffCount++;
+                        totalDifferingBytes += differingByteCount;
+                        reusedChunkWithDiffsCount++;
+                        int bucket = Math.Min(9, (int)(10.0 * differingByteCount / Globals.chunkSize));
+                        errorRateHistogram[bucket]++;
+                    }
+
+                    // Multi-reference overlap: compare best match vs second-best candidate
+                    if (mosaicCandidates.TryGetValue(i, out var candidates) && candidates.Count >= 2)
+                    {
+                        byte[]? secondBest = null;
+                        float secondBestSim = -1f;
+                        lock (candidates)
+                        {
+                            foreach (var cand in candidates)
+                            {
+                                if (cand.Chunk == null || cand.Chunk.Length == 0) continue;
+                                bool isSameAsBest = cand.StorageGuid == sorted[i].StorageGuid
+                                    && cand.BucketId == sorted[i].BucketId;
+                                if (isSameAsBest) continue;
+                                if (cand.Similarity > secondBestSim)
+                                {
+                                    secondBestSim = cand.Similarity;
+                                    secondBest = cand.Chunk.ToByteArray();
+                                }
+                            }
+                        }
+
+                        if (secondBest != null && secondBest.Length >= Globals.chunkSize)
+                        {
+                            int errBest = 0, errSecond = 0, errBoth = 0;
+                            for (int j = 0; j < Globals.chunkSize; j++)
+                            {
+                                bool bestDiffers = fileChunks[i][j] != baseChunk[j];
+                                bool secondDiffers = fileChunks[i][j] != secondBest[j];
+                                if (bestDiffers) errBest++;
+                                if (secondDiffers) errSecond++;
+                                if (bestDiffers && secondDiffers) errBoth++;
+                            }
+                            mrefTotalErrorsBest += errBest;
+                            mrefTotalErrorsBoth += errBoth;
+                            mrefTotalFixedBySecond += (errBest - errBoth);
+                            mrefChunksWithTwoCandidates++;
+                        }
+                    }
                 }
             }
             phaseSw.Stop();
-            Console.WriteLine($"[Compress] DiffEncode: {phaseSw.ElapsedMilliseconds}ms, empty={emptyDiffCount}, diffs={diffCount}, zeroRef={zeroRefCount}, bloated={bloatedDiffRestore.Count}");
+
+            averageErrorRate = reusedChunkWithDiffsCount > 0
+                ? (float)totalDifferingBytes / ((long)reusedChunkWithDiffsCount * Globals.chunkSize)
+                : 0f;
+            string histStr = string.Join(",", errorRateHistogram.Select(h =>
+                reusedChunkWithDiffsCount > 0 ? $"{100.0 * h / reusedChunkWithDiffsCount:F0}%" : "0%"));
+
+            Console.WriteLine($"[Compress] DiffEncode: {phaseSw.ElapsedMilliseconds}ms, empty={emptyDiffCount}, diffs={diffCount}, zeroRef={zeroRefCount}, bloated={bloatedDiffRestore.Count}, avgErrorRate={averageErrorRate:P1}, errorDist=[{histStr}]");
             Observability.RecordStage("DiffEncode", phaseSw.Elapsed.TotalMilliseconds,
                 ("chunk_count", sorted.Length), ("empty_diff", emptyDiffCount), ("non_empty_diff", diffCount),
                 ("zero_ref", zeroRefCount), ("bloated_restore", bloatedDiffRestore.Count));
+
+            if (mrefChunksWithTwoCandidates > 0)
+            {
+                double mrefAvgErrBest = 100.0 * mrefTotalErrorsBest / ((long)mrefChunksWithTwoCandidates * Globals.chunkSize);
+                double mrefAvgOverlap = 100.0 * mrefTotalErrorsBoth / ((long)mrefChunksWithTwoCandidates * Globals.chunkSize);
+                double mrefAvgFixed = mrefTotalErrorsBest > 0 ? 100.0 * mrefTotalFixedBySecond / mrefTotalErrorsBest : 0;
+                double mrefCombinedErr = 100.0 * mrefTotalErrorsBoth / ((long)mrefChunksWithTwoCandidates * Globals.chunkSize);
+                Console.WriteLine($"[Compress] MultiRefPotential: chunks_with_2_candidates={mrefChunksWithTwoCandidates}, " +
+                    $"avgErrorBest={mrefAvgErrBest:F1}%, avgOverlap={mrefAvgOverlap:F1}%, " +
+                    $"avgFixedBySecond={mrefAvgFixed:F1}%, theoreticalCombinedError={mrefCombinedErr:F1}%");
+            }
+            else
+            {
+                Console.WriteLine("[Compress] MultiRefPotential: no chunks with 2+ candidates available for overlap analysis");
+            }
         }
 
         // ── MOSAIC FALLBACK for bloat-rejected chunks ──
@@ -1976,7 +2059,8 @@ public class CrossService : ICross
         Console.WriteLine($"[Compress] Stats: initialLshMatches={initialMatches}, actualDedup={referencesFound}, " +
             $"stored={storedChunks}, totalChunks={totalChunks}, " +
             $"clusteredNonReps={clusteredNonReps}, ejectedByBloat={ejectedByBloat}, " +
-            $"rawStoredBytes={rawStoredBytes}, datacenterBytesZstd={datacenterBytesStored}");
+            $"rawStoredBytes={rawStoredBytes}, datacenterBytesZstd={datacenterBytesStored}, " +
+            $"avgErrorRate={averageErrorRate:P1}");
 
         // v5.0.0: references are built by BuildV5References (ref table + compact indices)
 
@@ -2108,7 +2192,7 @@ public class CrossService : ICross
             Console.WriteLine($"[Compress] DONE: {totalSw.ElapsedMilliseconds}ms total, in={_file.Length} out={toReturn.Length} ratio={toReturn.Length/(double)_file.Length:F3}, dedup={referencesFound}, lshMatches={initialMatches}, stored={storedForLog}");
         }
 
-        return (toReturn, referencesFound, totalChunks, datacenterBytesStored);
+        return (toReturn, referencesFound, totalChunks, datacenterBytesStored, averageErrorRate, errorDictionaryBytes.Length);
     }
 
     public async Task<byte[]> CompressFile(byte[] _file)
@@ -2223,7 +2307,7 @@ public class CrossService : ICross
 
             Console.WriteLine($"[CompressWindowed] Block {block + 1}/{blockCount}: {totalRead} bytes");
 
-            var (compressedBlock, refs, chunks, _) = await CompressFileWithStats(windowData);
+            var (compressedBlock, refs, chunks, _, _, _) = await CompressFileWithStats(windowData);
             totalRefs += refs;
             totalChunks += chunks;
 
@@ -2367,7 +2451,7 @@ public class CrossService : ICross
             Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: {totalRead} bytes (total read: {totalReadSoFar}/{originalFileSize})");
 
             // Compress this window using the existing v3.0.0 pipeline (unchanged!)
-            var (compressedBlock, refs, chunks, _) = await CompressFileWithStats(windowData);
+            var (compressedBlock, refs, chunks, _, _, _) = await CompressFileWithStats(windowData);
             totalRefs += refs;
             totalChunks += chunks;
 

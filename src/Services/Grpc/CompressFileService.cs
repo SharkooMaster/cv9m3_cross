@@ -545,7 +545,7 @@ public class CompressFileService : FileService.FileServiceBase
             throw new RpcException(new Status(StatusCode.InvalidArgument, "SHA-256 mismatch for uploaded file."));
 
         // ── Wait for pipeline to finish writing all compressed blocks ──
-        var (compressedSize, refsFound, totalChunks, dcBytesStored, serverProcessingMs) = await pipelineTask;
+        var (compressedSize, refsFound, totalChunks, dcBytesStored, serverProcessingMs, avgErrorRate, errorPayloadBytes) = await pipelineTask;
 
         // ── Write SHA256 trailer (hash of original file, computed in receive loop) ──
         await grpcStream.WriteAsync(uploadedSha256, 0, 32, context.CancellationToken);
@@ -563,7 +563,9 @@ public class CompressFileService : FileService.FileServiceBase
                 TotalChunks = (uint)Math.Max(0, totalChunks),
                 CompressedSha256 = ByteString.CopyFrom(uploadedSha256),
                 DatacenterBytesStored = (ulong)Math.Max(0, dcBytesStored),
-                ServerProcessingMs = serverProcessingMs
+                ServerProcessingMs = serverProcessingMs,
+                AverageErrorRate = avgErrorRate,
+                ErrorPayloadBytes = (ulong)Math.Max(0, errorPayloadBytes)
             }
         });
         await responseStream.WriteAsync(new FileUploadResponse
@@ -578,7 +580,7 @@ public class CompressFileService : FileService.FileServiceBase
     /// Parallel compression pipeline: N workers compress windows, writer outputs in order.
     /// Writes v4.0.0 header + blocks (NOT trailer — caller writes that).
     /// </summary>
-    private static async Task<(long CompressedSize, int TotalRefs, int TotalChunks, long DatacenterBytes, double ServerProcessingMs)> RunCompressionPipeline(
+    private static async Task<(long CompressedSize, int TotalRefs, int TotalChunks, long DatacenterBytes, double ServerProcessingMs, float AverageErrorRate, long ErrorPayloadBytes)> RunCompressionPipeline(
         ChannelReader<(int Index, byte[] Data)> reader,
         GrpcResponseStream grpcStream,
         long declaredFileSize,
@@ -601,6 +603,9 @@ public class CompressFileService : FileService.FileServiceBase
         int totalRefs = 0, totalChunks = 0;
         long totalDatacenterBytes = 0;
         long totalCompressionTicks = 0;
+        long totalErrorPayloadBytes = 0;
+        double weightedErrorRateSum = 0;
+        long weightedErrorRateDenom = 0;
 
         // Completed blocks waiting to be written in order
         var completedBlocks = new ConcurrentDictionary<int, (byte[] Compressed, int OriginalLen)>();
@@ -619,7 +624,7 @@ public class CompressFileService : FileService.FileServiceBase
                     {
                         Console.WriteLine($"[Pipeline] Compressing block {item.Index + 1}/{blockCount} ({item.Data.Length} bytes)...");
                         var sw = System.Diagnostics.Stopwatch.StartNew();
-                        (byte[] compressed, int refs, int chunks, long dcBytes) = await crossService.CompressFileWithStats(item.Data, maxErrorRate);
+                        (byte[] compressed, int refs, int chunks, long dcBytes, float blockAvgErr, long blockErrPayload) = await crossService.CompressFileWithStats(item.Data, maxErrorRate);
                         sw.Stop();
                         Console.WriteLine($"[Pipeline] Block {item.Index + 1}/{blockCount}: {item.Data.Length} → {compressed.Length} ({sw.ElapsedMilliseconds}ms)");
 
@@ -630,6 +635,16 @@ public class CompressFileService : FileService.FileServiceBase
                         Interlocked.Add(ref totalChunks, chunks);
                         Interlocked.Add(ref totalDatacenterBytes, dcBytes);
                         Interlocked.Add(ref totalCompressionTicks, sw.ElapsedTicks);
+                        Interlocked.Add(ref totalErrorPayloadBytes, blockErrPayload);
+                        if (blockAvgErr > 0 && refs > 0)
+                        {
+                            long blockWeight = (long)refs;
+                            lock (completedBlocks)
+                            {
+                                weightedErrorRateSum += blockAvgErr * blockWeight;
+                                weightedErrorRateDenom += blockWeight;
+                            }
+                        }
                         blockReady.Release();
                         GC.Collect(2, GCCollectionMode.Optimized, false);
                     }
@@ -658,7 +673,8 @@ public class CompressFileService : FileService.FileServiceBase
 
         await Task.WhenAll(workers);
         double serverMs = totalCompressionTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-        return (totalCompressedSize, totalRefs, totalChunks, totalDatacenterBytes, serverMs);
+        float avgErrorRate = weightedErrorRateDenom > 0 ? (float)(weightedErrorRateSum / weightedErrorRateDenom) : 0f;
+        return (totalCompressedSize, totalRefs, totalChunks, totalDatacenterBytes, serverMs, avgErrorRate, totalErrorPayloadBytes);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -726,7 +742,7 @@ public class CompressFileService : FileService.FileServiceBase
         byte[] fileBytes = await File.ReadAllBytesAsync(tempPath, context.CancellationToken);
 
         var compressSw = System.Diagnostics.Stopwatch.StartNew();
-        (byte[] compressedBytes, int referencesFound, int totalChunks, long dcBytesStored) = await crossService.CompressFileWithStats(fileBytes, maxErrorRate);
+        (byte[] compressedBytes, int referencesFound, int totalChunks, long dcBytesStored, float avgErrorRate, long errorPayloadBytes) = await crossService.CompressFileWithStats(fileBytes, maxErrorRate);
         compressSw.Stop();
         fileBytes = null!;
 
@@ -745,7 +761,9 @@ public class CompressFileService : FileService.FileServiceBase
                 TotalChunks = (uint)Math.Max(0, totalChunks),
                 CompressedSha256 = ByteString.CopyFrom(compressedHash),
                 DatacenterBytesStored = (ulong)Math.Max(0, dcBytesStored),
-                ServerProcessingMs = compressSw.Elapsed.TotalMilliseconds
+                ServerProcessingMs = compressSw.Elapsed.TotalMilliseconds,
+                AverageErrorRate = avgErrorRate,
+                ErrorPayloadBytes = (ulong)Math.Max(0, errorPayloadBytes)
             }
         });
 

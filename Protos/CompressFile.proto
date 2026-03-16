@@ -68,6 +68,10 @@ message CompressionStats {
   uint64 datacenter_bytes_stored = 6;
   // Pure server-side processing time in milliseconds (excludes network transfer).
   double server_processing_ms = 7;
+  // Average error rate across reused chunks with diffs (0.0–1.0).
+  float average_error_rate = 8;
+  // Total bytes used by error correction payload in the CCF output.
+  uint64 error_payload_bytes = 9;
 }
 
 message Error {
