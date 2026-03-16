@@ -608,7 +608,9 @@ public class CrossService : ICross
                                 {
                                     Index = chunkIdx,
                                     MinimumSimilarity = MIN_THRESH,
-                                    K = isHighEntropy ? Globals.MosaicTopK : 1
+                                    K = Globals.EnableMosaicDedup && isHighEntropy
+                                        ? Math.Max(Globals.SearchTopK, Globals.MosaicTopK)
+                                        : Globals.SearchTopK
                                 };
                                 req.Vector.AddRange(vectors[chunkIdx]);
                                 req.Bitstrings.AddRange(buckets);

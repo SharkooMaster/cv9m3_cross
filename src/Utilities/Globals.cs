@@ -69,6 +69,14 @@ public static class Globals
     public static int MosaicTopK =
         int.TryParse(Environment.GetEnvironmentVariable("MOSAIC_TOP_K"), out var mtk) ? mtk : 10;
 
+    /// <summary>
+    /// Number of top-K candidates to return from Level 1 search. Independent of mosaic.
+    /// Agents return the K most similar chunks per query, enabling multi-reference
+    /// diagnostics and future multi-reference error encoding.
+    /// </summary>
+    public static int SearchTopK =
+        int.TryParse(Environment.GetEnvironmentVariable("SEARCH_TOP_K"), out var stk) ? stk : 10;
+
     public const int MosaicNComponents = 64;
     public static int MosaicSubChunkSize => chunkSize / MosaicNComponents;
 
