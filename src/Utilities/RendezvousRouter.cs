@@ -37,6 +37,37 @@ public static class RendezvousRouter
     private static long _resolvedAtTicks = 0;
 
     /// <summary>
+    /// Force the next GetAgents() call to re-resolve DNS, bypassing the 15s cache.
+    /// Called by AgentHealthWatcher on each health-check tick.
+    /// </summary>
+    public static void ForceRefresh()
+    {
+        Interlocked.Exchange(ref _resolvedAtTicks, 0);
+    }
+
+    /// <summary>
+    /// Resolve the current IP for a given agent IP (re-resolve if stale).
+    /// Used after WaitForAgentAsync to pick up a potentially new IP.
+    /// </summary>
+    public static string ResolveAgentIp(string agentIp)
+    {
+        var mapping = _nodeToIp;
+        foreach (var kv in mapping)
+        {
+            if (kv.Value == agentIp)
+                return kv.Value;
+        }
+        GetAgents();
+        mapping = _nodeToIp;
+        foreach (var kv in mapping)
+        {
+            if (kv.Value == agentIp)
+                return kv.Value;
+        }
+        return agentIp;
+    }
+
+    /// <summary>
     /// Pick the owning agent for a bucket. Returns a pod IP for gRPC connection.
     /// Deterministic: same (bucket, node set) → same agent. Stable across pod restarts.
     /// Zero allocations in hot path — stackalloc + MurmurHash3.

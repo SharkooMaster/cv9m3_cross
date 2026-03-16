@@ -375,6 +375,17 @@ public class CompressFileService : FileService.FileServiceBase
 
             Console.WriteLine($"[ProcessFileStream] metadata: file={fileName}, size={declaredSize}, windowed={willUseWindowed}, concurrency={MaxConcurrentCompressions - _compressionGate.CurrentCount}/{MaxConcurrentCompressions}");
 
+            // ── Agent readiness gate: wait until at least one agent is available ──
+            try
+            {
+                await AgentHealthWatcher.Instance.WaitForFirstAgentAsync(context.CancellationToken);
+            }
+            catch (InvalidOperationException)
+            {
+                Console.WriteLine("[ProcessFileStream] AgentHealthWatcher not yet started, proceeding with warmup discovery");
+                RendezvousRouter.GetAgents();
+            }
+
             // ── Concurrency gate: wait if too many concurrent compressions ──
             await _compressionGate.WaitAsync(context.CancellationToken);
             try

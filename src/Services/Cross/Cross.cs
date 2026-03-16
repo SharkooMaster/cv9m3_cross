@@ -231,6 +231,16 @@ public class CrossService : ICross
         {
             if (mosaicInfos.TryGetValue(i, out var mosaic) && mosaic.Donors.Count > 0)
             {
+                if (mosaic.IsByteMerge && mosaic.Donors.Count == 2)
+                {
+                    // 0x05: byte-level pair merge — 2 donors + per-byte bitmask
+                    bw.Write((byte)0x05);
+                    bw.Write(GetOrAddRef(mosaic.Donors[0].BucketId, mosaic.Donors[0].BucketKey));
+                    bw.Write(GetOrAddRef(mosaic.Donors[1].BucketId, mosaic.Donors[1].BucketKey));
+                    bw.Write(mosaic.ByteMergeBitmask);
+                    continue;
+                }
+
                 bw.Write((byte)0x04);
                 bw.Write((byte)mosaic.Donors.Count);
                 foreach (var (dBucketId, dBucketKey) in mosaic.Donors)
@@ -619,30 +629,30 @@ public class CrossService : ICross
                             }
 
                             BatchSearchVector_Result? batchRes = null;
-                            // Try with generous deadline; retry once on timeout
-                            for (int attempt = 0; attempt < 2 && batchRes == null; attempt++)
+                            var currentAgent = agent;
+                            while (batchRes == null)
                             {
                                 try
                                 {
-                                    int deadlineSec = attempt == 0 ? 30 : 45;
-                                    batchRes = await client.BatchGetAsync(batchReq,
-                                        deadline: DateTime.UtcNow.AddSeconds(deadlineSec));
+                                    var searchClient = GrpcChannelFactory.GetClient(
+                                        target: currentAgent,
+                                        ctor: chan => new SearchVector.SearchVectorClient(chan),
+                                        roundRobin: false, port: 5000);
+                                    batchRes = await searchClient.BatchGetAsync(batchReq,
+                                        deadline: DateTime.UtcNow.AddSeconds(30));
                                 }
-                                catch (global::Grpc.Core.RpcException rpcEx) when (rpcEx.StatusCode == global::Grpc.Core.StatusCode.DeadlineExceeded)
+                                catch (Exception searchEx)
                                 {
-                                    if (attempt == 0)
+                                    Console.WriteLine($"[Compress] BatchGet to {currentAgent} failed: {searchEx.Message}, waiting for recovery...");
+                                    try
                                     {
-                                        Console.WriteLine($"[Compress] BatchGet to {agent} deadline ({batchReq.Queries.Count} queries), retrying...");
-                                        await Task.Delay(500);
+                                        await AgentHealthWatcher.Instance.WaitForAgentAsync(currentAgent, CancellationToken.None);
                                     }
-                                    else
-                                    {
-                                        Console.WriteLine($"[Compress] BatchGet to {agent} deadline on retry, skipping batch");
-                                    }
+                                    catch (OperationCanceledException) { return; }
+                                    currentAgent = RendezvousRouter.ResolveAgentIp(currentAgent);
+                                    Console.WriteLine($"[Compress] Agent recovered (now {currentAgent}), retrying BatchGet...");
                                 }
                             }
-
-                            if (batchRes == null) return; // skip this batch — agent overloaded
 
                             // Map results — only update sorted[idx] if this agent found a BETTER match
                             for (int j = 0; j < indexMap.Count && j < batchRes!.Results.Count; j++)
@@ -710,10 +720,10 @@ public class CrossService : ICross
                                 }
                             }
                         }
+                        catch (OperationCanceledException) { }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"[Compress] BatchGet to {agent} failed: {ex.Message}");
-                            // Don't mark as need-to-store here — other agents may have matches
+                            Console.WriteLine($"[Compress] BatchGet to {agent} unexpected error: {ex.Message}");
                         }
                     }));
                 }
@@ -768,11 +778,167 @@ public class CrossService : ICross
         allBuckets = null!;
         agentChunkBuckets = null!;
 
+        var mosaicInfos = new ConcurrentDictionary<int, MosaicChunkInfo>();
+
+        // ── SMART REFERENCE SELECTION + PAIR MERGE ──
+        // For each chunk with Top-K candidates, find the single candidate with the fewest
+        // byte-level differences. Then try all C(K,2) pairs: merge two candidates byte-by-byte
+        // (picking the byte that matches the original at each position) and keep the pair
+        // that produces fewer residual errors than the best single candidate.
+        if (mosaicCandidates.Count > 0)
+        {
+            phaseSw.Restart();
+            int smartUpgraded = 0;
+            int pairMerged = 0;
+            int totalCandidatesEvaluated = 0;
+            int cs = Globals.chunkSize;
+            int bitmaskLen = (cs + 7) / 8;
+
+            Parallel.ForEach(mosaicCandidates, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, kv =>
+            {
+                int idx = kv.Key;
+                var candidates = kv.Value;
+                if (candidates == null || candidates.Count == 0) return;
+                if (!chunkMap.TryGetValue(idx, out var original) || original == null) return;
+
+                // Pre-convert candidate chunks to byte arrays (filter to valid-length chunks)
+                var candBytes = new List<(byte[] chunk, SearchVectorObject svo)>();
+                lock (candidates)
+                {
+                    foreach (var c in candidates)
+                    {
+                        if (c.Chunk != null && c.Chunk.Length >= cs)
+                            candBytes.Add((c.Chunk.ToByteArray(), c));
+                    }
+                }
+                if (candBytes.Count == 0) return;
+                Interlocked.Add(ref totalCandidatesEvaluated, candBytes.Count);
+
+                // Current best: whatever the cosine-sim search picked
+                byte[]? currentBase = sorted[idx]?.Chunk != null && sorted[idx]!.Chunk.Length >= cs
+                    ? sorted[idx]!.Chunk.ToByteArray()
+                    : null;
+                int currentDiffs = currentBase != null ? CountDiffs(original, currentBase, cs) : cs;
+
+                // Stage 1: find the single candidate with fewest byte differences
+                int bestSingleDiffs = currentDiffs;
+                int bestSingleIdx = -1;
+                for (int c = 0; c < candBytes.Count; c++)
+                {
+                    int diffs = CountDiffs(original, candBytes[c].chunk, cs);
+                    if (diffs < bestSingleDiffs)
+                    {
+                        bestSingleDiffs = diffs;
+                        bestSingleIdx = c;
+                    }
+                }
+
+                // Stage 2: try all pairs, build merged chunk picking the matching byte at each position
+                int bestPairDiffs = bestSingleDiffs;
+                int bestPairA = -1, bestPairB = -1;
+                for (int a = 0; a < candBytes.Count; a++)
+                {
+                    for (int b = a + 1; b < candBytes.Count; b++)
+                    {
+                        int remaining = 0;
+                        byte[] ca = candBytes[a].chunk, cb = candBytes[b].chunk;
+                        for (int j = 0; j < cs; j++)
+                        {
+                            if (ca[j] != original[j] && cb[j] != original[j])
+                                remaining++;
+                        }
+                        if (remaining < bestPairDiffs)
+                        {
+                            bestPairDiffs = remaining;
+                            bestPairA = a;
+                            bestPairB = b;
+                        }
+                    }
+                }
+
+                // Decision: use pair merge, single upgrade, or keep current
+                if (bestPairA >= 0 && bestPairDiffs < bestSingleDiffs)
+                {
+                    // Pair merge wins — build merged base + bitmask
+                    byte[] chunkA = candBytes[bestPairA].chunk;
+                    byte[] chunkB = candBytes[bestPairB].chunk;
+                    byte[] merged = new byte[cs];
+                    byte[] bitmask = new byte[bitmaskLen];
+                    for (int j = 0; j < cs; j++)
+                    {
+                        if (chunkA[j] == original[j])
+                        {
+                            merged[j] = chunkA[j];
+                        }
+                        else if (chunkB[j] == original[j])
+                        {
+                            merged[j] = chunkB[j];
+                            bitmask[j >> 3] |= (byte)(1 << (j & 7));
+                        }
+                        else
+                        {
+                            merged[j] = chunkA[j]; // neither matches, default to A
+                        }
+                    }
+
+                    var svoA = candBytes[bestPairA].svo;
+                    var svoB = candBytes[bestPairB].svo;
+                    var info = new MosaicChunkInfo
+                    {
+                        IsByteMerge = true,
+                        ByteMergeBitmask = bitmask,
+                        StitchedBase = merged,
+                        Donors = new List<(ulong BucketId, ulong BucketKey)>
+                        {
+                            (svoA.BucketId, (ulong)svoA.BucketKey),
+                            (svoB.BucketId, (ulong)svoB.BucketKey)
+                        }
+                    };
+                    mosaicInfos[idx] = info;
+                    sorted[idx]!.NeedToStore = false;
+                    sorted[idx]!.Chunk = ByteString.CopyFrom(merged);
+                    Interlocked.Increment(ref pairMerged);
+                }
+                else if (bestSingleIdx >= 0 && bestSingleDiffs < currentDiffs)
+                {
+                    // Single byte-best upgrade
+                    var best = candBytes[bestSingleIdx].svo;
+                    sorted[idx] = new QueryResponseObject
+                    {
+                        BucketId = best.BucketId,
+                        BucketKey = (ulong)best.BucketKey,
+                        Similarity = best.Similarity,
+                        Chunk = best.Chunk,
+                        Index = idx,
+                        Duplicate = true,
+                        NeedToStore = false,
+                        TargetAgent = sorted[idx]?.TargetAgent ?? "",
+                        StorageGuid = best.StorageGuid ?? ""
+                    };
+                    Interlocked.Increment(ref smartUpgraded);
+                }
+            });
+
+            phaseSw.Stop();
+            Console.WriteLine($"[Compress] SmartRefSelect: {phaseSw.ElapsedMilliseconds}ms, " +
+                $"evaluated={totalCandidatesEvaluated} candidates across {mosaicCandidates.Count} chunks, " +
+                $"singleUpgrades={smartUpgraded}, pairMerges={pairMerged}");
+        }
+
+        static int CountDiffs(byte[] a, byte[] b, int len)
+        {
+            int diffs = 0;
+            for (int i = 0; i < len; i++)
+            {
+                if (a[i] != b[i]) diffs++;
+            }
+            return diffs;
+        }
+
         // ── LEVEL 2 MOSAIC ASSEMBLY ──
         // For high-entropy chunks that failed Level 1 (NeedToStore=true + have mosaic candidates),
         // stitch a base chunk from donor sub-regions. The mosaic base replaces ByteString.Empty so
         // error encoding produces a smaller diff.
-        var mosaicInfos = new ConcurrentDictionary<int, MosaicChunkInfo>();
         if (Globals.EnableMosaicDedup && mosaicCandidates.Count > 0)
         {
             var swMosaic = Stopwatch.StartNew();
@@ -1126,59 +1292,25 @@ public class CrossService : ICross
                                 batchReq.Items.Add(req);
                             }
 
-                            try
+                            var storeAgent = agent;
+                            bool stored = false;
+                            while (!stored)
                             {
-                                var client = GrpcChannelFactory.GetClient(
-                                    target: agent,
-                                    ctor: chan => new StoreVector.StoreVectorClient(chan),
-                                    roundRobin: false, port: 5000);
-
-                                var batchRes = await client.BatchStoreAsync(batchReq,
-                                    deadline: DateTime.UtcNow.AddSeconds(30));
-
-                                int freshlyStored = 0;
-                                int dedupedAtStore = 0;
-                                for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
-                                {
-                                    var storeRes = batchRes.Results[j];
-                                    batchItems[j].response.BucketId = storeRes.Id;
-                                    batchItems[j].response.BucketKey = storeRes.Index;
-                                    batchItems[j].response.StorageGuid = storeRes.StorageGuid ?? "";
-
-                                    if (storeRes.WasDeduplicated)
-                                    {
-                                        batchItems[j].response.NeedToStore = false;
-                                        batchItems[j].response.Duplicate = true;
-                                        batchItems[j].response.Similarity = storeRes.Similarity;
-                                        if (storeRes.BaseChunk != null && storeRes.BaseChunk.Length > 0)
-                                            batchItems[j].response.Chunk = storeRes.BaseChunk;
-                                        dedupedAtStore++;
-                                    }
-                                    else
-                                    {
-                                        freshlyStored++;
-                                    }
-                                }
-                                Interlocked.Add(ref totalStored, freshlyStored);
-                                if (dedupedAtStore > 0)
-                                    Console.WriteLine($"[Compress] Store-time dedup on {agent}: {dedupedAtStore} chunks matched existing entries");
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"[Compress] BatchStore to {agent} failed: {ex.Message}, retrying SAME agent...");
                                 try
                                 {
-                                    await Task.Delay(500);
-                                    var retryClient = GrpcChannelFactory.GetClient(
-                                        target: agent,
+                                    var storeClient = GrpcChannelFactory.GetClient(
+                                        target: storeAgent,
                                         ctor: chan => new StoreVector.StoreVectorClient(chan),
                                         roundRobin: false, port: 5000);
-                                    var retryRes = await retryClient.BatchStoreAsync(batchReq,
+
+                                    var batchRes = await storeClient.BatchStoreAsync(batchReq,
                                         deadline: DateTime.UtcNow.AddSeconds(30));
+
                                     int freshlyStored = 0;
-                                    for (int j = 0; j < batchItems.Count && j < retryRes.Results.Count; j++)
+                                    int dedupedAtStore = 0;
+                                    for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
                                     {
-                                        var storeRes = retryRes.Results[j];
+                                        var storeRes = batchRes.Results[j];
                                         batchItems[j].response.BucketId = storeRes.Id;
                                         batchItems[j].response.BucketKey = storeRes.Index;
                                         batchItems[j].response.StorageGuid = storeRes.StorageGuid ?? "";
@@ -1190,6 +1322,7 @@ public class CrossService : ICross
                                             batchItems[j].response.Similarity = storeRes.Similarity;
                                             if (storeRes.BaseChunk != null && storeRes.BaseChunk.Length > 0)
                                                 batchItems[j].response.Chunk = storeRes.BaseChunk;
+                                            dedupedAtStore++;
                                         }
                                         else
                                         {
@@ -1197,13 +1330,20 @@ public class CrossService : ICross
                                         }
                                     }
                                     Interlocked.Add(ref totalStored, freshlyStored);
-                                    Console.WriteLine($"[Compress] Retry store to {agent} OK for {batchItems.Count} chunks");
+                                    if (dedupedAtStore > 0)
+                                        Console.WriteLine($"[Compress] Store-time dedup on {storeAgent}: {dedupedAtStore} chunks matched existing entries");
+                                    stored = true;
                                 }
-                                catch (Exception retryEx)
+                                catch (Exception storeEx)
                                 {
-                                    Console.WriteLine($"[Compress] Retry store to {agent} also failed: {retryEx.Message}");
-                                    foreach (var item in batchItems)
-                                    { item.response.BucketId = 0; item.response.BucketKey = 0; item.response.StorageGuid = ""; item.response.Chunk = ByteString.Empty; }
+                                    Console.WriteLine($"[Compress] BatchStore to {storeAgent} failed: {storeEx.Message}, waiting for recovery...");
+                                    try
+                                    {
+                                        await AgentHealthWatcher.Instance.WaitForAgentAsync(storeAgent, CancellationToken.None);
+                                    }
+                                    catch (OperationCanceledException) { return; }
+                                    storeAgent = RendezvousRouter.ResolveAgentIp(storeAgent);
+                                    Console.WriteLine($"[Compress] Agent recovered (now {storeAgent}), retrying BatchStore...");
                                 }
                             }
                         }));
@@ -1911,48 +2051,23 @@ public class CrossService : ICross
                             batchReq.Items.Add(req);
                         }
 
-                        try
+                        var reStoreAgent = agent;
+                        bool reStored = false;
+                        while (!reStored)
                         {
-                            var client = GrpcChannelFactory.GetClient(
-                                target: agent,
-                                ctor: chan => new StoreVector.StoreVectorClient(chan),
-                                roundRobin: false, port: 5000);
-
-                            var batchRes = await client.BatchStoreAsync(batchReq,
-                                deadline: DateTime.UtcNow.AddSeconds(30));
-
-                            for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
-                            {
-                                var storeRes = batchRes.Results[j];
-                                batchItems[j].response.BucketId = storeRes.Id;
-                                batchItems[j].response.BucketKey = storeRes.Index;
-                                batchItems[j].response.StorageGuid = storeRes.StorageGuid ?? "";
-
-                                if (storeRes.WasDeduplicated)
-                                {
-                                    batchItems[j].response.NeedToStore = false;
-                                    batchItems[j].response.Duplicate = true;
-                                    batchItems[j].response.Similarity = storeRes.Similarity;
-                                    if (storeRes.BaseChunk != null && storeRes.BaseChunk.Length > 0)
-                                        batchItems[j].response.Chunk = storeRes.BaseChunk;
-                                }
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"[Compress] Re-store to {agent} failed: {ex.Message}, retrying SAME agent...");
                             try
                             {
-                                await Task.Delay(500);
-                                var retryClient = GrpcChannelFactory.GetClient(
-                                    target: agent,
+                                var reStoreClient = GrpcChannelFactory.GetClient(
+                                    target: reStoreAgent,
                                     ctor: chan => new StoreVector.StoreVectorClient(chan),
                                     roundRobin: false, port: 5000);
-                                var retryRes = await retryClient.BatchStoreAsync(batchReq,
+
+                                var batchRes = await reStoreClient.BatchStoreAsync(batchReq,
                                     deadline: DateTime.UtcNow.AddSeconds(30));
-                                for (int j = 0; j < batchItems.Count && j < retryRes.Results.Count; j++)
+
+                                for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
                                 {
-                                    var storeRes = retryRes.Results[j];
+                                    var storeRes = batchRes.Results[j];
                                     batchItems[j].response.BucketId = storeRes.Id;
                                     batchItems[j].response.BucketKey = storeRes.Index;
                                     batchItems[j].response.StorageGuid = storeRes.StorageGuid ?? "";
@@ -1966,16 +2081,18 @@ public class CrossService : ICross
                                             batchItems[j].response.Chunk = storeRes.BaseChunk;
                                     }
                                 }
-                                Console.WriteLine($"[Compress] Retry re-store to {agent} OK for {batchItems.Count} chunks");
+                                reStored = true;
                             }
-                            catch (Exception retryEx)
+                            catch (Exception reStoreEx)
                             {
-                                Console.WriteLine(
-                                    $"[Compress] WARN: Bloat re-store FAILED for {batchItems.Count} chunks on agent {agent} " +
-                                    $"after 2 attempts: {retryEx.Message}. " +
-                                    $"Chunks will use zero-ref (full diff encoding) — output file will be larger than optimal.");
-                                foreach (var item in batchItems)
-                                { item.response.BucketId = 0; item.response.BucketKey = 0; item.response.StorageGuid = ""; item.response.Chunk = ByteString.Empty; }
+                                Console.WriteLine($"[Compress] Re-store to {reStoreAgent} failed: {reStoreEx.Message}, waiting for recovery...");
+                                try
+                                {
+                                    await AgentHealthWatcher.Instance.WaitForAgentAsync(reStoreAgent, CancellationToken.None);
+                                }
+                                catch (OperationCanceledException) { return; }
+                                reStoreAgent = RendezvousRouter.ResolveAgentIp(reStoreAgent);
+                                Console.WriteLine($"[Compress] Agent recovered (now {reStoreAgent}), retrying re-store...");
                             }
                         }
                     }));
@@ -2713,6 +2830,8 @@ public class CrossService : ICross
         // Mosaic metadata for 0x03/0x04 refs (populated during parsing, used during fetch)
         // BucketIndex is used by v5 (fetched via GetChunkByReferenceAsync); v3.x sets it to 0 and uses StorageGuid instead.
         var mosaicRefs = new Dictionary<int, (List<(ulong BucketId, string StorageGuid, ulong BucketIndex)> Donors, ulong MatchBitmap, byte[] Selectors, byte[]? DonorPositions)>();
+        // Byte-merge metadata for 0x05 refs (pair merge with per-byte bitmask)
+        var byteMergeRefs = new Dictionary<int, (List<(ulong BucketId, string StorageGuid, ulong BucketIndex)> Donors, byte[] Bitmask)>();
 
         if (header.Version == "v5.0.0" || header.Version == "v5.1.0" || header.Version == "v5.2.0" || header.Version == "v5.3.0")
         {
@@ -2785,6 +2904,29 @@ public class CrossService : ICross
 
                         mosaicRefs[i] = (donors, matchBitmap, selectors, donorPositions);
                         refBucketIds[i] = ulong.MaxValue;
+                        refStorageGuids[i] = "";
+                        break;
+                    }
+                    case 0x05:
+                    {
+                        // Byte-level pair merge: 2 donor refs + per-byte bitmask
+                        int bitmaskLen = (Globals.chunkSize + 7) / 8;
+                        var donors = new List<(ulong BucketId, string StorageGuid, ulong BucketIndex)>(2);
+                        for (int d = 0; d < 2; d++)
+                        {
+                            ushort tableIdx = BitConverter.ToUInt16(file, off);
+                            off += sizeof(ushort);
+                            if (tableIdx >= refTableSize)
+                                throw new InvalidDataException($"v5 byte-merge donor table index {tableIdx} out of range");
+                            donors.Add((refTable[tableIdx].BucketId, "", refTable[tableIdx].BucketIndex));
+                        }
+                        var byteMergeBitmask = new byte[bitmaskLen];
+                        Buffer.BlockCopy(file, off, byteMergeBitmask, 0, bitmaskLen);
+                        off += bitmaskLen;
+
+                        byteMergeRefs[i] = (donors, byteMergeBitmask);
+                        refBucketIds[i] = ulong.MaxValue;
+                        refBucketIndices[i] = ulong.MaxValue;
                         refStorageGuids[i] = "";
                         break;
                     }
@@ -2889,6 +3031,31 @@ public class CrossService : ICross
                         off += 64;
 
                         mosaicRefs[i] = (donors, matchBitmap, selectors, donorPositions);
+                        refBucketIds[i] = ulong.MaxValue;
+                        refStorageGuids[i] = "";
+                        break;
+                    }
+                    case 0x05: // byte-level pair merge (v3.x inline format)
+                    {
+                        int bitmaskLen = (Globals.chunkSize + 7) / 8;
+                        var donors = new List<(ulong BucketId, string StorageGuid, ulong BucketIndex)>(2);
+                        for (int d = 0; d < 2; d++)
+                        {
+                            ulong dBucketId = BitConverter.ToUInt64(file, off);
+                            off += sizeof(ulong);
+                            var dGuidRaw = new byte[32];
+                            Buffer.BlockCopy(file, off, dGuidRaw, 0, 32);
+                            off += 32;
+                            bool dAllZero = true;
+                            for (int b = 0; b < 32; b++) { if (dGuidRaw[b] != 0) { dAllZero = false; break; } }
+                            string dGuid = dAllZero ? "" : Convert.ToHexString(dGuidRaw).ToLowerInvariant();
+                            donors.Add((dBucketId, dGuid, 0));
+                        }
+                        var byteMergeBitmask = new byte[bitmaskLen];
+                        Buffer.BlockCopy(file, off, byteMergeBitmask, 0, bitmaskLen);
+                        off += bitmaskLen;
+
+                        byteMergeRefs[i] = (donors, byteMergeBitmask);
                         refBucketIds[i] = ulong.MaxValue;
                         refStorageGuids[i] = "";
                         break;
@@ -3084,6 +3251,48 @@ public class CrossService : ICross
                             Buffer.BlockCopy(donorChunks[donorIdx], srcOffset, stitched, dstOffset, len);
                     }
                     baseChunks[idx] = stitched;
+                    Interlocked.Increment(ref primaryHits);
+                });
+            }
+            else if (byteMergeRefs.ContainsKey(i))
+            {
+                int idx = i;
+                var (bmDonors, bitmask) = byteMergeRefs[idx];
+                fetchTasks[i] = Task.Run(async () =>
+                {
+                    int chSize = Globals.chunkSize;
+                    var donorChunks = new byte[2][];
+                    var donorFetches = new Task[2];
+                    for (int d = 0; d < 2; d++)
+                    {
+                        int dIdx = d;
+                        var (dBucketId, dGuid, dBucketIdx) = bmDonors[dIdx];
+                        donorFetches[dIdx] = Task.Run(async () =>
+                        {
+                            string bitstring = UlongToBitstring(dBucketId);
+                            string targetAgent = RendezvousRouter.PickAgent(bitstring);
+                            byte[]? chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(dBucketId, dBucketIdx, targetAgent);
+                            if (chunk == null)
+                            {
+                                for (int retry = 0; retry < 3; retry++)
+                                {
+                                    await Task.Delay(100 * (retry + 1));
+                                    chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(dBucketId, dBucketIdx, targetAgent);
+                                    if (chunk != null) break;
+                                }
+                            }
+                            donorChunks[dIdx] = chunk ?? new byte[chSize];
+                        });
+                    }
+                    await Task.WhenAll(donorFetches);
+
+                    var merged = new byte[chSize];
+                    for (int j = 0; j < chSize; j++)
+                    {
+                        bool useDonorB = (bitmask[j >> 3] & (1 << (j & 7))) != 0;
+                        merged[j] = useDonorB ? donorChunks[1][j] : donorChunks[0][j];
+                    }
+                    baseChunks[idx] = merged;
                     Interlocked.Increment(ref primaryHits);
                 });
             }

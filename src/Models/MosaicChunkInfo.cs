@@ -26,6 +26,16 @@ internal class MosaicChunkInfo
     /// <summary>The assembled mosaic base chunk (chunkSize bytes).</summary>
     public byte[] StitchedBase = Array.Empty<byte>();
 
+    /// <summary>
+    /// True when this entry represents a byte-level pair merge (0x05 ref flag) rather than
+    /// a sub-chunk mosaic (0x04). Donors has exactly 2 entries and ByteMergeBitmask selects
+    /// which donor provides each byte: bit j = 0 → donor 0, bit j = 1 → donor 1.
+    /// </summary>
+    public bool IsByteMerge;
+
+    /// <summary>chunkSize/8 bytes: per-byte selector bitmask for byte-level pair merge.</summary>
+    public byte[] ByteMergeBitmask = Array.Empty<byte>();
+
     public static int GetSelector(byte[] selectors, int elementIndex)
     {
         int byteIdx = elementIndex / 2;

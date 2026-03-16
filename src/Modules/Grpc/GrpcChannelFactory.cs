@@ -176,4 +176,23 @@ public static class GrpcChannelFactory
         });
     }
 
+    /// <summary>
+    /// Remove cached channel and all client stubs for a given target IP.
+    /// Called when an agent's pod IP changes or the agent is removed from topology.
+    /// </summary>
+    public static void EvictChannel(string target, int port = 5000)
+    {
+        var uri = $"http://{target}:{port}";
+
+        if (_channels.TryRemove(uri, out var channel))
+        {
+            Console.WriteLine($"[GrpcChannelFactory] Evicting channel to {uri}");
+            try { channel.Dispose(); } catch { }
+        }
+
+        var keysToRemove = _clients.Keys.Where(k => k.Contains(uri)).ToList();
+        foreach (var key in keysToRemove)
+            _clients.TryRemove(key, out _);
+    }
+
 }
