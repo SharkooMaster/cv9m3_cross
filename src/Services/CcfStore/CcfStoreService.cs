@@ -81,6 +81,38 @@ public class CcfStoreService
             yield return Path.GetFileNameWithoutExtension(file);
     }
 
+    public IEnumerable<string> ListPackedCcfIds()
+    {
+        if (!Directory.Exists(_packsDir)) yield break;
+        foreach (var idxFile in Directory.EnumerateFiles(_packsDir, "*.idx"))
+        {
+            FileStream? fs = null;
+            BinaryReader? br = null;
+            try
+            {
+                fs = new FileStream(idxFile, FileMode.Open, FileAccess.Read, FileShare.Read);
+                br = new BinaryReader(fs);
+                int entryCount = br.ReadInt32();
+                byte[] idBytes = new byte[64];
+                for (int i = 0; i < entryCount; i++)
+                {
+                    int bytesRead = br.Read(idBytes, 0, 64);
+                    if (bytesRead < 64) break;
+                    br.ReadInt64(); // offset
+                    br.ReadInt32(); // length
+                    string entryId = System.Text.Encoding.UTF8.GetString(idBytes).TrimEnd('\0');
+                    if (!string.IsNullOrEmpty(entryId))
+                        yield return entryId;
+                }
+            }
+            finally
+            {
+                br?.Dispose();
+                fs?.Dispose();
+            }
+        }
+    }
+
     public int UnpackedCount()
     {
         if (!Directory.Exists(_ccfDir)) return 0;
@@ -105,6 +137,40 @@ public class CcfStoreService
     {
         string path = Path.Combine(_dictDir, "latest.dict");
         return File.Exists(path) ? File.ReadAllBytes(path) : null;
+    }
+
+    public (long BytesFreed, int FilesDeleted) ClearAll()
+    {
+        long bytesFreed = 0;
+        int filesDeleted = 0;
+
+        void ClearDir(string dir)
+        {
+            if (!Directory.Exists(dir)) return;
+            foreach (var f in Directory.EnumerateFiles(dir))
+            {
+                try
+                {
+                    bytesFreed += new FileInfo(f).Length;
+                    File.Delete(f);
+                    filesDeleted++;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[CcfStore] Failed to delete {f}: {ex.Message}");
+                }
+            }
+        }
+
+        ClearDir(_ccfDir);
+        ClearDir(_packsDir);
+        ClearDir(_dictDir);
+
+        lock (_cacheLock) { _packCache.Clear(); }
+        lock (_pframeCacheLock) { _pframeCache.Clear(); }
+
+        Console.WriteLine($"[CcfStore] Cleared all: {filesDeleted} files, {bytesFreed / 1024.0 / 1024.0:F1} MB freed");
+        return (bytesFreed, filesDeleted);
     }
 
     public CcfStoreStats GetStoreStats()

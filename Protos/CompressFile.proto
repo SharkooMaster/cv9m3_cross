@@ -15,6 +15,8 @@ service FileService {
   rpc GetSystemStats(SystemStatsRequest) returns (SystemStatsResponse);
   // CCF store stats: optimizer status, pack savings, dictionary info.
   rpc GetCcfStoreStats(CcfStoreStatsRequest) returns (CcfStoreStatsResponse);
+  // Clear all CCF store data (packs, unpacked CCFs, dictionary). Used before benchmark runs.
+  rpc ClearCcfStore(ClearCcfStoreRequest) returns (ClearCcfStoreResponse);
 }
 
 message SystemStatsRequest {}
@@ -105,6 +107,14 @@ message FileUploadResponse {
     Error error = 3;
     DecompressionStats decompress_stats = 4;
   }
+}
+
+message ClearCcfStoreRequest {}
+
+message ClearCcfStoreResponse {
+  bool success = 1;
+  int64 bytes_freed = 2;
+  int32 files_deleted = 3;
 }
 
 message CcfStoreStatsRequest {}

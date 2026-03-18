@@ -1070,13 +1070,42 @@ public class CompressFileService : FileService.FileServiceBase
             resp.PackCompressionRatio = CcfPackOptimizerService.TotalPackRawBytes > 0
                 ? 1.0 - (double)CcfPackOptimizerService.TotalPackCompressedBytes / CcfPackOptimizerService.TotalPackRawBytes
                 : 0;
-            resp.EncodingVersion = "v5.3.0";
+            resp.EncodingVersion = "v5.5.0";
             resp.PframeGroups = CcfPackOptimizerService.PframeGroupsFound;
             resp.PframeDeltaCount = CcfPackOptimizerService.PframeDeltaCount;
             resp.PframeSavedBytes = CcfPackOptimizerService.PframeSavedBytes;
             resp.PframeSavingRatio = CcfPackOptimizerService.TotalPackRawBytes > 0
                 ? (double)CcfPackOptimizerService.PframeSavedBytes / CcfPackOptimizerService.TotalPackRawBytes
                 : 0;
+        }
+
+        return Task.FromResult(resp);
+    }
+
+    public override Task<ClearCcfStoreResponse> ClearCcfStore(
+        ClearCcfStoreRequest request, ServerCallContext context)
+    {
+        var resp = new ClearCcfStoreResponse();
+
+        if (!Globals.EnableCcfStore)
+        {
+            resp.Success = false;
+            return Task.FromResult(resp);
+        }
+
+        try
+        {
+            var (bytesFreed, filesDeleted) = CcfStoreService.Instance.ClearAll();
+            CcfPackOptimizerService.ResetStats();
+
+            resp.Success = true;
+            resp.BytesFreed = bytesFreed;
+            resp.FilesDeleted = filesDeleted;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ClearCcfStore] Error: {ex.Message}");
+            resp.Success = false;
         }
 
         return Task.FromResult(resp);
