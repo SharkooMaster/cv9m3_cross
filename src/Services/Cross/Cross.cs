@@ -16,6 +16,7 @@ using ZstdSharp;
 
 using Cross.Models;
 using Cross.Services.Cache;
+using Cross.Services.CcfStore;
 using Grpc.Core;
 
 namespace Cross.Services.Cross;
@@ -62,6 +63,80 @@ public class CrossService : ICross
             shift += 7;
             if (shift > 28) throw new InvalidDataException("Varint too large.");
         }
+    }
+
+    /// <summary>
+    /// Lossless same-size nibble rearrangement: packs pairs of high nibbles into the first
+    /// half and pairs of low nibbles into the second half. This separates the coarse magnitude
+    /// (high nibbles cluster around 0x0/0xF for small deltas) from the fine detail (low nibbles),
+    /// dramatically improving entropy coding for Laplacian-distributed error values.
+    /// </summary>
+    internal static byte[] NibbleSplit(byte[] input)
+    {
+        int n = input.Length;
+        int pairs = n / 2;
+        var output = new byte[n];
+
+        for (int i = 0; i < pairs; i++)
+        {
+            output[i] = (byte)((input[2 * i] & 0xF0) | (input[2 * i + 1] >> 4));
+            output[pairs + i] = (byte)(((input[2 * i] & 0x0F) << 4) | (input[2 * i + 1] & 0x0F));
+        }
+
+        if (n % 2 != 0)
+            output[n - 1] = input[n - 1];
+
+        return output;
+    }
+
+    internal static byte[] NibbleUnsplit(byte[] input)
+    {
+        int n = input.Length;
+        int pairs = n / 2;
+        var output = new byte[n];
+
+        for (int i = 0; i < pairs; i++)
+        {
+            byte hiPacked = input[i];
+            byte loPacked = input[pairs + i];
+            output[2 * i] = (byte)((hiPacked & 0xF0) | (loPacked >> 4));
+            output[2 * i + 1] = (byte)(((hiPacked & 0x0F) << 4) | (loPacked & 0x0F));
+        }
+
+        if (n % 2 != 0)
+            output[n - 1] = input[n - 1];
+
+        return output;
+    }
+
+    internal static (byte[] Quantized, byte[] Residual) QuantizeWithResidual(byte[] input, int threshold)
+    {
+        var quantized = new byte[input.Length];
+        var residual = new byte[input.Length];
+        for (int i = 0; i < input.Length; i++)
+        {
+            byte v = input[i];
+            int signed = v < 128 ? v : v - 256;
+            if (Math.Abs(signed) <= threshold)
+            {
+                quantized[i] = 0;
+                residual[i] = v;
+            }
+            else
+            {
+                quantized[i] = v;
+                residual[i] = 0;
+            }
+        }
+        return (quantized, residual);
+    }
+
+    internal static byte[] MergeQuantizedResidual(byte[] quantized, byte[] residual)
+    {
+        var output = new byte[quantized.Length];
+        for (int i = 0; i < output.Length; i++)
+            output[i] = (byte)(quantized[i] | residual[i]);
+        return output;
     }
 
     /// <summary>
@@ -139,10 +214,9 @@ public class CrossService : ICross
         byte[] errorPayload;
         if (version == "v5.3.0")
         {
-            // v5.3.0: error dict already contains independently Zstd'd sub-streams
             errorPayload = errorDictionary;
-            bw.Write(errorPayload.Length);      // compressed length == stored length
-            bw.Write(errorPayload.Length);      // original length (same — no outer compression)
+            bw.Write(errorPayload.Length);
+            bw.Write(errorPayload.Length);
         }
         else if (version == "v3.1.0" || version == "v5.0.0" || version == "v5.1.0" || version == "v5.2.0")
         {
@@ -2253,9 +2327,27 @@ public class CrossService : ICross
             byte[] rawSkips = skipMs.ToArray();
             byte[] rawVals = valMs.ToArray();
 
-            using var compressor = new Compressor(19);
-            byte[] zstdSkips = compressor.Wrap(rawSkips).ToArray();
-            byte[] zstdVals = compressor.Wrap(rawVals).ToArray();
+            byte[] zstdSkips, zstdVals;
+            var liveDict = Globals.EnableCcfStore
+                ? CcfPackOptimizerService.LiveDictionary
+                : null;
+
+            if (liveDict != null)
+            {
+                using var compSkip = new Compressor(19);
+                compSkip.LoadDictionary(liveDict);
+                zstdSkips = compSkip.Wrap(rawSkips).ToArray();
+
+                using var compVal = new Compressor(19);
+                compVal.LoadDictionary(liveDict);
+                zstdVals = compVal.Wrap(rawVals).ToArray();
+            }
+            else
+            {
+                using var compressor = new Compressor(19);
+                zstdSkips = compressor.Wrap(rawSkips).ToArray();
+                zstdVals = compressor.Wrap(rawVals).ToArray();
+            }
 
             using var outMs = new MemoryStream();
             using var bw2 = new BinaryWriter(outMs, Encoding.UTF8, leaveOpen: true);
@@ -3119,7 +3211,6 @@ public class CrossService : ICross
 
         if (header.Version == "v5.3.0")
         {
-            // v5.3.0: error payload stored raw (sub-streams are internally Zstd'd)
             errorBytes = new byte[header.ErrorLength];
             Buffer.BlockCopy(file, errorOffset, errorBytes, 0, header.ErrorLength);
         }
@@ -3434,11 +3525,33 @@ public class CrossService : ICross
             int skipDataOffset = (int)errMs.Position;
             int valDataOffset = skipDataOffset + compSkipLen;
 
-            using var decompressor = new Decompressor();
-            byte[] skipStream = decompressor.Unwrap(
-                new ReadOnlySpan<byte>(errorBytes, skipDataOffset, compSkipLen)).ToArray();
-            byte[] valStream = decompressor.Unwrap(
-                new ReadOnlySpan<byte>(errorBytes, valDataOffset, compValLen)).ToArray();
+            byte[] skipStream, valStream;
+            var dictForDecomp = Globals.EnableCcfStore
+                ? CcfPackOptimizerService.LiveDictionary
+                : null;
+
+            if (dictForDecomp != null)
+            {
+                try
+                {
+                    using var dd = new Decompressor();
+                    dd.LoadDictionary(dictForDecomp);
+                    skipStream = dd.Unwrap(new ReadOnlySpan<byte>(errorBytes, skipDataOffset, compSkipLen)).ToArray();
+                    valStream = dd.Unwrap(new ReadOnlySpan<byte>(errorBytes, valDataOffset, compValLen)).ToArray();
+                }
+                catch
+                {
+                    using var dd2 = new Decompressor();
+                    skipStream = dd2.Unwrap(new ReadOnlySpan<byte>(errorBytes, skipDataOffset, compSkipLen)).ToArray();
+                    valStream = dd2.Unwrap(new ReadOnlySpan<byte>(errorBytes, valDataOffset, compValLen)).ToArray();
+                }
+            }
+            else
+            {
+                using var decompressor = new Decompressor();
+                skipStream = decompressor.Unwrap(new ReadOnlySpan<byte>(errorBytes, skipDataOffset, compSkipLen)).ToArray();
+                valStream = decompressor.Unwrap(new ReadOnlySpan<byte>(errorBytes, valDataOffset, compValLen)).ToArray();
+            }
 
             using var skipMs = new MemoryStream(skipStream, writable: false);
             int cursor = 0;

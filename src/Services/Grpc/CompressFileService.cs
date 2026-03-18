@@ -1,5 +1,6 @@
 
 
+using Cross.Services.CcfStore;
 using Cross.Utilities;
 using CrossService;
 using Google.Protobuf;
@@ -359,12 +360,14 @@ public class CompressFileService : FileService.FileServiceBase
 
             var firstMsg = requestStream.Current;
             float maxErrorRate = 0f;
+            bool storeOnCluster = false;
             if (firstMsg.PayloadCase == FileUploadRequest.PayloadOneofCase.Metadata)
             {
                 fileName = firstMsg.Metadata.FileName;
                 declaredSize = firstMsg.Metadata.OriginalSize;
                 declaredSha256 = firstMsg.Metadata.Sha256;
                 maxErrorRate = firstMsg.Metadata.MaxErrorRate;
+                storeOnCluster = firstMsg.Metadata.StoreOnCluster && Globals.EnableCcfStore;
             }
 
             bool willUseWindowed = declaredSize > (ulong)windowedThreshold;
@@ -392,20 +395,13 @@ public class CompressFileService : FileService.FileServiceBase
             {
                 if (willUseWindowed)
                 {
-                    // ═══════════════════════════════════════════════════════════
-                    //  WINDOWED IN-MEMORY PIPELINE — no temp file, parallel compression
-                    //  RAM ≈ (parallelism + channelCapacity) × windowSize ≈ 512-768 MB
-                    // ═══════════════════════════════════════════════════════════
                     await HandleWindowedPipeline(requestStream, responseStream, context,
-                        (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate);
+                        (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate, storeOnCluster);
                 }
                 else
                 {
-                    // ═══════════════════════════════════════════════════════════
-                    //  MONOLITHIC v3.0.0 — temp file, single-shot compression
-                    // ═══════════════════════════════════════════════════════════
                     await HandleMonolithicCompression(requestStream, responseStream, context,
-                        tempPath, (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate);
+                        tempPath, (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate, storeOnCluster);
                 }
             }
             finally
@@ -451,17 +447,16 @@ public class CompressFileService : FileService.FileServiceBase
         long declaredSize,
         ByteString? declaredSha256,
         long effectiveLimit,
-        float maxErrorRate = 0f)
+        float maxErrorRate = 0f,
+        bool storeOnCluster = false)
     {
         int windowSize = MyCrossService.WindowSize;
         int parallelism = GetPipelineParallelism();
         int blockCount = (int)((declaredSize + windowSize - 1) / windowSize);
         if (blockCount == 0) blockCount = 1;
 
-        Console.WriteLine($"[Pipeline] Starting: {declaredSize} bytes, windowSize={windowSize / (1024 * 1024)}MB, blocks={blockCount}, parallelism={parallelism}");
+        Console.WriteLine($"[Pipeline] Starting: {declaredSize} bytes, windowSize={windowSize / (1024 * 1024)}MB, blocks={blockCount}, parallelism={parallelism}, clusterStore={storeOnCluster}");
 
-        // Bounded channel: capacity = parallelism + small buffer
-        // This limits RAM to (capacity + parallelism) × windowSize
         var windowChannel = Channel.CreateBounded<(int Index, byte[] Data)>(
             new BoundedChannelOptions(parallelism + 4)
             {
@@ -469,11 +464,19 @@ public class CompressFileService : FileService.FileServiceBase
                 SingleWriter = true
             });
 
-        var grpcStream = new GrpcResponseStream(responseStream, context.CancellationToken);
+        // When storing on cluster, capture compressed output to a temp file instead of streaming
+        string? clusterTempPath = storeOnCluster
+            ? Path.Combine(Path.GetTempPath(), $"cross-cluster-{Guid.NewGuid():N}.bin")
+            : null;
+        FileStream? clusterTempFs = clusterTempPath != null
+            ? new FileStream(clusterTempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024)
+            : null;
 
-        // ── Start compression pipeline (runs concurrently with receive) ──
+        var grpcStream = storeOnCluster ? null : new GrpcResponseStream(responseStream, context.CancellationToken);
+
+        Stream outputStream = storeOnCluster ? (Stream)clusterTempFs! : grpcStream!;
         var pipelineTask = RunCompressionPipeline(
-            windowChannel.Reader, grpcStream, declaredSize, blockCount, parallelism, context.CancellationToken, maxErrorRate);
+            windowChannel.Reader, outputStream, declaredSize, blockCount, parallelism, context.CancellationToken, maxErrorRate);
 
         // ── Receive loop: accumulate gRPC chunks into window buffers ──
         byte[] currentBuf = new byte[windowSize];
@@ -555,34 +558,67 @@ public class CompressFileService : FileService.FileServiceBase
         if (declaredSha256 != null && declaredSha256.Length == 32 && !declaredSha256.Span.SequenceEqual(uploadedSha256))
             throw new RpcException(new Status(StatusCode.InvalidArgument, "SHA-256 mismatch for uploaded file."));
 
-        // ── Wait for pipeline to finish writing all compressed blocks ──
         var (compressedSize, refsFound, totalChunks, dcBytesStored, serverProcessingMs, avgErrorRate, errorPayloadBytes) = await pipelineTask;
 
-        // ── Write SHA256 trailer (hash of original file, computed in receive loop) ──
-        await grpcStream.WriteAsync(uploadedSha256, 0, 32, context.CancellationToken);
-        await grpcStream.FlushAsync(context.CancellationToken);
+        // Write SHA256 trailer
+        await outputStream.WriteAsync(uploadedSha256, 0, 32, context.CancellationToken);
+        await outputStream.FlushAsync(context.CancellationToken);
         compressedSize += 32;
 
-        // ── Stats + EOF ──
-        await responseStream.WriteAsync(new FileUploadResponse
+        string fileIdHex = Convert.ToHexString(uploadedSha256).ToLowerInvariant();
+
+        if (storeOnCluster && clusterTempFs != null && clusterTempPath != null)
         {
-            Stats = new CompressionStats
+            await clusterTempFs.DisposeAsync();
+            byte[] ccfBytes = await File.ReadAllBytesAsync(clusterTempPath, context.CancellationToken);
+            try { File.Delete(clusterTempPath); } catch { }
+
+            await CcfStoreService.Instance.StoreCcfAsync(fileIdHex, ccfBytes, context.CancellationToken);
+            Console.WriteLine($"[Pipeline] Cluster-stored CCF: fileId={fileIdHex}, {ccfBytes.Length} bytes");
+
+            await responseStream.WriteAsync(new FileUploadResponse
             {
-                OriginalSize = (ulong)receivedBytes,
-                CompressedSize = (ulong)compressedSize,
-                ReferencesFound = (uint)Math.Max(0, refsFound),
-                TotalChunks = (uint)Math.Max(0, totalChunks),
-                CompressedSha256 = ByteString.CopyFrom(uploadedSha256),
-                DatacenterBytesStored = (ulong)Math.Max(0, dcBytesStored),
-                ServerProcessingMs = serverProcessingMs,
-                AverageErrorRate = avgErrorRate,
-                ErrorPayloadBytes = (ulong)Math.Max(0, errorPayloadBytes)
-            }
-        });
-        await responseStream.WriteAsync(new FileUploadResponse
+                Stats = new CompressionStats
+                {
+                    OriginalSize = (ulong)receivedBytes,
+                    CompressedSize = (ulong)compressedSize,
+                    ReferencesFound = (uint)Math.Max(0, refsFound),
+                    TotalChunks = (uint)Math.Max(0, totalChunks),
+                    CompressedSha256 = ByteString.CopyFrom(uploadedSha256),
+                    DatacenterBytesStored = (ulong)Math.Max(0, dcBytesStored),
+                    ServerProcessingMs = serverProcessingMs,
+                    AverageErrorRate = avgErrorRate,
+                    ErrorPayloadBytes = (ulong)Math.Max(0, errorPayloadBytes),
+                    FileId = fileIdHex
+                }
+            });
+            await responseStream.WriteAsync(new FileUploadResponse
+            {
+                Chunk = new FileChunk { Seq = 0, Data = ByteString.Empty, Eof = true }
+            });
+        }
+        else
         {
-            Chunk = new FileChunk { Seq = 0, Data = ByteString.Empty, Eof = true }
-        });
+            await responseStream.WriteAsync(new FileUploadResponse
+            {
+                Stats = new CompressionStats
+                {
+                    OriginalSize = (ulong)receivedBytes,
+                    CompressedSize = (ulong)compressedSize,
+                    ReferencesFound = (uint)Math.Max(0, refsFound),
+                    TotalChunks = (uint)Math.Max(0, totalChunks),
+                    CompressedSha256 = ByteString.CopyFrom(uploadedSha256),
+                    DatacenterBytesStored = (ulong)Math.Max(0, dcBytesStored),
+                    ServerProcessingMs = serverProcessingMs,
+                    AverageErrorRate = avgErrorRate,
+                    ErrorPayloadBytes = (ulong)Math.Max(0, errorPayloadBytes)
+                }
+            });
+            await responseStream.WriteAsync(new FileUploadResponse
+            {
+                Chunk = new FileChunk { Seq = 0, Data = ByteString.Empty, Eof = true }
+            });
+        }
 
         Console.WriteLine($"[Pipeline] COMPLETE: {receivedBytes} → {compressedSize} bytes, {blockCount} blocks, refs={refsFound}");
     }
@@ -593,7 +629,7 @@ public class CompressFileService : FileService.FileServiceBase
     /// </summary>
     private static async Task<(long CompressedSize, int TotalRefs, int TotalChunks, long DatacenterBytes, double ServerProcessingMs, float AverageErrorRate, long ErrorPayloadBytes)> RunCompressionPipeline(
         ChannelReader<(int Index, byte[] Data)> reader,
-        GrpcResponseStream grpcStream,
+        Stream outputStream,
         long declaredFileSize,
         int blockCount,
         int parallelism,
@@ -602,13 +638,12 @@ public class CompressFileService : FileService.FileServiceBase
     {
         var crossService = new MyCrossService();
 
-        // ── Write v5 header: magic(4) + fileSize(8) + blockCount(4) = 16 bytes ──
         byte[] header = new byte[4 + 8 + 4];
         byte[] magic = "CV5\0"u8.ToArray();
         Buffer.BlockCopy(magic, 0, header, 0, 4);
         BitConverter.TryWriteBytes(header.AsSpan(4), declaredFileSize);
         BitConverter.TryWriteBytes(header.AsSpan(12), blockCount);
-        await grpcStream.WriteAsync(header, 0, header.Length, ct);
+        await outputStream.WriteAsync(header, 0, header.Length, ct);
 
         long totalCompressedSize = header.Length;
         int totalRefs = 0, totalChunks = 0;
@@ -673,8 +708,8 @@ public class CompressFileService : FileService.FileServiceBase
                 byte[] blockHeader = new byte[8];
                 BitConverter.TryWriteBytes(blockHeader.AsSpan(0), (int)block.Compressed.Length);
                 BitConverter.TryWriteBytes(blockHeader.AsSpan(4), block.OriginalLen);
-                await grpcStream.WriteAsync(blockHeader, 0, 8, ct);
-                await grpcStream.WriteAsync(block.Compressed, 0, block.Compressed.Length, ct);
+                await outputStream.WriteAsync(blockHeader, 0, 8, ct);
+                await outputStream.WriteAsync(block.Compressed, 0, block.Compressed.Length, ct);
 
                 totalCompressedSize += 8 + block.Compressed.Length;
                 Console.WriteLine($"[Pipeline] ✅ Block {nextToWrite + 1}/{blockCount} streamed ({block.OriginalLen} → {block.Compressed.Length})");
@@ -699,7 +734,8 @@ public class CompressFileService : FileService.FileServiceBase
         long declaredSize,
         ByteString? declaredSha256,
         long effectiveLimit,
-        float maxErrorRate = 0f)
+        float maxErrorRate = 0f,
+        bool storeOnCluster = false)
     {
         long receivedBytes = 0;
         byte[] uploadedSha256;
@@ -761,46 +797,185 @@ public class CompressFileService : FileService.FileServiceBase
         using (var compressedSha = SHA256.Create())
             compressedHash = compressedSha.ComputeHash(compressedBytes);
 
-        // ── Stream response ──
-        await responseStream.WriteAsync(new FileUploadResponse
-        {
-            Stats = new CompressionStats
-            {
-                OriginalSize = (ulong)receivedBytes,
-                CompressedSize = (ulong)compressedBytes.Length,
-                ReferencesFound = (uint)Math.Max(0, referencesFound),
-                TotalChunks = (uint)Math.Max(0, totalChunks),
-                CompressedSha256 = ByteString.CopyFrom(compressedHash),
-                DatacenterBytesStored = (ulong)Math.Max(0, dcBytesStored),
-                ServerProcessingMs = compressSw.Elapsed.TotalMilliseconds,
-                AverageErrorRate = avgErrorRate,
-                ErrorPayloadBytes = (ulong)Math.Max(0, errorPayloadBytes)
-            }
-        });
+        string fileIdHex = Convert.ToHexString(uploadedSha256).ToLowerInvariant();
 
-        const int outChunkSize = 1024 * 1024;
-        uint seq = 0;
-        for (int offset = 0; offset < compressedBytes.Length; offset += outChunkSize, seq++)
+        if (storeOnCluster)
         {
-            int len = Math.Min(outChunkSize, compressedBytes.Length - offset);
+            await CcfStoreService.Instance.StoreCcfAsync(fileIdHex, compressedBytes, context.CancellationToken);
+            Console.WriteLine($"[ProcessFileStream] Cluster-stored CCF: fileId={fileIdHex}, {compressedBytes.Length} bytes");
+
             await responseStream.WriteAsync(new FileUploadResponse
             {
-                Chunk = new FileChunk
+                Stats = new CompressionStats
                 {
-                    Seq = seq,
-                    Data = ByteString.CopyFrom(compressedBytes, offset, len),
-                    Eof = false
+                    OriginalSize = (ulong)receivedBytes,
+                    CompressedSize = (ulong)compressedBytes.Length,
+                    ReferencesFound = (uint)Math.Max(0, referencesFound),
+                    TotalChunks = (uint)Math.Max(0, totalChunks),
+                    CompressedSha256 = ByteString.CopyFrom(compressedHash),
+                    DatacenterBytesStored = (ulong)Math.Max(0, dcBytesStored),
+                    ServerProcessingMs = compressSw.Elapsed.TotalMilliseconds,
+                    AverageErrorRate = avgErrorRate,
+                    ErrorPayloadBytes = (ulong)Math.Max(0, errorPayloadBytes),
+                    FileId = fileIdHex
                 }
             });
+            await responseStream.WriteAsync(new FileUploadResponse
+            {
+                Chunk = new FileChunk { Seq = 0, Data = ByteString.Empty, Eof = true }
+            });
         }
-        await responseStream.WriteAsync(new FileUploadResponse
+        else
         {
-            Chunk = new FileChunk { Seq = seq, Data = ByteString.Empty, Eof = true }
-        });
+            await responseStream.WriteAsync(new FileUploadResponse
+            {
+                Stats = new CompressionStats
+                {
+                    OriginalSize = (ulong)receivedBytes,
+                    CompressedSize = (ulong)compressedBytes.Length,
+                    ReferencesFound = (uint)Math.Max(0, referencesFound),
+                    TotalChunks = (uint)Math.Max(0, totalChunks),
+                    CompressedSha256 = ByteString.CopyFrom(compressedHash),
+                    DatacenterBytesStored = (ulong)Math.Max(0, dcBytesStored),
+                    ServerProcessingMs = compressSw.Elapsed.TotalMilliseconds,
+                    AverageErrorRate = avgErrorRate,
+                    ErrorPayloadBytes = (ulong)Math.Max(0, errorPayloadBytes)
+                }
+            });
+
+            const int outChunkSize = 1024 * 1024;
+            uint seq = 0;
+            for (int offset = 0; offset < compressedBytes.Length; offset += outChunkSize, seq++)
+            {
+                int len = Math.Min(outChunkSize, compressedBytes.Length - offset);
+                await responseStream.WriteAsync(new FileUploadResponse
+                {
+                    Chunk = new FileChunk
+                    {
+                        Seq = seq,
+                        Data = ByteString.CopyFrom(compressedBytes, offset, len),
+                        Eof = false
+                    }
+                });
+            }
+            await responseStream.WriteAsync(new FileUploadResponse
+            {
+                Chunk = new FileChunk { Seq = seq, Data = ByteString.Empty, Eof = true }
+            });
+        }
 
         Console.WriteLine($"[ProcessFileStream] Monolithic DONE: {receivedBytes} → {compressedBytes.Length}");
         compressedBytes = null!;
         GC.Collect(2, GCCollectionMode.Optimized, false);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  CLUSTER-STORED MODE: DECOMPRESS BY FILE ID
+    // ═══════════════════════════════════════════════════════════════════
+    public override async Task DecompressById(
+        FileIdRequest request,
+        IServerStreamWriter<FileUploadResponse> responseStream,
+        ServerCallContext context)
+    {
+        if (!Globals.EnableCcfStore)
+            throw new RpcException(new Status(StatusCode.FailedPrecondition,
+                "Cluster-stored CCF mode is not enabled. Set ENABLE_CCF_STORE=true."));
+
+        string fileId = request.FileId;
+        if (string.IsNullOrWhiteSpace(fileId))
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "file_id is required."));
+
+        Console.WriteLine($"[DecompressById] Fetching CCF for fileId={fileId}");
+
+        byte[]? ccfBytes = await CcfStoreService.Instance.GetCcfAsync(fileId, context.CancellationToken);
+        if (ccfBytes == null)
+            throw new RpcException(new Status(StatusCode.NotFound,
+                $"CCF not found for fileId={fileId}. File may not have been compressed in cluster-stored mode."));
+
+        Console.WriteLine($"[DecompressById] Got {ccfBytes.Length} byte CCF, decompressing...");
+
+        await _compressionGate.WaitAsync(context.CancellationToken);
+        try
+        {
+            byte[] magicBytes = new byte[4];
+            Buffer.BlockCopy(ccfBytes, 0, magicBytes, 0, Math.Min(4, ccfBytes.Length));
+            bool isWindowed = MyCrossService.IsWindowedFormat(magicBytes);
+
+            var crossService = new MyCrossService();
+
+            if (isWindowed)
+            {
+                string tempPath = Path.Combine(Path.GetTempPath(), $"cross-dbi-{Guid.NewGuid():N}.bin");
+                try
+                {
+                    await File.WriteAllBytesAsync(tempPath, ccfBytes, context.CancellationToken);
+                    var grpcStream = new GrpcResponseStream(responseStream, context.CancellationToken);
+                    (long decompressedSize, byte[] decompressedHash) =
+                        await crossService.DecompressFileWindowedStreamAsync(tempPath, grpcStream, context.CancellationToken);
+
+                    await responseStream.WriteAsync(new FileUploadResponse
+                    {
+                        DecompressStats = new DecompressionStats
+                        {
+                            CompressedSize = (ulong)ccfBytes.Length,
+                            DecompressedSize = (ulong)decompressedSize,
+                            DecompressedSha256 = ByteString.CopyFrom(decompressedHash)
+                        }
+                    });
+                    await responseStream.WriteAsync(new FileUploadResponse
+                    {
+                        Chunk = new FileChunk { Seq = 0, Data = ByteString.Empty, Eof = true }
+                    });
+                }
+                finally
+                {
+                    try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                }
+            }
+            else
+            {
+                byte[] decompressedBytes = await crossService.DecompressFile(ccfBytes);
+                byte[] decompressedHash;
+                using (var sha = SHA256.Create())
+                    decompressedHash = sha.ComputeHash(decompressedBytes);
+
+                await responseStream.WriteAsync(new FileUploadResponse
+                {
+                    DecompressStats = new DecompressionStats
+                    {
+                        CompressedSize = (ulong)ccfBytes.Length,
+                        DecompressedSize = (ulong)decompressedBytes.Length,
+                        DecompressedSha256 = ByteString.CopyFrom(decompressedHash)
+                    }
+                });
+
+                const int outChunkSize = 1024 * 1024;
+                uint seq = 0;
+                for (int offset = 0; offset < decompressedBytes.Length; offset += outChunkSize, seq++)
+                {
+                    int len = Math.Min(outChunkSize, decompressedBytes.Length - offset);
+                    await responseStream.WriteAsync(new FileUploadResponse
+                    {
+                        Chunk = new FileChunk
+                        {
+                            Seq = seq,
+                            Data = ByteString.CopyFrom(decompressedBytes, offset, len),
+                            Eof = false
+                        }
+                    });
+                }
+                await responseStream.WriteAsync(new FileUploadResponse
+                {
+                    Chunk = new FileChunk { Seq = seq, Data = ByteString.Empty, Eof = true }
+                });
+            }
+
+            Console.WriteLine($"[DecompressById] DONE for fileId={fileId}");
+        }
+        finally
+        {
+            _compressionGate.Release();
+        }
     }
 
     /// <summary>
@@ -866,5 +1041,44 @@ public class CompressFileService : FileService.FileServiceBase
             TotalVectors = totalVectors,
             AgentCount = reachable
         };
+    }
+
+    public override Task<CcfStoreStatsResponse> GetCcfStoreStats(
+        CcfStoreStatsRequest request, ServerCallContext context)
+    {
+        var resp = new CcfStoreStatsResponse { Enabled = Globals.EnableCcfStore };
+
+        if (Globals.EnableCcfStore)
+        {
+            var fs = CcfStoreService.Instance.GetStoreStats();
+            resp.OptimizerRunning = CcfPackOptimizerService.IsRunning;
+            resp.LastRunUnix = CcfPackOptimizerService.LastRunUtc.HasValue
+                ? new DateTimeOffset(CcfPackOptimizerService.LastRunUtc.Value).ToUnixTimeSeconds()
+                : 0;
+            resp.UnpackedCount = fs.UnpackedCount;
+            resp.UnpackedBytes = fs.UnpackedBytes;
+            resp.PackCount = fs.PackCount;
+            resp.PackBytes = fs.PackBytes;
+            resp.TotalBytes = fs.TotalBytes;
+            resp.HasDictionary = fs.HasDictionary;
+            resp.DictBytes = fs.DictBytes;
+            resp.LastPackedCount = CcfPackOptimizerService.LastPackedCount;
+            resp.LastPackSavedBytes = CcfPackOptimizerService.LastPackSavedBytes;
+            resp.TotalPackedAllTime = CcfPackOptimizerService.TotalPackedAllTime;
+            resp.PackRawBytes = CcfPackOptimizerService.TotalPackRawBytes;
+            resp.PackCompressedBytes = CcfPackOptimizerService.TotalPackCompressedBytes;
+            resp.PackCompressionRatio = CcfPackOptimizerService.TotalPackRawBytes > 0
+                ? 1.0 - (double)CcfPackOptimizerService.TotalPackCompressedBytes / CcfPackOptimizerService.TotalPackRawBytes
+                : 0;
+            resp.EncodingVersion = "v5.3.0";
+            resp.PframeGroups = CcfPackOptimizerService.PframeGroupsFound;
+            resp.PframeDeltaCount = CcfPackOptimizerService.PframeDeltaCount;
+            resp.PframeSavedBytes = CcfPackOptimizerService.PframeSavedBytes;
+            resp.PframeSavingRatio = CcfPackOptimizerService.TotalPackRawBytes > 0
+                ? (double)CcfPackOptimizerService.PframeSavedBytes / CcfPackOptimizerService.TotalPackRawBytes
+                : 0;
+        }
+
+        return Task.FromResult(resp);
     }
 }

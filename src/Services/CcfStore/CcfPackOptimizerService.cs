@@ -1,0 +1,782 @@
+using System.Security.Cryptography;
+using System.Text;
+using Cross.Utilities;
+using ZstdSharp;
+
+namespace Cross.Services.CcfStore;
+
+/// <summary>
+/// Background service that periodically packs unpacked CCFs into pack files
+/// with P-frame cross-file delta compression, trains a shared zstd dictionary,
+/// and removes individual CCFs after packing.
+///
+/// Pack format v3 (P-frame delta compression):
+///   [4B] magic "CCP\0"
+///   [4B] version = 3
+///   [4B] decompressedSize
+///   [remainder] zstd-19 compressed inner payload
+///
+///   Inner payload:
+///     [4B] entryCount
+///     [4B] dictSize (0 = no dictionary)
+///     [dictSize B] dictionary
+///     Per entry:
+///       [1B] frameType: 0 = I-frame, 1 = P-frame (subtraction delta)
+///       [4B] baseIndex: -1 for I-frame, positional index for P-frame
+///       [4B] dataLength
+///       [dataLength B] data (I-frame: raw CCF, P-frame: PFramePayload)
+///
+/// Pack format v2 (legacy, zstd-compressed):
+///   [4B] magic "CCP\0"  [4B] version = 2  [4B] decompressedSize
+///   [remainder] zstd-19 compressed inner payload
+///   Inner: [4B] entryCount [4B] dictSize ... per entry: [4B] ccfDataLen [ccf bytes]
+///
+/// Index (.idx) — same structure for all versions:
+///   [4B] entryCount
+///   Per entry: [64B] fileId [8B] offset [4B] length
+///   v2: offset → int32 dataLength field, length = ccfDataLength
+///   v3: offset → frameType byte, length = 9 + dataLength
+/// </summary>
+public class CcfPackOptimizerService : BackgroundService
+{
+    private static readonly byte[] PackMagic = "CCP\0"u8.ToArray();
+    private const int PackVersion = 3;
+    public static long TotalPackRawBytes;
+    public static long TotalPackCompressedBytes;
+
+    public static volatile bool IsRunning;
+    public static DateTime? LastRunUtc;
+    public static int LastPackedCount;
+    public static long LastPackSavedBytes;
+    public static int TotalPackedAllTime;
+
+    // P-frame stats
+    public static int PframeGroupsFound;
+    public static int PframeDeltaCount;
+    public static long PframeSavedBytes;
+
+    private const int DictTrainThreshold = 50;
+    private static volatile byte[]? _liveDict;
+    private static readonly object _dictLock = new();
+    public static byte[]? LiveDictionary => _liveDict;
+
+    private const double PframeSavingsThreshold = 0.85;
+
+    // ───────────────────────────────────────────────────────────────────
+    //  CCF component extraction (shared with CcfStoreService for reconstruction)
+    // ───────────────────────────────────────────────────────────────────
+
+    internal sealed class CcfComponents
+    {
+        public string Version = "";
+        public byte[] Refs = Array.Empty<byte>();
+        public byte[] Trim = Array.Empty<byte>();
+        public byte[] Hash = Array.Empty<byte>();
+        public int PatchCount;
+        public int OriginalSize;
+        public byte[] RawSkip = Array.Empty<byte>();
+        public byte[] RawValues = Array.Empty<byte>();
+        public byte[] RawError = Array.Empty<byte>();
+        public bool IsSplitStream;
+        public bool IsValid;
+        public string RefsFingerprint = "";
+        public int OriginalCcfLength;
+        public byte[] DeltaSource => IsSplitStream ? RawValues : RawError;
+    }
+
+    internal static CcfComponents ParseCcfComponents(byte[] file)
+    {
+        var comp = new CcfComponents { OriginalCcfLength = file.Length };
+        try
+        {
+            if (file.Length < 12) return comp;
+
+            int pos = 0;
+            int versionLen = BitConverter.ToInt32(file, pos); pos += 4;
+            if (versionLen <= 0 || versionLen > 20 || pos + versionLen > file.Length) return comp;
+
+            comp.Version = Encoding.UTF8.GetString(file, pos, versionLen); pos += versionLen;
+            int refsLen = BitConverter.ToInt32(file, pos); pos += 4;
+
+            int errorCompLen;
+            bool hasOrigLen = comp.Version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0";
+            errorCompLen = BitConverter.ToInt32(file, pos); pos += 4;
+            if (hasOrigLen) pos += 4; // skip errorOrigLen
+
+            int trimLen = 0;
+            bool hasTrim = comp.Version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0";
+            if (hasTrim) { trimLen = BitConverter.ToInt32(file, pos); pos += 4; }
+
+            int refsOffset = pos;
+            int errorOffset = refsOffset + refsLen;
+            int trimOffset = errorOffset + errorCompLen;
+            int hashOffset = trimOffset + (hasTrim ? trimLen : 0);
+
+            if (errorOffset + errorCompLen > file.Length) return comp;
+
+            comp.Refs = new byte[refsLen];
+            if (refsLen > 0) Buffer.BlockCopy(file, refsOffset, comp.Refs, 0, refsLen);
+
+            if (hasTrim && trimLen > 0 && trimOffset + trimLen <= file.Length)
+            {
+                comp.Trim = new byte[trimLen];
+                Buffer.BlockCopy(file, trimOffset, comp.Trim, 0, trimLen);
+            }
+
+            if (hashOffset + 4 <= file.Length)
+            {
+                int hashContentLen = BitConverter.ToInt32(file, hashOffset);
+                if (hashContentLen > 0 && hashOffset + 4 + hashContentLen <= file.Length)
+                {
+                    comp.Hash = new byte[hashContentLen];
+                    Buffer.BlockCopy(file, hashOffset + 4, comp.Hash, 0, hashContentLen);
+                }
+            }
+
+            byte[] errorPayload = new byte[errorCompLen];
+            if (errorCompLen > 0) Buffer.BlockCopy(file, errorOffset, errorPayload, 0, errorCompLen);
+
+            if (comp.Version == "v5.3.0" && errorCompLen >= 16)
+            {
+                comp.IsSplitStream = true;
+                comp.PatchCount = BitConverter.ToInt32(errorPayload, 0);
+                comp.OriginalSize = BitConverter.ToInt32(errorPayload, 4);
+                int compSkipLen = BitConverter.ToInt32(errorPayload, 8);
+                int compValLen = BitConverter.ToInt32(errorPayload, 12);
+
+                if (16 + compSkipLen + compValLen <= errorCompLen)
+                {
+                    var dict = _liveDict;
+                    try
+                    {
+                        using var d = new Decompressor();
+                        if (dict != null) d.LoadDictionary(dict);
+                        comp.RawSkip = d.Unwrap(errorPayload.AsSpan(16, compSkipLen)).ToArray();
+                        comp.RawValues = d.Unwrap(errorPayload.AsSpan(16 + compSkipLen, compValLen)).ToArray();
+                    }
+                    catch
+                    {
+                        using var d2 = new Decompressor();
+                        comp.RawSkip = d2.Unwrap(errorPayload.AsSpan(16, compSkipLen)).ToArray();
+                        comp.RawValues = d2.Unwrap(errorPayload.AsSpan(16 + compSkipLen, compValLen)).ToArray();
+                    }
+                    comp.IsValid = true;
+                }
+            }
+            else if (comp.Version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0")
+            {
+                using var d = new Decompressor();
+                comp.RawError = d.Unwrap(errorPayload).ToArray();
+                comp.OriginalSize = comp.RawError.Length;
+                comp.IsValid = true;
+            }
+            else if (comp.Version is "v2.0.0" or "v2.1.0" or "v3.0.0")
+            {
+                comp.RawError = errorPayload;
+                comp.OriginalSize = errorPayload.Length;
+                comp.IsValid = true;
+            }
+
+            comp.RefsFingerprint = Convert.ToHexString(SHA256.HashData(comp.Refs)).ToLowerInvariant();
+        }
+        catch { /* leave IsValid = false */ }
+        return comp;
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    //  P-frame payload building & reconstruction
+    // ───────────────────────────────────────────────────────────────────
+
+    internal static byte[] BuildPFramePayload(CcfComponents comp, byte[] compressedDelta)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+
+        bw.Write(comp.OriginalCcfLength);
+        bw.Write(comp.IsSplitStream ? (byte)0 : (byte)1);
+        bw.Write(comp.PatchCount);
+        bw.Write(comp.OriginalSize);
+
+        if (comp.IsSplitStream)
+        {
+            // Store skip stream re-compressed without dict for portability
+            using var c = new Compressor(19);
+            byte[] portableSkip = c.Wrap(comp.RawSkip).ToArray();
+            bw.Write(portableSkip.Length);
+            bw.Write(portableSkip);
+        }
+        else
+        {
+            bw.Write(0); // no skip stream for single-blob
+        }
+
+        bw.Write(compressedDelta.Length);
+        bw.Write(compressedDelta);
+
+        var versionBytes = Encoding.UTF8.GetBytes(comp.Version);
+        bw.Write(versionBytes.Length);
+        bw.Write(versionBytes);
+        bw.Write(comp.Refs.Length);
+        if (comp.Refs.Length > 0) bw.Write(comp.Refs);
+        bw.Write(comp.Trim.Length);
+        if (comp.Trim.Length > 0) bw.Write(comp.Trim);
+        bw.Write(comp.Hash.Length);
+        if (comp.Hash.Length > 0) bw.Write(comp.Hash);
+
+        bw.Flush();
+        return ms.ToArray();
+    }
+
+    /// <summary>
+    /// Reconstruct the original CCF from a P-frame payload and the base I-frame CCF bytes.
+    /// Returns null on failure.
+    /// </summary>
+    internal static byte[]? ReconstructCcfFromPFrame(byte[] pframeData, byte[] baseCcf)
+    {
+        try
+        {
+            using var ms = new MemoryStream(pframeData);
+            using var br = new BinaryReader(ms, Encoding.UTF8);
+
+            int _origLen = br.ReadInt32();
+            byte errorFormat = br.ReadByte();
+            int patchCount = br.ReadInt32();
+            int originalSize = br.ReadInt32();
+
+            int compSkipLen = br.ReadInt32();
+            byte[] compSkip = compSkipLen > 0 ? br.ReadBytes(compSkipLen) : Array.Empty<byte>();
+
+            int compDeltaLen = br.ReadInt32();
+            byte[] compDelta = br.ReadBytes(compDeltaLen);
+
+            int versionLen = br.ReadInt32();
+            string version = Encoding.UTF8.GetString(br.ReadBytes(versionLen));
+            int refsLen = br.ReadInt32();
+            byte[] refs = refsLen > 0 ? br.ReadBytes(refsLen) : Array.Empty<byte>();
+            int trimLen = br.ReadInt32();
+            byte[] trim = trimLen > 0 ? br.ReadBytes(trimLen) : Array.Empty<byte>();
+            int hashLen = br.ReadInt32();
+            byte[] hash = hashLen > 0 ? br.ReadBytes(hashLen) : Array.Empty<byte>();
+
+            using var decomp = new Decompressor();
+            byte[] rawDelta = decomp.Unwrap(compDelta).ToArray();
+
+            var baseComp = ParseCcfComponents(baseCcf);
+            if (!baseComp.IsValid) return null;
+            byte[] baseData = baseComp.DeltaSource;
+
+            int maxLen = Math.Max(rawDelta.Length, baseData.Length);
+            byte[] originalData = new byte[rawDelta.Length];
+            for (int i = 0; i < rawDelta.Length; i++)
+            {
+                byte b = i < baseData.Length ? baseData[i] : (byte)0;
+                originalData[i] = (byte)((rawDelta[i] + b) & 0xFF);
+            }
+
+            byte[] errorPayload;
+            int errorOriginalLength;
+
+            if (errorFormat == 0) // v5.3.0 split-stream
+            {
+                byte[] rawSkip;
+                if (compSkip.Length > 0)
+                {
+                    using var dSkip = new Decompressor();
+                    rawSkip = dSkip.Unwrap(compSkip).ToArray();
+                }
+                else
+                {
+                    rawSkip = Array.Empty<byte>();
+                }
+
+                using var c = new Compressor(3);
+                byte[] zSkip = c.Wrap(rawSkip).ToArray();
+                byte[] zVals = c.Wrap(originalData).ToArray();
+
+                using var errMs = new MemoryStream();
+                using var errBw = new BinaryWriter(errMs, Encoding.UTF8, leaveOpen: true);
+                errBw.Write(patchCount);
+                errBw.Write(originalSize);
+                errBw.Write(zSkip.Length);
+                errBw.Write(zVals.Length);
+                errBw.Write(zSkip);
+                errBw.Write(zVals);
+                errBw.Flush();
+                errorPayload = errMs.ToArray();
+                errorOriginalLength = errorPayload.Length;
+            }
+            else // single-blob
+            {
+                errorOriginalLength = originalData.Length;
+                bool needsCompression = version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0";
+                if (needsCompression)
+                {
+                    using var c = new Compressor(3);
+                    errorPayload = c.Wrap(originalData).ToArray();
+                }
+                else
+                {
+                    errorPayload = originalData;
+                    errorOriginalLength = errorPayload.Length;
+                }
+            }
+
+            return ReassembleCcf(version, refs, errorPayload, errorOriginalLength, trim, hash);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CcfPackOptimizer] P-frame reconstruction failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    internal static byte[] ReassembleCcf(
+        string version, byte[] refs, byte[] errorPayload, int errorOriginalLength,
+        byte[] trim, byte[] hash)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+
+        var versionBytes = Encoding.UTF8.GetBytes(version);
+        bw.Write(versionBytes.Length);
+        bw.Write(versionBytes);
+        bw.Write(refs.Length);
+
+        if (version == "v5.3.0")
+        {
+            bw.Write(errorPayload.Length);
+            bw.Write(errorPayload.Length);
+        }
+        else if (version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0")
+        {
+            bw.Write(errorPayload.Length);
+            bw.Write(errorOriginalLength);
+        }
+        else
+        {
+            bw.Write(errorPayload.Length);
+        }
+
+        if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0")
+            bw.Write(trim.Length);
+
+        bw.Write(refs);
+        bw.Write(errorPayload);
+        bw.Write(trim);
+        bw.Write(hash.Length);
+        bw.Write(hash);
+        bw.Flush();
+
+        return ms.ToArray();
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    //  Main loop
+    // ───────────────────────────────────────────────────────────────────
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        if (!Globals.EnableCcfStore)
+        {
+            Console.WriteLine("[CcfPackOptimizer] Disabled (ENABLE_CCF_STORE != true)");
+            return;
+        }
+
+        var existingDict = CcfStoreService.Instance.LoadDict();
+        if (existingDict != null)
+        {
+            lock (_dictLock) { _liveDict = existingDict; }
+            Console.WriteLine($"[CcfPackOptimizer] Loaded existing dictionary ({existingDict.Length} bytes)");
+        }
+
+        Console.WriteLine($"[CcfPackOptimizer] Started. PackThreshold={Globals.CcfPackThreshold}, DictThreshold={DictTrainThreshold}, Interval={Globals.CcfPackIntervalSec}s, PackVersion={PackVersion}");
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(Globals.CcfPackIntervalSec), stoppingToken);
+                await RunOptimizationCycle(stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[CcfPackOptimizer] Error in optimization cycle: {ex.Message}");
+                await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+            }
+        }
+    }
+
+    private async Task RunOptimizationCycle(CancellationToken ct)
+    {
+        IsRunning = true;
+        try
+        {
+            await RunOptimizationCycleInner(ct);
+        }
+        finally
+        {
+            IsRunning = false;
+            LastRunUtc = DateTime.UtcNow;
+        }
+    }
+
+    private async Task RunOptimizationCycleInner(CancellationToken ct)
+    {
+        var store = CcfStoreService.Instance;
+        var unpackedIds = store.ListUnpackedCcfs().ToList();
+
+        if (_liveDict == null && unpackedIds.Count >= DictTrainThreshold)
+        {
+            var trainEntries = new List<(string FileId, byte[] Data)>();
+            foreach (var fileId in unpackedIds)
+            {
+                byte[]? data = await store.GetCcfAsync(fileId, ct);
+                if (data != null) trainEntries.Add((fileId, data));
+                if (trainEntries.Count >= 500) break;
+            }
+
+            byte[]? dict = TrainDictionaryFromCcfs(trainEntries);
+            if (dict != null)
+            {
+                await store.StoreDictAsync(dict, ct);
+                lock (_dictLock) { _liveDict = dict; }
+                Console.WriteLine($"[CcfPackOptimizer] Dictionary trained: {dict.Length} bytes from {trainEntries.Count} CCFs");
+            }
+        }
+
+        if (unpackedIds.Count < Globals.CcfPackThreshold)
+        {
+            Console.WriteLine($"[CcfPackOptimizer] {unpackedIds.Count} unpacked CCFs (threshold={Globals.CcfPackThreshold}), dict={(LiveDictionary != null ? $"{LiveDictionary.Length}B" : "none")}");
+            return;
+        }
+
+        Console.WriteLine($"[CcfPackOptimizer] Packing {unpackedIds.Count} CCFs with P-frame delta...");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        // ── Collect all CCFs and parse components ──
+        var entries = new List<(string FileId, byte[] Ccf, CcfComponents Comp)>();
+        long totalRawBytes = 0;
+        foreach (var fileId in unpackedIds)
+        {
+            byte[]? data = await store.GetCcfAsync(fileId, ct);
+            if (data == null) continue;
+            var comp = ParseCcfComponents(data);
+            entries.Add((fileId, data, comp));
+            totalRawBytes += data.Length;
+        }
+
+        if (entries.Count < 2)
+        {
+            Console.WriteLine("[CcfPackOptimizer] Not enough readable CCFs to pack");
+            return;
+        }
+
+        // ── Group by refs fingerprint ──
+        var groups = entries
+            .Where(e => e.Comp.IsValid && e.Comp.RefsFingerprint.Length > 0)
+            .GroupBy(e => e.Comp.RefsFingerprint)
+            .ToList();
+
+        // Entries that failed parsing go into a singleton "ungrouped" list
+        var ungrouped = entries.Where(e => !e.Comp.IsValid || e.Comp.RefsFingerprint.Length == 0).ToList();
+
+        int pframeGroups = groups.Count(g => g.Count() > 1);
+        int cyclePframeDelta = 0;
+        long cyclePframeSaved = 0;
+
+        // ── Build v3 inner payload ──
+        string packId = $"pack-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("N")[..8]}";
+        using var innerMs = new MemoryStream();
+        using var idxMs = new MemoryStream();
+
+        int totalEntryCount = entries.Count;
+        byte[]? currentDict = LiveDictionary;
+        WriteInt32(innerMs, totalEntryCount);
+        WriteInt32(innerMs, currentDict?.Length ?? 0);
+        if (currentDict != null) innerMs.Write(currentDict);
+
+        WriteInt32(idxMs, totalEntryCount);
+
+        int entryIndex = 0;
+
+        void WriteIFrame(string fileId, byte[] ccfBytes)
+        {
+            long offset = innerMs.Position;
+            innerMs.WriteByte(0); // I-frame
+            WriteInt32(innerMs, -1);
+            WriteInt32(innerMs, ccfBytes.Length);
+            innerMs.Write(ccfBytes);
+
+            int entrySize = 1 + 4 + 4 + ccfBytes.Length;
+            WriteIndexEntry(idxMs, fileId, offset, entrySize);
+            entryIndex++;
+        }
+
+        void WritePFrame(string fileId, byte[] pframePayload, int baseIdx)
+        {
+            long offset = innerMs.Position;
+            innerMs.WriteByte(1); // P-frame
+            WriteInt32(innerMs, baseIdx);
+            WriteInt32(innerMs, pframePayload.Length);
+            innerMs.Write(pframePayload);
+
+            int entrySize = 1 + 4 + 4 + pframePayload.Length;
+            WriteIndexEntry(idxMs, fileId, offset, entrySize);
+            entryIndex++;
+        }
+
+        // Process grouped families
+        foreach (var group in groups)
+        {
+            var members = group.ToList();
+            if (members.Count == 1)
+            {
+                WriteIFrame(members[0].FileId, members[0].Ccf);
+                continue;
+            }
+
+            // First member = I-frame (base)
+            var (baseFileId, baseCcf, baseComp) = members[0];
+            WriteIFrame(baseFileId, baseCcf);
+            int baseEntryIndex = entryIndex - 1;
+
+            // Remaining members: try P-frame
+            for (int m = 1; m < members.Count; m++)
+            {
+                var (fileId, ccfBytes, comp) = members[m];
+                bool usedPFrame = false;
+
+                if (comp.IsValid && baseComp.IsValid)
+                {
+                    try
+                    {
+                        byte[] memberSrc = comp.DeltaSource;
+                        byte[] baseSrc = baseComp.DeltaSource;
+
+                        byte[] delta = new byte[memberSrc.Length];
+                        int limit = Math.Min(memberSrc.Length, baseSrc.Length);
+                        for (int i = 0; i < limit; i++)
+                            delta[i] = (byte)((memberSrc[i] - baseSrc[i]) & 0xFF);
+                        for (int i = limit; i < memberSrc.Length; i++)
+                            delta[i] = memberSrc[i];
+
+                        using var zc = new Compressor(19);
+                        byte[] compDelta = zc.Wrap(delta).ToArray();
+
+                        byte[] pframePayload = BuildPFramePayload(comp, compDelta);
+
+                        if (pframePayload.Length < ccfBytes.Length * PframeSavingsThreshold)
+                        {
+                            // Round-trip verification
+                            byte[]? reconstructed = ReconstructCcfFromPFrame(pframePayload, baseCcf);
+                            if (reconstructed != null)
+                            {
+                                var reconComp = ParseCcfComponents(reconstructed);
+                                if (reconComp.IsValid &&
+                                    reconComp.DeltaSource.Length == memberSrc.Length &&
+                                    reconComp.DeltaSource.AsSpan().SequenceEqual(memberSrc))
+                                {
+                                    WritePFrame(fileId, pframePayload, baseEntryIndex);
+                                    cyclePframeSaved += ccfBytes.Length - pframePayload.Length;
+                                    cyclePframeDelta++;
+                                    usedPFrame = true;
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"[CcfPackOptimizer] P-frame round-trip mismatch for {fileId}, using I-frame");
+                                }
+                            }
+                            else
+                            {
+                                Console.WriteLine($"[CcfPackOptimizer] P-frame reconstruction returned null for {fileId}, using I-frame");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[CcfPackOptimizer] P-frame failed for {fileId}: {ex.Message}");
+                    }
+                }
+
+                if (!usedPFrame)
+                    WriteIFrame(fileId, ccfBytes);
+            }
+        }
+
+        // Process ungrouped (failed to parse)
+        foreach (var (fileId, ccfBytes, _) in ungrouped)
+            WriteIFrame(fileId, ccfBytes);
+
+        byte[] innerPayload = innerMs.ToArray();
+
+        // ── Compress and write pack ──
+        using var compressor = new Compressor(19);
+        byte[] compressedPayload = compressor.Wrap(innerPayload).ToArray();
+
+        using var packMs = new MemoryStream();
+        packMs.Write(PackMagic);
+        WriteInt32(packMs, PackVersion);
+        WriteInt32(packMs, innerPayload.Length);
+        packMs.Write(compressedPayload);
+
+        byte[] packData = packMs.ToArray();
+        byte[] indexData = idxMs.ToArray();
+
+        await store.StorePackAsync(packId, packData, indexData, ct);
+
+        foreach (var (fileId, _, _) in entries)
+            store.DeleteCcf(fileId);
+
+        sw.Stop();
+        long saved = totalRawBytes - packData.Length;
+        double compressionRatio = innerPayload.Length > 0
+            ? 1.0 - (double)compressedPayload.Length / innerPayload.Length
+            : 0;
+
+        LastPackedCount = entries.Count;
+        LastPackSavedBytes = saved;
+        TotalPackedAllTime += entries.Count;
+        TotalPackRawBytes += innerPayload.Length;
+        TotalPackCompressedBytes += compressedPayload.Length;
+        PframeGroupsFound += pframeGroups;
+        PframeDeltaCount += cyclePframeDelta;
+        PframeSavedBytes += cyclePframeSaved;
+
+        Console.WriteLine($"[CcfPackOptimizer] Packed {entries.Count} CCFs into {packId}: " +
+            $"raw={totalRawBytes / 1024.0:F1}KB → inner={innerPayload.Length / 1024.0:F1}KB → " +
+            $"zstd={compressedPayload.Length / 1024.0:F1}KB ({compressionRatio * 100:F1}% pack compression), " +
+            $"P-frame: {cyclePframeDelta} deltas in {pframeGroups} families (saved {cyclePframeSaved / 1024.0:F1}KB inner), " +
+            $"{sw.ElapsedMilliseconds}ms");
+    }
+
+    private static byte[]? TrainDictionaryFromCcfs(List<(string FileId, byte[] Data)> ccfEntries)
+    {
+        var samples = new List<byte[]>();
+        foreach (var (_, ccfBytes) in ccfEntries)
+        {
+            byte[]? errorStream = ExtractErrorStream(ccfBytes);
+            if (errorStream != null && errorStream.Length > 0)
+                samples.Add(errorStream);
+        }
+
+        if (samples.Count < 10) return null;
+
+        try
+        {
+            return DictBuilder.TrainFromBuffer(samples, 64 * 1024);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CcfPackOptimizer] Dictionary training failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static byte[]? ExtractErrorStream(byte[] file)
+    {
+        try
+        {
+            if (file.Length < 12) return null;
+
+            int pos = 0;
+            int versionLen = BitConverter.ToInt32(file, pos); pos += 4;
+            if (versionLen <= 0 || versionLen > 20 || pos + versionLen > file.Length) return null;
+
+            string version = Encoding.UTF8.GetString(file, pos, versionLen); pos += versionLen;
+            int refsLen = BitConverter.ToInt32(file, pos); pos += 4;
+
+            int errorCompLen;
+            if (version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0")
+            {
+                errorCompLen = BitConverter.ToInt32(file, pos); pos += 4;
+                pos += 4;
+            }
+            else
+            {
+                errorCompLen = BitConverter.ToInt32(file, pos); pos += 4;
+            }
+
+            if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0")
+                pos += 4;
+
+            int errorOffset = pos + refsLen;
+            if (errorCompLen <= 0 || errorOffset + errorCompLen > file.Length) return null;
+
+            byte[] errorPayload = new byte[errorCompLen];
+            Buffer.BlockCopy(file, errorOffset, errorPayload, 0, errorCompLen);
+
+            if (version == "v5.3.0" && errorCompLen >= 16)
+            {
+                int compSkipLen = BitConverter.ToInt32(errorPayload, 8);
+                int compValLen = BitConverter.ToInt32(errorPayload, 12);
+                if (16 + compSkipLen + compValLen <= errorCompLen)
+                {
+                    using var decomp = new Decompressor();
+                    return decomp.Unwrap(errorPayload.AsSpan(16 + compSkipLen, compValLen)).ToArray();
+                }
+            }
+            else if (version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0")
+            {
+                using var decomp = new Decompressor();
+                return decomp.Unwrap(errorPayload).ToArray();
+            }
+
+            return errorPayload;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    //  Helpers
+    // ───────────────────────────────────────────────────────────────────
+
+    private static void WriteIndexEntry(Stream idxMs, string fileId, long offset, int entrySize)
+    {
+        byte[] idBytes = new byte[64];
+        Encoding.UTF8.GetBytes(fileId, 0, Math.Min(fileId.Length, 64), idBytes, 0);
+        idxMs.Write(idBytes);
+        WriteInt64(idxMs, offset);
+        WriteInt32(idxMs, entrySize);
+    }
+
+    private static void WriteInt32(Stream s, int value)
+    {
+        Span<byte> buf = stackalloc byte[4];
+        BitConverter.TryWriteBytes(buf, value);
+        s.Write(buf);
+    }
+
+    private static void WriteInt64(Stream s, long value)
+    {
+        Span<byte> buf = stackalloc byte[8];
+        BitConverter.TryWriteBytes(buf, value);
+        s.Write(buf);
+    }
+
+    /// <summary>
+    /// Read the N-th entry's (offset, length) from an index file.
+    /// </summary>
+    internal static (long Offset, int Length)? FindEntryByPosition(string idxPath, int position)
+    {
+        try
+        {
+            using var fs = new FileStream(idxPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var br = new BinaryReader(fs);
+            int entryCount = br.ReadInt32();
+            if (position < 0 || position >= entryCount) return null;
+            fs.Seek(4 + (long)position * (64 + 8 + 4), SeekOrigin.Begin);
+            fs.Seek(64, SeekOrigin.Current); // skip fileId
+            long offset = br.ReadInt64();
+            int length = br.ReadInt32();
+            return (offset, length);
+        }
+        catch { return null; }
+    }
+}

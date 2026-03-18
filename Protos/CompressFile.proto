@@ -9,8 +9,12 @@ service FileService {
   rpc ProcessFileStream(stream FileUploadRequest) returns (stream FileUploadResponse);
   // Streaming decompression: client streams .ccf, server streams back decompressed bytes.
   rpc DecompressFileStream(stream FileUploadRequest) returns (stream FileUploadResponse);
+  // Cluster-stored mode: decompress by file ID (CCF lives on cluster, not client).
+  rpc DecompressById(FileIdRequest) returns (stream FileUploadResponse);
   // Aggregate storage stats from all agents.
   rpc GetSystemStats(SystemStatsRequest) returns (SystemStatsResponse);
+  // CCF store stats: optimizer status, pack savings, dictionary info.
+  rpc GetCcfStoreStats(CcfStoreStatsRequest) returns (CcfStoreStatsResponse);
 }
 
 message SystemStatsRequest {}
@@ -41,6 +45,14 @@ message FileMetadata {
   // Max fraction of differing bytes allowed per chunk (0.0-1.0). 0 = use server default.
   // E.g. 0.40 means reject matches where >40% of bytes differ.
   float max_error_rate = 5;
+  // Cluster-stored mode: when true, the CCF is stored on the cluster and only
+  // a file_id is returned (instead of streaming the CCF bytes to the client).
+  // The client can later call DecompressById to retrieve the original file.
+  bool store_on_cluster = 10;
+}
+
+message FileIdRequest {
+  string file_id = 1;
 }
 
 message FileChunk {
@@ -72,6 +84,8 @@ message CompressionStats {
   float average_error_rate = 8;
   // Total bytes used by error correction payload in the CCF output.
   uint64 error_payload_bytes = 9;
+  // Cluster-stored mode: the file ID (SHA256 hex) for later DecompressById calls.
+  string file_id = 10;
 }
 
 message Error {
@@ -91,4 +105,30 @@ message FileUploadResponse {
     Error error = 3;
     DecompressionStats decompress_stats = 4;
   }
+}
+
+message CcfStoreStatsRequest {}
+
+message CcfStoreStatsResponse {
+  bool enabled = 1;
+  bool optimizer_running = 2;
+  int64 last_run_unix = 3;        // seconds since epoch, 0 = never
+  int32 unpacked_count = 4;
+  int64 unpacked_bytes = 5;
+  int32 pack_count = 6;
+  int64 pack_bytes = 7;
+  int64 total_bytes = 8;          // unpacked + packed
+  bool has_dictionary = 9;
+  int64 dict_bytes = 10;
+  int32 last_packed_count = 11;   // CCFs in last pack cycle
+  int64 last_pack_saved_bytes = 12;
+  int32 total_packed_all_time = 13;
+  int64 pack_raw_bytes = 14;         // total inner payload bytes before zstd (across all packs)
+  int64 pack_compressed_bytes = 15;  // total zstd-compressed bytes (across all packs)
+  double pack_compression_ratio = 16; // 0.0-1.0, how much pack compression saves
+  string encoding_version = 17;      // current CCF encoding version (e.g., "v5.3.0")
+  int32 pframe_groups = 18;          // number of families (2+ CCFs sharing refs) found for P-frame delta
+  int32 pframe_delta_count = 19;     // number of CCFs stored as P-frame deltas
+  int64 pframe_saved_bytes = 20;     // inner payload bytes saved by P-frame delta encoding
+  double pframe_saving_ratio = 21;   // P-frame savings as ratio of total inner payload
 }

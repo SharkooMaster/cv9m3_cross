@@ -90,6 +90,20 @@ public static class Globals
     public static bool EnableLaneSearch =
         string.Equals(Environment.GetEnvironmentVariable("ENABLE_LANE_SEARCH"), "true",
             StringComparison.OrdinalIgnoreCase);
+
+    // ── Cluster-stored CCF mode ──
+    public static bool EnableCcfStore =
+        string.Equals(Environment.GetEnvironmentVariable("ENABLE_CCF_STORE"), "true",
+            StringComparison.OrdinalIgnoreCase);
+
+    public static string CcfStorePath =
+        Environment.GetEnvironmentVariable("CCF_STORE_PATH") ?? "/data/ccf-store";
+
+    public static int CcfPackThreshold =
+        int.TryParse(Environment.GetEnvironmentVariable("CCF_PACK_THRESHOLD"), out var cpt) ? cpt : 100;
+
+    public static int CcfPackIntervalSec =
+        int.TryParse(Environment.GetEnvironmentVariable("CCF_PACK_INTERVAL_SEC"), out var cpi) ? cpi : 300;
     //public static string GatewayLoadbalancer = "192.168.50.241";
     // Allow running outside Kubernetes/Docker by overriding via env var.
     // Examples:
