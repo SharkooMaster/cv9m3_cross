@@ -104,6 +104,23 @@ public static class Globals
 
     public static int CcfPackIntervalSec =
         int.TryParse(Environment.GetEnvironmentVariable("CCF_PACK_INTERVAL_SEC"), out var cpi) ? cpi : 300;
+
+    // ── Optional global CCF compaction (budgeted, non-blocking) ──
+    public static bool CcfGlobalCompactionEnabled =
+        string.Equals(Environment.GetEnvironmentVariable("CCF_GLOBAL_COMPACTION_ENABLED"), "true",
+            StringComparison.OrdinalIgnoreCase);
+
+    public static int CcfCompactionMaxSourcePacksPerCycle =
+        int.TryParse(Environment.GetEnvironmentVariable("CCF_COMPACTION_MAX_SOURCE_PACKS_PER_CYCLE"), out var csp) ? csp : 2;
+
+    public static long CcfCompactionMaxReadBytesPerCycle =
+        long.TryParse(Environment.GetEnvironmentVariable("CCF_COMPACTION_MAX_READ_BYTES_PER_CYCLE"), out var crb) ? crb : 512L * 1024 * 1024;
+
+    public static int CcfCompactionMaxDurationSec =
+        int.TryParse(Environment.GetEnvironmentVariable("CCF_COMPACTION_MAX_DURATION_SEC"), out var cds) ? cds : 45;
+
+    public static int CcfCompactionMaxWorkingSetMb =
+        int.TryParse(Environment.GetEnvironmentVariable("CCF_COMPACTION_MAX_WORKING_SET_MB"), out var cws) ? cws : 1024;
     //public static string GatewayLoadbalancer = "192.168.50.241";
     // Allow running outside Kubernetes/Docker by overriding via env var.
     // Examples:

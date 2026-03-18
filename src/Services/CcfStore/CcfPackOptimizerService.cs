@@ -77,6 +77,14 @@ public class CcfPackOptimizerService : BackgroundService
 
     private const double PframeSavingsThreshold = 0.85;
 
+    private sealed class LoadedEntry
+    {
+        public string FileId { get; init; } = string.Empty;
+        public byte[] Ccf { get; init; } = Array.Empty<byte>();
+        public CcfComponents Comp { get; init; } = new();
+        public string? SourcePackId { get; init; }
+    }
+
     // ───────────────────────────────────────────────────────────────────
     //  CCF component extraction (shared with CcfStoreService for reconstruction)
     // ───────────────────────────────────────────────────────────────────
@@ -620,69 +628,193 @@ public class CcfPackOptimizerService : BackgroundService
             }
         }
 
-        if (unpackedIds.Count < Globals.CcfPackThreshold)
+        var candidateIds = new List<(string FileId, string? SourcePackId)>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var selectedPacks = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var id in unpackedIds)
         {
-            Console.WriteLine($"[CcfPackOptimizer] {unpackedIds.Count} unpacked CCFs (threshold={Globals.CcfPackThreshold}), dict={(LiveDictionary != null ? $"{LiveDictionary.Length}B" : "none")}");
+            if (seen.Add(id))
+                candidateIds.Add((id, null));
+        }
+
+        if (Globals.CcfGlobalCompactionEnabled)
+        {
+            int maxSourcePacks = Math.Max(0, Globals.CcfCompactionMaxSourcePacksPerCycle);
+            long readBudget = Math.Max(64L * 1024 * 1024, Globals.CcfCompactionMaxReadBytesPerCycle);
+            long selectedPackBytes = 0;
+
+            foreach (var (packId, packBytes) in store.ListPacks().OrderBy(p => p.PackId))
+            {
+                if (selectedPacks.Count >= maxSourcePacks) break;
+                if (selectedPackBytes + packBytes > readBudget / 2 && selectedPacks.Count > 0) break;
+
+                var ids = store.ListPackEntryIds(packId)
+                    .Where(id => !string.IsNullOrWhiteSpace(id))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                if (ids.Count == 0) continue;
+
+                selectedPacks[packId] = ids;
+                selectedPackBytes += Math.Max(0, packBytes);
+                foreach (var id in ids)
+                {
+                    if (seen.Add(id))
+                        candidateIds.Add((id, packId));
+                }
+            }
+
+            Console.WriteLine($"[CcfPackOptimizer] Global compaction enabled: sourcePacks={selectedPacks.Count}, candidates={candidateIds.Count}, readBudget={readBudget / 1024 / 1024}MB");
+        }
+
+        if (candidateIds.Count < Globals.CcfPackThreshold)
+        {
+            Console.WriteLine($"[CcfPackOptimizer] {candidateIds.Count} candidate CCFs (threshold={Globals.CcfPackThreshold}), dict={(LiveDictionary != null ? $"{LiveDictionary.Length}B" : "none")}");
             return;
         }
 
-        Console.WriteLine($"[CcfPackOptimizer] Packing {unpackedIds.Count} CCFs with P-frame delta...");
-        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var loadSw = System.Diagnostics.Stopwatch.StartNew();
+        var loadedEntries = new List<LoadedEntry>(capacity: Math.Min(candidateIds.Count, 4096));
+        long bytesRead = 0;
+        long maxReadBytes = Math.Max(64L * 1024 * 1024, Globals.CcfCompactionMaxReadBytesPerCycle);
+        long maxWorkingSetBytes = Math.Max(256L, Globals.CcfCompactionMaxWorkingSetMb) * 1024L * 1024L;
+        DateTime deadline = DateTime.UtcNow.AddSeconds(Math.Max(5, Globals.CcfCompactionMaxDurationSec));
+        var loadedByPack = selectedPacks.Keys.ToDictionary(k => k, _ => 0, StringComparer.OrdinalIgnoreCase);
 
-        // ── Collect all CCFs and parse components ──
-        var entries = new List<(string FileId, byte[] Ccf, CcfComponents Comp)>();
-        long totalRawBytes = 0;
-        foreach (var fileId in unpackedIds)
+        foreach (var (fileId, sourcePackId) in candidateIds)
         {
+            ct.ThrowIfCancellationRequested();
+            if (DateTime.UtcNow >= deadline && loadedEntries.Count >= 2)
+                break;
+
+            if (bytesRead >= maxReadBytes && loadedEntries.Count >= 2)
+                break;
+
+            if (Environment.WorkingSet > maxWorkingSetBytes && loadedEntries.Count >= 2)
+            {
+                Console.WriteLine($"[CcfPackOptimizer] Working set guard hit ({Environment.WorkingSet / 1024 / 1024}MB >= {Globals.CcfCompactionMaxWorkingSetMb}MB), ending load phase");
+                break;
+            }
+
             byte[]? data = await store.GetCcfAsync(fileId, ct);
             if (data == null) continue;
+
+            bytesRead += data.Length;
             var comp = ParseCcfComponents(data);
-            entries.Add((fileId, data, comp));
-            totalRawBytes += data.Length;
+            loadedEntries.Add(new LoadedEntry
+            {
+                FileId = fileId,
+                Ccf = data,
+                Comp = comp,
+                SourcePackId = sourcePackId
+            });
+
+            if (sourcePackId != null && loadedByPack.ContainsKey(sourcePackId))
+                loadedByPack[sourcePackId]++;
         }
 
-        if (entries.Count < 2)
+        loadSw.Stop();
+        if (loadedEntries.Count < 2)
         {
-            Console.WriteLine("[CcfPackOptimizer] Not enough readable CCFs to pack");
+            Console.WriteLine($"[CcfPackOptimizer] Not enough readable CCFs to pack (loaded={loadedEntries.Count}, read={bytesRead / 1024}KB)");
             return;
         }
 
-        // ── Group by refs fingerprint ──
+        Console.WriteLine($"[CcfPackOptimizer] Packing loaded set: entries={loadedEntries.Count}, read={bytesRead / 1024 / 1024}MB, loadTime={loadSw.ElapsedMilliseconds}ms");
+
+        var packResult = await PackEntriesAsync(store, loadedEntries, ct);
+
+        // Delete source unpacked files that were compacted.
+        foreach (var entry in loadedEntries)
+        {
+            if (entry.SourcePackId == null)
+                store.DeleteCcf(entry.FileId);
+        }
+
+        // Delete source packs only when all of their indexed entries were compacted this cycle.
+        foreach (var (packId, ids) in selectedPacks)
+        {
+            int loaded = loadedByPack.TryGetValue(packId, out var n) ? n : 0;
+            if (loaded == ids.Count && ids.Count > 0)
+            {
+                if (!store.DeletePack(packId))
+                    Console.WriteLine($"[CcfPackOptimizer] Failed deleting migrated source pack {packId}");
+            }
+            else
+            {
+                Console.WriteLine($"[CcfPackOptimizer] Kept source pack {packId} (loaded {loaded}/{ids.Count} entries this cycle)");
+            }
+        }
+
+        LastPackedCount = packResult.EntryCount;
+        LastPackSavedBytes = packResult.TotalRawBytes - packResult.PackBytes;
+        TotalPackedAllTime += packResult.EntryCount;
+        TotalPackRawBytes += packResult.InnerBytes;
+        TotalPackCompressedBytes += packResult.CompressedBytes;
+        PframeGroupsFound += packResult.PframeGroups;
+        PframeDeltaCount += packResult.PframeDeltaCount;
+        PframeSavedBytes += packResult.PframeSavedBytes;
+
+        double compressionRatio = packResult.InnerBytes > 0
+            ? 1.0 - (double)packResult.CompressedBytes / packResult.InnerBytes
+            : 0;
+
+        Console.WriteLine($"[CcfPackOptimizer] Packed {packResult.EntryCount} CCFs into {packResult.PackId}: " +
+            $"raw={packResult.TotalRawBytes / 1024.0:F1}KB → inner={packResult.InnerBytes / 1024.0:F1}KB → " +
+            $"zstd={packResult.CompressedBytes / 1024.0:F1}KB ({compressionRatio * 100:F1}% pack compression), " +
+            $"P-frame: {packResult.PframeDeltaCount} deltas in {packResult.PframeGroups} families (saved {packResult.PframeSavedBytes / 1024.0:F1}KB inner)");
+    }
+
+    private sealed class PackBuildResult
+    {
+        public string PackId { get; init; } = string.Empty;
+        public int EntryCount { get; init; }
+        public long TotalRawBytes { get; init; }
+        public int PframeGroups { get; init; }
+        public int PframeDeltaCount { get; init; }
+        public long PframeSavedBytes { get; init; }
+        public long InnerBytes { get; init; }
+        public long CompressedBytes { get; init; }
+        public long PackBytes { get; init; }
+    }
+
+    private async Task<PackBuildResult> PackEntriesAsync(CcfStoreService store, List<LoadedEntry> entries, CancellationToken ct)
+    {
+        long totalRawBytes = 0;
+        foreach (var entry in entries)
+            totalRawBytes += entry.Ccf.Length;
+
         var groups = entries
             .Where(e => e.Comp.IsValid && e.Comp.RefsFingerprint.Length > 0)
             .GroupBy(e => e.Comp.RefsFingerprint)
             .ToList();
 
-        // Entries that failed parsing go into a singleton "ungrouped" list
         var ungrouped = entries.Where(e => !e.Comp.IsValid || e.Comp.RefsFingerprint.Length == 0).ToList();
 
         int pframeGroups = groups.Count(g => g.Count() > 1);
         int cyclePframeDelta = 0;
         long cyclePframeSaved = 0;
 
-        // ── Build v3 inner payload ──
         string packId = $"pack-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("N")[..8]}";
         using var innerMs = new MemoryStream();
         using var idxMs = new MemoryStream();
 
-        int totalEntryCount = entries.Count;
         byte[]? currentDict = LiveDictionary;
-        WriteInt32(innerMs, totalEntryCount);
+        WriteInt32(innerMs, entries.Count);
         WriteInt32(innerMs, currentDict?.Length ?? 0);
         if (currentDict != null) innerMs.Write(currentDict);
 
-        WriteInt32(idxMs, totalEntryCount);
-
+        WriteInt32(idxMs, entries.Count);
         int entryIndex = 0;
 
         void WriteIFrame(string fileId, byte[] ccfBytes)
         {
             long offset = innerMs.Position;
-            innerMs.WriteByte(0); // I-frame
+            innerMs.WriteByte(0);
             WriteInt32(innerMs, -1);
             WriteInt32(innerMs, ccfBytes.Length);
             innerMs.Write(ccfBytes);
-
             int entrySize = 1 + 4 + 4 + ccfBytes.Length;
             WriteIndexEntry(idxMs, fileId, offset, entrySize);
             entryIndex++;
@@ -691,19 +823,18 @@ public class CcfPackOptimizerService : BackgroundService
         void WritePFrame(string fileId, byte[] pframePayload, int baseIdx)
         {
             long offset = innerMs.Position;
-            innerMs.WriteByte(1); // P-frame
+            innerMs.WriteByte(1);
             WriteInt32(innerMs, baseIdx);
             WriteInt32(innerMs, pframePayload.Length);
             innerMs.Write(pframePayload);
-
             int entrySize = 1 + 4 + 4 + pframePayload.Length;
             WriteIndexEntry(idxMs, fileId, offset, entrySize);
             entryIndex++;
         }
 
-        // Process grouped families
         foreach (var group in groups)
         {
+            ct.ThrowIfCancellationRequested();
             var members = group.ToList();
             if (members.Count == 1)
             {
@@ -711,24 +842,21 @@ public class CcfPackOptimizerService : BackgroundService
                 continue;
             }
 
-            // First member = I-frame (base)
-            var (baseFileId, baseCcf, baseComp) = members[0];
-            WriteIFrame(baseFileId, baseCcf);
+            var baseMember = members[0];
+            WriteIFrame(baseMember.FileId, baseMember.Ccf);
             int baseEntryIndex = entryIndex - 1;
 
-            // Remaining members: try P-frame
             for (int m = 1; m < members.Count; m++)
             {
-                var (fileId, ccfBytes, comp) = members[m];
+                var member = members[m];
                 bool usedPFrame = false;
 
-                if (comp.IsValid && baseComp.IsValid)
+                if (member.Comp.IsValid && baseMember.Comp.IsValid)
                 {
                     try
                     {
-                        byte[] memberSrc = comp.DeltaSource;
-                        byte[] baseSrc = baseComp.DeltaSource;
-
+                        byte[] memberSrc = member.Comp.DeltaSource;
+                        byte[] baseSrc = baseMember.Comp.DeltaSource;
                         byte[] delta = new byte[memberSrc.Length];
                         int limit = Math.Min(memberSrc.Length, baseSrc.Length);
                         for (int i = 0; i < limit; i++)
@@ -738,13 +866,11 @@ public class CcfPackOptimizerService : BackgroundService
 
                         using var zc = new Compressor(19);
                         byte[] compDelta = zc.Wrap(delta).ToArray();
+                        byte[] pframePayload = BuildPFramePayload(member.Comp, compDelta);
 
-                        byte[] pframePayload = BuildPFramePayload(comp, compDelta);
-
-                        if (pframePayload.Length < ccfBytes.Length * PframeSavingsThreshold)
+                        if (pframePayload.Length < member.Ccf.Length * PframeSavingsThreshold)
                         {
-                            // Round-trip verification
-                            byte[]? reconstructed = ReconstructCcfFromPFrame(pframePayload, baseCcf);
+                            byte[]? reconstructed = ReconstructCcfFromPFrame(pframePayload, baseMember.Ccf);
                             if (reconstructed != null)
                             {
                                 var reconComp = ParseCcfComponents(reconstructed);
@@ -752,40 +878,29 @@ public class CcfPackOptimizerService : BackgroundService
                                     reconComp.DeltaSource.Length == memberSrc.Length &&
                                     reconComp.DeltaSource.AsSpan().SequenceEqual(memberSrc))
                                 {
-                                    WritePFrame(fileId, pframePayload, baseEntryIndex);
-                                    cyclePframeSaved += ccfBytes.Length - pframePayload.Length;
+                                    WritePFrame(member.FileId, pframePayload, baseEntryIndex);
+                                    cyclePframeSaved += member.Ccf.Length - pframePayload.Length;
                                     cyclePframeDelta++;
                                     usedPFrame = true;
                                 }
-                                else
-                                {
-                                    Console.WriteLine($"[CcfPackOptimizer] P-frame round-trip mismatch for {fileId}, using I-frame");
-                                }
-                            }
-                            else
-                            {
-                                Console.WriteLine($"[CcfPackOptimizer] P-frame reconstruction returned null for {fileId}, using I-frame");
                             }
                         }
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[CcfPackOptimizer] P-frame failed for {fileId}: {ex.Message}");
+                        Console.WriteLine($"[CcfPackOptimizer] P-frame failed for {member.FileId}: {ex.Message}");
                     }
                 }
 
                 if (!usedPFrame)
-                    WriteIFrame(fileId, ccfBytes);
+                    WriteIFrame(member.FileId, member.Ccf);
             }
         }
 
-        // Process ungrouped (failed to parse)
-        foreach (var (fileId, ccfBytes, _) in ungrouped)
-            WriteIFrame(fileId, ccfBytes);
+        foreach (var entry in ungrouped)
+            WriteIFrame(entry.FileId, entry.Ccf);
 
         byte[] innerPayload = innerMs.ToArray();
-
-        // ── Compress and write pack ──
         using var compressor = new Compressor(19);
         byte[] compressedPayload = compressor.Wrap(innerPayload).ToArray();
 
@@ -797,32 +912,20 @@ public class CcfPackOptimizerService : BackgroundService
 
         byte[] packData = packMs.ToArray();
         byte[] indexData = idxMs.ToArray();
-
         await store.StorePackAsync(packId, packData, indexData, ct);
 
-        foreach (var (fileId, _, _) in entries)
-            store.DeleteCcf(fileId);
-
-        sw.Stop();
-        long saved = totalRawBytes - packData.Length;
-        double compressionRatio = innerPayload.Length > 0
-            ? 1.0 - (double)compressedPayload.Length / innerPayload.Length
-            : 0;
-
-        LastPackedCount = entries.Count;
-        LastPackSavedBytes = saved;
-        TotalPackedAllTime += entries.Count;
-        TotalPackRawBytes += innerPayload.Length;
-        TotalPackCompressedBytes += compressedPayload.Length;
-        PframeGroupsFound += pframeGroups;
-        PframeDeltaCount += cyclePframeDelta;
-        PframeSavedBytes += cyclePframeSaved;
-
-        Console.WriteLine($"[CcfPackOptimizer] Packed {entries.Count} CCFs into {packId}: " +
-            $"raw={totalRawBytes / 1024.0:F1}KB → inner={innerPayload.Length / 1024.0:F1}KB → " +
-            $"zstd={compressedPayload.Length / 1024.0:F1}KB ({compressionRatio * 100:F1}% pack compression), " +
-            $"P-frame: {cyclePframeDelta} deltas in {pframeGroups} families (saved {cyclePframeSaved / 1024.0:F1}KB inner), " +
-            $"{sw.ElapsedMilliseconds}ms");
+        return new PackBuildResult
+        {
+            PackId = packId,
+            EntryCount = entries.Count,
+            TotalRawBytes = totalRawBytes,
+            PframeGroups = pframeGroups,
+            PframeDeltaCount = cyclePframeDelta,
+            PframeSavedBytes = cyclePframeSaved,
+            InnerBytes = innerPayload.Length,
+            CompressedBytes = compressedPayload.Length,
+            PackBytes = packData.Length
+        };
     }
 
     private static byte[]? TrainDictionaryFromCcfs(List<(string FileId, byte[] Data)> ccfEntries)

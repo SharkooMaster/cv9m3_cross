@@ -113,6 +113,49 @@ public class CcfStoreService
         }
     }
 
+    public IEnumerable<(string PackId, long PackBytes)> ListPacks()
+    {
+        if (!Directory.Exists(_packsDir)) yield break;
+        foreach (var packFile in Directory.EnumerateFiles(_packsDir, "*.pack"))
+        {
+            string packId = Path.GetFileNameWithoutExtension(packFile);
+            long bytes = 0;
+            try { bytes = new FileInfo(packFile).Length; } catch { }
+            yield return (packId, bytes);
+        }
+    }
+
+    public IEnumerable<string> ListPackEntryIds(string packId)
+    {
+        string idxFile = Path.Combine(_packsDir, $"{packId}.idx");
+        if (!File.Exists(idxFile)) yield break;
+
+        FileStream? fs = null;
+        BinaryReader? br = null;
+        try
+        {
+            fs = new FileStream(idxFile, FileMode.Open, FileAccess.Read, FileShare.Read);
+            br = new BinaryReader(fs);
+            int entryCount = br.ReadInt32();
+            byte[] idBytes = new byte[64];
+            for (int i = 0; i < entryCount; i++)
+            {
+                int bytesRead = br.Read(idBytes, 0, 64);
+                if (bytesRead < 64) break;
+                br.ReadInt64(); // offset
+                br.ReadInt32(); // length
+                string entryId = System.Text.Encoding.UTF8.GetString(idBytes).TrimEnd('\0');
+                if (!string.IsNullOrEmpty(entryId))
+                    yield return entryId;
+            }
+        }
+        finally
+        {
+            br?.Dispose();
+            fs?.Dispose();
+        }
+    }
+
     public int UnpackedCount()
     {
         if (!Directory.Exists(_ccfDir)) return 0;
@@ -124,6 +167,54 @@ public class CcfStoreService
         await File.WriteAllBytesAsync(Path.Combine(_packsDir, $"{packId}.pack"), packData, ct);
         await File.WriteAllBytesAsync(Path.Combine(_packsDir, $"{packId}.idx"), indexData, ct);
         Console.WriteLine($"[CcfStore] Stored pack {packId} ({packData.Length} bytes, {indexData.Length} byte index)");
+    }
+
+    public bool DeletePack(string packId)
+    {
+        string packFile = Path.Combine(_packsDir, $"{packId}.pack");
+        string idxFile = Path.Combine(_packsDir, $"{packId}.idx");
+        bool deleted = false;
+
+        try
+        {
+            if (File.Exists(packFile))
+            {
+                File.Delete(packFile);
+                deleted = true;
+            }
+            if (File.Exists(idxFile))
+            {
+                File.Delete(idxFile);
+                deleted = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CcfStore] Failed deleting pack {packId}: {ex.Message}");
+            return false;
+        }
+
+        if (deleted)
+        {
+            lock (_cacheLock)
+            {
+                if (_packCache.ContainsKey(packFile))
+                    _packCache.Remove(packFile);
+            }
+
+            lock (_pframeCacheLock)
+            {
+                var keysToRemove = _pframeCache.Keys
+                    .Where(k => k.StartsWith(packFile + ":", StringComparison.Ordinal))
+                    .ToList();
+                foreach (var key in keysToRemove)
+                    _pframeCache.Remove(key);
+            }
+
+            Console.WriteLine($"[CcfStore] Deleted pack {packId}");
+        }
+
+        return true;
     }
 
     public async Task StoreDictAsync(byte[] dictData, CancellationToken ct = default)
