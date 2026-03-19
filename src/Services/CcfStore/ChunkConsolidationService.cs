@@ -92,7 +92,7 @@ public class ChunkConsolidationService : BackgroundService
     {
         var store = CcfStoreService.Instance;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        long memoryBudget = Globals.GetDynamicMemoryBudget(0.30);
+        long memoryBudget = Globals.GetDynamicWorkingSetCeiling(0.70);
         DateTime deadline = DateTime.UtcNow.AddMinutes(3);
         var packBytesById = store.ListPacks()
             .GroupBy(p => p.PackId, StringComparer.OrdinalIgnoreCase)

@@ -658,14 +658,15 @@ public class CcfPackOptimizerService : BackgroundService
             }
         }
 
-        var candidateIds = new List<(string FileId, string? SourcePackId)>();
+        var unpackedCandidates = new List<(string FileId, string? SourcePackId)>();
+        var packCandidates = new List<(string FileId, string? SourcePackId)>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var selectedPacks = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var id in unpackedIds)
         {
             if (seen.Add(id))
-                candidateIds.Add((id, null));
+                unpackedCandidates.Add((id, null));
         }
 
         if (Globals.CcfGlobalCompactionEnabled)
@@ -691,12 +692,18 @@ public class CcfPackOptimizerService : BackgroundService
                 foreach (var id in ids)
                 {
                     if (seen.Add(id))
-                        candidateIds.Add((id, packId));
+                        packCandidates.Add((id, packId));
                 }
             }
 
-            Console.WriteLine($"[CcfPackOptimizer] Global compaction enabled: sourcePacks={selectedPacks.Count}, candidates={candidateIds.Count}, readBudget={readBudget / 1024 / 1024}MB");
+            Console.WriteLine($"[CcfPackOptimizer] Global compaction enabled: sourcePacks={selectedPacks.Count}, candidates={unpackedCandidates.Count + packCandidates.Count}, readBudget={readBudget / 1024 / 1024}MB");
         }
+
+        // Prioritize source pack entries when global compaction is enabled, so we
+        // actually compact packs under load instead of repeatedly only taking 1-2 unpacked files.
+        var candidateIds = Globals.CcfGlobalCompactionEnabled
+            ? packCandidates.Concat(unpackedCandidates).ToList()
+            : unpackedCandidates;
 
         if (candidateIds.Count < Globals.CcfPackThreshold)
         {
@@ -710,7 +717,7 @@ public class CcfPackOptimizerService : BackgroundService
         long maxReadBytes = Math.Max(64L * 1024 * 1024, Globals.CcfCompactionMaxReadBytesPerCycle);
         long maxWorkingSetBytes = Globals.CcfCompactionMaxWorkingSetMb > 0
             ? (long)Globals.CcfCompactionMaxWorkingSetMb * 1024L * 1024L
-            : Globals.GetDynamicMemoryBudget();
+            : Globals.GetDynamicWorkingSetCeiling(0.85);
         DateTime deadline = DateTime.UtcNow.AddSeconds(Math.Max(5, Globals.CcfCompactionMaxDurationSec));
         var loadedByPack = selectedPacks.Keys.ToDictionary(k => k, _ => 0, StringComparer.OrdinalIgnoreCase);
 

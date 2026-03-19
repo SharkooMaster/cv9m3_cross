@@ -132,23 +132,21 @@ public static class Globals
     internal static readonly SemaphoreSlim CcfOptimizationLock = new(1, 1);
 
     /// <summary>
-    /// Returns a memory budget based on current available system memory.
+    /// Returns an absolute working-set ceiling based on available container memory.
     /// Container-aware via GC.GetGCMemoryInfo (respects cgroup limits).
     /// </summary>
-    public static long GetDynamicMemoryBudget(double fraction = 0.50)
+    public static long GetDynamicWorkingSetCeiling(double fraction = 0.85)
     {
         try
         {
             var gcInfo = GC.GetGCMemoryInfo();
             long totalAvailable = gcInfo.TotalAvailableMemoryBytes;
-            long currentUsage = Environment.WorkingSet;
-            long freeHeadroom = totalAvailable - currentUsage;
-            long budget = (long)(freeHeadroom * fraction);
-            return Math.Clamp(budget, 256L * 1024 * 1024, 8L * 1024 * 1024 * 1024);
+            long ceiling = (long)(totalAvailable * fraction);
+            return Math.Clamp(ceiling, 1024L * 1024 * 1024, 32L * 1024 * 1024 * 1024);
         }
         catch
         {
-            return 512L * 1024 * 1024;
+            return 8L * 1024 * 1024 * 1024;
         }
     }
 
