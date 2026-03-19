@@ -1077,6 +1077,12 @@ public class CompressFileService : FileService.FileServiceBase
             resp.PframeSavingRatio = CcfPackOptimizerService.TotalPackRawBytes > 0
                 ? (double)CcfPackOptimizerService.PframeSavedBytes / CcfPackOptimizerService.TotalPackRawBytes
                 : 0;
+            resp.LastConsolidationSavedBytes = ChunkConsolidationService.LastConsolidationSavedBytes;
+            resp.TotalConsolidationSavedBytes = ChunkConsolidationService.TotalConsolidationSavedBytes;
+            resp.LastConsolidatedEntries = ChunkConsolidationService.LastRepackedEntries;
+            resp.LastConsolidationUnix = ChunkConsolidationService.LastConsolidationUtc.HasValue
+                ? new DateTimeOffset(ChunkConsolidationService.LastConsolidationUtc.Value).ToUnixTimeSeconds()
+                : 0;
         }
 
         return Task.FromResult(resp);
@@ -1097,6 +1103,7 @@ public class CompressFileService : FileService.FileServiceBase
         {
             var (bytesFreed, filesDeleted) = CcfStoreService.Instance.ClearAll();
             CcfPackOptimizerService.ResetStats();
+            ChunkConsolidationService.ResetStats();
 
             resp.Success = true;
             resp.BytesFreed = bytesFreed;

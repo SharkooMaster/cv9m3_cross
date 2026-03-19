@@ -23,6 +23,19 @@ public class ChunkConsolidationService : BackgroundService
     public static int LastScannedPacks;
     public static int LastRepackedEntries;
     public static int LastScatteredFamilies;
+    public static DateTime? LastConsolidationUtc;
+    public static long LastConsolidationSavedBytes;
+    public static long TotalConsolidationSavedBytes;
+
+    public static void ResetStats()
+    {
+        LastScannedPacks = 0;
+        LastRepackedEntries = 0;
+        LastScatteredFamilies = 0;
+        LastConsolidationUtc = null;
+        LastConsolidationSavedBytes = 0;
+        TotalConsolidationSavedBytes = 0;
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -81,6 +94,9 @@ public class ChunkConsolidationService : BackgroundService
         var sw = System.Diagnostics.Stopwatch.StartNew();
         long memoryBudget = Globals.GetDynamicMemoryBudget(0.30);
         DateTime deadline = DateTime.UtcNow.AddMinutes(3);
+        var packBytesById = store.ListPacks()
+            .GroupBy(p => p.PackId, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First().PackBytes, StringComparer.OrdinalIgnoreCase);
 
         // Phase 1: Lightweight fingerprint scan per pack.
         // Track which RefsFingerprint families live in each pack.
@@ -165,6 +181,7 @@ public class ChunkConsolidationService : BackgroundService
         }
 
         Console.WriteLine($"[ChunkConsolidation] Targeting {packsToRepack.Count} packs for family consolidation");
+        long sourcePackBytes = packsToRepack.Sum(p => packBytesById.TryGetValue(p, out var b) ? Math.Max(0, b) : 0L);
 
         // Phase 4: Load ALL entries from selected packs and repack optimally
         var allEntries = new List<CcfPackOptimizerService.LoadedEntry>();
@@ -240,6 +257,9 @@ public class ChunkConsolidationService : BackgroundService
             ct);
 
         LastRepackedEntries = result.EntryCount;
+        LastConsolidationUtc = DateTime.UtcNow;
+        LastConsolidationSavedBytes = Math.Max(0, sourcePackBytes - result.PackBytes);
+        TotalConsolidationSavedBytes += LastConsolidationSavedBytes;
 
         CcfPackOptimizerService.PframeGroupsFound += result.PframeGroups;
         CcfPackOptimizerService.PframeDeltaCount += result.PframeDeltaCount;
@@ -249,6 +269,7 @@ public class ChunkConsolidationService : BackgroundService
         Console.WriteLine($"[ChunkConsolidation] Consolidated {result.EntryCount} entries → {result.PackId}: " +
             $"inner={result.InnerBytes / 1024.0:F1}KB → zstd={result.CompressedBytes / 1024.0:F1}KB ({ratio * 100:F1}%), " +
             $"P-frame: {result.PframeDeltaCount} deltas in {result.PframeGroups} families, " +
+            $"consolidationSaved={LastConsolidationSavedBytes / 1024.0:F1}KB, " +
             $"cleanup scheduled for {fullyMigratedSourcePacks.Count}/{packsToRepack.Count} source packs ({sw.ElapsedMilliseconds}ms)");
     }
 

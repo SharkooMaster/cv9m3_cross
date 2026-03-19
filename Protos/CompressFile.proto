@@ -141,4 +141,8 @@ message CcfStoreStatsResponse {
   int32 pframe_delta_count = 19;     // number of CCFs stored as P-frame deltas
   int64 pframe_saved_bytes = 20;     // inner payload bytes saved by P-frame delta encoding
   double pframe_saving_ratio = 21;   // P-frame savings as ratio of total inner payload
+  int64 last_consolidation_saved_bytes = 22;   // bytes saved in the most recent consolidation cycle
+  int64 total_consolidation_saved_bytes = 23;  // cumulative bytes saved by consolidation cycles
+  int64 last_consolidation_unix = 24;          // seconds since epoch, 0 = never
+  int32 last_consolidated_entries = 25;        // entries rewritten in most recent consolidation cycle
 }
