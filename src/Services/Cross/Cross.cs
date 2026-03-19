@@ -35,8 +35,8 @@ public class CrossService : ICross
     // v5.0.0: Compact ref table with (bucketId, bucketIndex) as ulong pairs replaces inline 32-byte
     //         SHA256 storageGuids. Per-chunk refs use uint16 table indices into the ref table.
     //         Uses standard header (ParseHeader), zstd on error dict, SHA256 hash — same as v3.1.0.
-    private const string EncodingVersion = "v5.5.0";
-    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0", "v5.1.0", "v5.2.0", "v5.3.0", "v5.4.0", "v5.5.0" };
+    private const string EncodingVersion = "v5.6.0";
+    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0", "v5.1.0", "v5.2.0", "v5.3.0", "v5.4.0", "v5.5.0", "v5.6.0" };
     string headID = "";
     private readonly global::Cross.Services.Grpc.Agent.ChunkReferenceServiceClient _chunkReferenceClient = new();
 
@@ -212,7 +212,7 @@ public class CrossService : ICross
         bw.Write(references.Length);
 
         byte[] errorPayload;
-        if (version is "v5.3.0" or "v5.4.0" or "v5.5.0")
+        if (version is "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
         {
             errorPayload = errorDictionary;
             bw.Write(errorPayload.Length);
@@ -373,7 +373,7 @@ public class CrossService : ICross
         // v3.1.0+: error dictionary is zstd-compressed; header has [compressedLen][originalLen]
         // v5.3.0+: sub-streams are internally compressed; both lengths are identical
         int errorOriginalLength = errorLength; // for uncompressed versions, original == stored
-        if (version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0")
+        if (version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
         {
             errorOriginalLength = BitConverter.ToInt32(payload.Slice(offset, IntSize));
             offset += IntSize;
@@ -381,7 +381,7 @@ public class CrossService : ICross
 
         // v2.1.0+: trim chunk length is stored in the header
         int trimLength = -1; // -1 means "not present" (v2.0.0 compat)
-        if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0")
+        if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
         {
             trimLength = BitConverter.ToInt32(payload.Slice(offset, IntSize));
             offset += IntSize;
@@ -2257,9 +2257,11 @@ public class CrossService : ICross
 
         // v5.0.0: references are built by BuildV5References (ref table + compact indices)
 
-        // ── ERROR ENCODING (v5.5.0): skip:value with direct byte replacement ──
-        // 2-bit mode per chunk: 00=duplicate (zero cost), 01=skip:value, 10=bitmask:value
-        // Value stream stores original bytes directly (NOT XOR).
+        // ── ERROR ENCODING (v5.6.0): bitmask-only with direct byte replacement ──
+        // 1-bit mode per chunk: 0=duplicate, 1=bitmask+values.
+        // Eliminates the skip stream entirely — sparse bitmasks compress better
+        // under zstd-19 than variable-length skip varints, and decode faster
+        // (direct bit indexing vs sequential varint walk).
         byte[] errorDictionaryBytes;
         {
             using var stage = Observability.StartStage("PatchEncode");
@@ -2269,12 +2271,14 @@ public class CrossService : ICross
             int cs = Globals.chunkSize;
             int totalBytes = chunkCount * cs;
             int bitmaskBytes = cs / 8;
-            int bitmaskThreshold = bitmaskBytes;
 
-            // Pass 1: compare original vs reference, record diff positions and original bytes
-            bool[][] chunkDiffMask = new bool[chunkCount][];
-            byte[][] chunkOriginalVals = new byte[chunkCount][];
-            int[] chunkErrors = new int[chunkCount];
+            byte[] modeBitfield = new byte[(chunkCount + 7) / 8];
+            using var bitmaskMs = new MemoryStream();
+            using var valMs = new MemoryStream();
+
+            int patchCount = 0;
+            int dupChunks = 0;
+            int bitmaskChunks = 0;
 
             for (int i = 0; i < chunkCount; i++)
             {
@@ -2303,97 +2307,41 @@ public class CrossService : ICross
                     baseChunk = Array.Empty<byte>();
                 }
 
-                bool[] diffs = new bool[cs];
-                int errs = 0;
                 int baseLen = Math.Min(baseChunk.Length, cs);
+                byte[] mask = new byte[bitmaskBytes];
+                int errs = 0;
+
                 for (int b = 0; b < cs; b++)
                 {
                     byte refByte = b < baseLen ? baseChunk[b] : (byte)0;
                     if (original[b] != refByte)
                     {
-                        diffs[b] = true;
+                        mask[b >> 3] |= (byte)(1 << (b & 7));
                         errs++;
                     }
                 }
-                chunkDiffMask[i] = diffs;
-                chunkOriginalVals[i] = original;
-                chunkErrors[i] = errs;
-            }
 
-            // Pass 2: encode into 4 streams with 2-bit mode per chunk
-            // Mode: 00=duplicate, 01=skip, 10=bitmask
-            byte[] modeBitfield = new byte[(chunkCount * 2 + 7) / 8];
-            using var skipMs = new MemoryStream();
-            using var bitmaskMs = new MemoryStream();
-            using var valMs = new MemoryStream();
-
-            int patchCount = 0;
-            int dupChunks = 0;
-            int skipChunks = 0;
-            int bitmaskChunks = 0;
-
-            for (int i = 0; i < chunkCount; i++)
-            {
-                bool[] diffs = chunkDiffMask[i];
-                byte[] original = chunkOriginalVals[i];
-                int errs = chunkErrors[i];
                 patchCount += errs;
 
                 if (errs == 0)
                 {
-                    // Mode 00 = duplicate: bits are already zero, write nothing
                     dupChunks++;
-                }
-                else if (errs > bitmaskThreshold)
-                {
-                    // Mode 10 = bitmask
-                    int bitPos = i * 2;
-                    modeBitfield[bitPos / 8] |= (byte)(0x02 << (bitPos % 8));
-
-                    bitmaskChunks++;
-
-                    byte[] mask = new byte[bitmaskBytes];
-                    for (int b = 0; b < cs; b++)
-                    {
-                        if (diffs[b])
-                            mask[b / 8] |= (byte)(1 << (b % 8));
-                    }
-                    bitmaskMs.Write(mask, 0, bitmaskBytes);
-
-                    for (int b = 0; b < cs; b++)
-                    {
-                        if (diffs[b])
-                            valMs.WriteByte(original[b]);
-                    }
                 }
                 else
                 {
-                    // Mode 01 = skip:value
-                    int bitPos = i * 2;
-                    modeBitfield[bitPos / 8] |= (byte)(0x01 << (bitPos % 8));
+                    modeBitfield[i >> 3] |= (byte)(1 << (i & 7));
+                    bitmaskChunks++;
 
-                    skipChunks++;
-
-                    uint skipRun = 0;
+                    bitmaskMs.Write(mask, 0, bitmaskBytes);
                     for (int b = 0; b < cs; b++)
                     {
-                        if (!diffs[b])
-                        {
-                            skipRun++;
-                        }
-                        else
-                        {
-                            WriteVarint(skipMs, skipRun);
+                        if ((mask[b >> 3] & (1 << (b & 7))) != 0)
                             valMs.WriteByte(original[b]);
-                            skipRun = 0;
-                        }
                     }
-                    WriteVarint(skipMs, skipRun);
                 }
             }
 
             byte[] rawMode = modeBitfield;
-            byte[] rawSkips = skipMs.ToArray();
             byte[] rawBitmasks = bitmaskMs.ToArray();
             byte[] rawVals = valMs.ToArray();
 
@@ -2401,23 +2349,20 @@ public class CrossService : ICross
                 ? CcfPackOptimizerService.LiveDictionary
                 : null;
 
-            byte[] zstdMode, zstdSkips, zstdBitmasks, zstdVals;
+            byte[] zstdMode, zstdBitmasks, zstdVals;
             if (liveDict != null)
             {
                 using var c1 = new Compressor(19); c1.LoadDictionary(liveDict);
                 zstdMode = c1.Wrap(rawMode).ToArray();
                 using var c2 = new Compressor(19); c2.LoadDictionary(liveDict);
-                zstdSkips = c2.Wrap(rawSkips).ToArray();
+                zstdBitmasks = c2.Wrap(rawBitmasks).ToArray();
                 using var c3 = new Compressor(19); c3.LoadDictionary(liveDict);
-                zstdBitmasks = c3.Wrap(rawBitmasks).ToArray();
-                using var c4 = new Compressor(19); c4.LoadDictionary(liveDict);
-                zstdVals = c4.Wrap(rawVals).ToArray();
+                zstdVals = c3.Wrap(rawVals).ToArray();
             }
             else
             {
                 using var c = new Compressor(19);
                 zstdMode = c.Wrap(rawMode).ToArray();
-                zstdSkips = c.Wrap(rawSkips).ToArray();
                 zstdBitmasks = c.Wrap(rawBitmasks).ToArray();
                 zstdVals = c.Wrap(rawVals).ToArray();
             }
@@ -2428,11 +2373,9 @@ public class CrossService : ICross
             bw2.Write(totalBytes);
             bw2.Write(chunkCount);
             bw2.Write(zstdMode.Length);
-            bw2.Write(zstdSkips.Length);
             bw2.Write(zstdBitmasks.Length);
             bw2.Write(zstdVals.Length);
             bw2.Write(zstdMode);
-            bw2.Write(zstdSkips);
             bw2.Write(zstdBitmasks);
             bw2.Write(zstdVals);
             bw2.Flush();
@@ -2440,10 +2383,10 @@ public class CrossService : ICross
             errorDictionaryBytes = outMs.ToArray();
 
             phaseSw.Stop();
-            Console.WriteLine($"[Compress] PatchEncode(v5.5.0): {phaseSw.ElapsedMilliseconds}ms, " +
+            Console.WriteLine($"[Compress] PatchEncode(v5.6.0): {phaseSw.ElapsedMilliseconds}ms, " +
                 $"totalBytes={totalBytes}, patches={patchCount} ({100.0 * patchCount / totalBytes:F1}%), " +
-                $"dup={dupChunks}, skip={skipChunks}, bitmask={bitmaskChunks} (of {chunkCount}), " +
-                $"modeStream={rawMode.Length}→{zstdMode.Length}, skipStream={rawSkips.Length}→{zstdSkips.Length}, " +
+                $"dup={dupChunks}, bitmask={bitmaskChunks} (of {chunkCount}), " +
+                $"modeStream={rawMode.Length}→{zstdMode.Length}, " +
                 $"bitmaskStream={rawBitmasks.Length}→{zstdBitmasks.Length}, valStream={rawVals.Length}→{zstdVals.Length}, " +
                 $"totalErrorPayload={errorDictionaryBytes.Length}");
             Observability.RecordStage("PatchEncode", phaseSw.Elapsed.TotalMilliseconds,
@@ -3005,7 +2948,7 @@ public class CrossService : ICross
         // Byte-merge metadata for 0x05 refs (pair merge with per-byte bitmask)
         var byteMergeRefs = new Dictionary<int, (List<(ulong BucketId, string StorageGuid, ulong BucketIndex)> Donors, byte[] Bitmask)>();
 
-        if (header.Version is "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0")
+        if (header.Version is "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
         {
             // v5.x: compact ref table + ushort indices
             // [4 bytes: chunkCount] [2 bytes: refTableSize]
@@ -3277,6 +3220,7 @@ public class CrossService : ICross
         }
 
         // ── Parse error encoding ──
+        // v5.6.0: bitmask-only with direct bytes, 1-bit mode (0=dup, 1=bitmask)
         // v5.5.0: skip:value with direct bytes, 2-bit mode (00=dup, 01=skip, 10=bitmask)
         // v5.4.0: four-stream with XOR (mode bitfield + skip + bitmask + value)
         // v5.3.0: split-stream (skip stream + value stream, each Zstd-19 compressed internally)
@@ -3291,9 +3235,10 @@ public class CrossService : ICross
         bool isSplitStreamPatch = (header.Version == "v5.3.0");
         bool isFourStreamPatch = (header.Version == "v5.4.0");
         bool isDirectPatch = (header.Version == "v5.5.0");
+        bool isBitmaskOnlyPatch = (header.Version == "v5.6.0");
         (int startPos, int runLength, short diffValue)[]? patches = null;
 
-        if (header.Version is "v5.3.0" or "v5.4.0" or "v5.5.0")
+        if (header.Version is "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
         {
             errorBytes = new byte[header.ErrorLength];
             Buffer.BlockCopy(file, errorOffset, errorBytes, 0, header.ErrorLength);
@@ -3310,7 +3255,7 @@ public class CrossService : ICross
             Buffer.BlockCopy(file, errorOffset, errorBytes, 0, header.ErrorLength);
         }
 
-        if (!isXorPatch && !isSkipXorPatch && !isRunXorPatch && !isSplitStreamPatch && !isFourStreamPatch && !isDirectPatch)
+        if (!isXorPatch && !isSkipXorPatch && !isRunXorPatch && !isSplitStreamPatch && !isFourStreamPatch && !isDirectPatch && !isBitmaskOnlyPatch)
         {
             using var errorMs = new MemoryStream(errorBytes, writable: false);
             using var reader = new BinaryReader(errorMs, Encoding.UTF8, leaveOpen: true);
@@ -3593,7 +3538,87 @@ public class CrossService : ICross
         }
 
         // ── Apply error encoding ──
-        if (isDirectPatch)
+        if (isBitmaskOnlyPatch)
+        {
+            // v5.6.0: bitmask-only with direct byte replacement, 1-bit mode per chunk
+            using var errMs = new MemoryStream(errorBytes, writable: false);
+            using var errBr = new BinaryReader(errMs);
+            int patchCount = errBr.ReadInt32();
+            int originalSize = errBr.ReadInt32();
+            if (originalSize != baseBuffer.Length)
+                throw new InvalidDataException(
+                    $"v5.6.0 originalSize {originalSize} does not match base buffer {baseBuffer.Length}.");
+            int bmChunkCount = errBr.ReadInt32();
+            int compModeLen = errBr.ReadInt32();
+            int compBitmaskLen = errBr.ReadInt32();
+            int compValLen = errBr.ReadInt32();
+
+            int modeOffset = (int)errMs.Position;
+            int bitmaskOffset = modeOffset + compModeLen;
+            int valOffset = bitmaskOffset + compBitmaskLen;
+
+            var dictForDecomp = Globals.EnableCcfStore
+                ? CcfPackOptimizerService.LiveDictionary
+                : null;
+
+            byte[] modeStream, bitmaskStream, valStream;
+            if (dictForDecomp != null)
+            {
+                try
+                {
+                    using var dd = new Decompressor();
+                    dd.LoadDictionary(dictForDecomp);
+                    modeStream = dd.Unwrap(new ReadOnlySpan<byte>(errorBytes, modeOffset, compModeLen)).ToArray();
+                    bitmaskStream = dd.Unwrap(new ReadOnlySpan<byte>(errorBytes, bitmaskOffset, compBitmaskLen)).ToArray();
+                    valStream = dd.Unwrap(new ReadOnlySpan<byte>(errorBytes, valOffset, compValLen)).ToArray();
+                }
+                catch
+                {
+                    using var dd2 = new Decompressor();
+                    modeStream = dd2.Unwrap(new ReadOnlySpan<byte>(errorBytes, modeOffset, compModeLen)).ToArray();
+                    bitmaskStream = dd2.Unwrap(new ReadOnlySpan<byte>(errorBytes, bitmaskOffset, compBitmaskLen)).ToArray();
+                    valStream = dd2.Unwrap(new ReadOnlySpan<byte>(errorBytes, valOffset, compValLen)).ToArray();
+                }
+            }
+            else
+            {
+                using var d = new Decompressor();
+                modeStream = d.Unwrap(new ReadOnlySpan<byte>(errorBytes, modeOffset, compModeLen)).ToArray();
+                bitmaskStream = d.Unwrap(new ReadOnlySpan<byte>(errorBytes, bitmaskOffset, compBitmaskLen)).ToArray();
+                valStream = d.Unwrap(new ReadOnlySpan<byte>(errorBytes, valOffset, compValLen)).ToArray();
+            }
+
+            int cs = Globals.chunkSize;
+            int bitmaskBytes = cs / 8;
+            int valIdx = 0;
+            int bmIdx = 0;
+
+            for (int ci = 0; ci < bmChunkCount; ci++)
+            {
+                bool hasErrors = (ci >> 3 < modeStream.Length)
+                    && ((modeStream[ci >> 3] >> (ci & 7)) & 1) != 0;
+
+                if (!hasErrors) continue;
+
+                int baseOff = ci * cs;
+                for (int bytePos = 0; bytePos < bitmaskBytes; bytePos++)
+                {
+                    byte maskByte = bitmaskStream[bmIdx + bytePos];
+                    if (maskByte == 0) continue;
+                    for (int bit = 0; bit < 8; bit++)
+                    {
+                        if (((maskByte >> bit) & 1) == 1)
+                        {
+                            int p = bytePos * 8 + bit;
+                            if (baseOff + p < baseBuffer.Length)
+                                baseBuffer[baseOff + p] = valStream[valIdx++];
+                        }
+                    }
+                }
+                bmIdx += bitmaskBytes;
+            }
+        }
+        else if (isDirectPatch)
         {
             // v5.5.0: skip:value with direct byte replacement, 2-bit mode per chunk
             using var errMs = new MemoryStream(errorBytes, writable: false);

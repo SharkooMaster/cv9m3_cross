@@ -289,11 +289,11 @@ public class ChunkConsolidationService : BackgroundService
             string version = Encoding.UTF8.GetString(file, pos, versionLen); pos += versionLen;
             int refsLen = BitConverter.ToInt32(file, pos); pos += 4;
 
-            bool hasOrigLen = version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0";
+            bool hasOrigLen = version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0";
             pos += 4;
             if (hasOrigLen) pos += 4;
 
-            bool hasTrim = version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0";
+            bool hasTrim = version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0";
             if (hasTrim) pos += 4;
 
             int refsOffset = pos;

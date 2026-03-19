@@ -1070,7 +1070,7 @@ public class CompressFileService : FileService.FileServiceBase
             resp.PackCompressionRatio = CcfPackOptimizerService.TotalPackRawBytes > 0
                 ? 1.0 - (double)CcfPackOptimizerService.TotalPackCompressedBytes / CcfPackOptimizerService.TotalPackRawBytes
                 : 0;
-            resp.EncodingVersion = "v5.5.0";
+            resp.EncodingVersion = "v5.6.0";
             resp.PframeGroups = CcfPackOptimizerService.PframeGroupsFound;
             resp.PframeDeltaCount = CcfPackOptimizerService.PframeDeltaCount;
             resp.PframeSavedBytes = CcfPackOptimizerService.PframeSavedBytes;

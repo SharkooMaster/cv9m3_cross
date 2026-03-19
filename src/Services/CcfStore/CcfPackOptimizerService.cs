@@ -149,12 +149,12 @@ public class CcfPackOptimizerService : BackgroundService
             int refsLen = BitConverter.ToInt32(file, pos); pos += 4;
 
             int errorCompLen;
-            bool hasOrigLen = comp.Version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0";
+            bool hasOrigLen = comp.Version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0";
             errorCompLen = BitConverter.ToInt32(file, pos); pos += 4;
             if (hasOrigLen) pos += 4; // skip errorOrigLen
 
             int trimLen = 0;
-            bool hasTrim = comp.Version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0";
+            bool hasTrim = comp.Version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0";
             if (hasTrim) { trimLen = BitConverter.ToInt32(file, pos); pos += 4; }
 
             int refsOffset = pos;
@@ -186,7 +186,47 @@ public class CcfPackOptimizerService : BackgroundService
             byte[] errorPayload = new byte[errorCompLen];
             if (errorCompLen > 0) Buffer.BlockCopy(file, errorOffset, errorPayload, 0, errorCompLen);
 
-            if (comp.Version == "v5.5.0" && errorCompLen >= 28)
+            if (comp.Version == "v5.6.0" && errorCompLen >= 24)
+            {
+                comp.IsDirectPatch = true;
+                comp.PatchCount = BitConverter.ToInt32(errorPayload, 0);
+                comp.OriginalSize = BitConverter.ToInt32(errorPayload, 4);
+                comp.FourStreamChunkCount = BitConverter.ToInt32(errorPayload, 8);
+                int compModeLen = BitConverter.ToInt32(errorPayload, 12);
+                int compBitmaskLen = BitConverter.ToInt32(errorPayload, 16);
+                int compValLen = BitConverter.ToInt32(errorPayload, 20);
+
+                int headerSize = 24;
+                if (headerSize + compModeLen + compBitmaskLen + compValLen <= errorCompLen)
+                {
+                    var dict = _liveDict;
+                    int off = headerSize;
+                    try
+                    {
+                        using var d = new Decompressor();
+                        if (dict != null) d.LoadDictionary(dict);
+                        comp.ModeBitfield = d.Unwrap(errorPayload.AsSpan(off, compModeLen)).ToArray();
+                        off += compModeLen;
+                        comp.RawSkip = Array.Empty<byte>();
+                        comp.RawBitmask = d.Unwrap(errorPayload.AsSpan(off, compBitmaskLen)).ToArray();
+                        off += compBitmaskLen;
+                        comp.RawValues = d.Unwrap(errorPayload.AsSpan(off, compValLen)).ToArray();
+                    }
+                    catch
+                    {
+                        using var d2 = new Decompressor();
+                        off = headerSize;
+                        comp.ModeBitfield = d2.Unwrap(errorPayload.AsSpan(off, compModeLen)).ToArray();
+                        off += compModeLen;
+                        comp.RawSkip = Array.Empty<byte>();
+                        comp.RawBitmask = d2.Unwrap(errorPayload.AsSpan(off, compBitmaskLen)).ToArray();
+                        off += compBitmaskLen;
+                        comp.RawValues = d2.Unwrap(errorPayload.AsSpan(off, compValLen)).ToArray();
+                    }
+                    comp.IsValid = true;
+                }
+            }
+            else if (comp.Version == "v5.5.0" && errorCompLen >= 28)
             {
                 comp.IsDirectPatch = true;
                 comp.PatchCount = BitConverter.ToInt32(errorPayload, 0);
@@ -329,12 +369,24 @@ public class CcfPackOptimizerService : BackgroundService
         using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
 
         bw.Write(comp.OriginalCcfLength);
-        byte errorFormat = comp.IsDirectPatch ? (byte)3 : comp.IsFourStream ? (byte)2 : comp.IsSplitStream ? (byte)0 : (byte)1;
+        bool isBitmaskOnly = comp.IsDirectPatch && (comp.Version == "v5.6.0");
+        byte errorFormat = isBitmaskOnly ? (byte)4 : comp.IsDirectPatch ? (byte)3 : comp.IsFourStream ? (byte)2 : comp.IsSplitStream ? (byte)0 : (byte)1;
         bw.Write(errorFormat);
         bw.Write(comp.PatchCount);
         bw.Write(comp.OriginalSize);
 
-        if (comp.IsDirectPatch || comp.IsFourStream)
+        if (isBitmaskOnly)
+        {
+            bw.Write(comp.FourStreamChunkCount);
+            using var c = new Compressor(19);
+            byte[] portableMode = c.Wrap(comp.ModeBitfield).ToArray();
+            byte[] portableBitmask = c.Wrap(comp.RawBitmask).ToArray();
+            bw.Write(portableMode.Length);
+            bw.Write(portableMode);
+            bw.Write(portableBitmask.Length);
+            bw.Write(portableBitmask);
+        }
+        else if (comp.IsDirectPatch || comp.IsFourStream)
         {
             bw.Write(comp.FourStreamChunkCount);
             using var c = new Compressor(19);
@@ -398,7 +450,15 @@ public class CcfPackOptimizerService : BackgroundService
             byte[] compSkip = Array.Empty<byte>();
             byte[] compBitmask = Array.Empty<byte>();
 
-            if (errorFormat == 3 || errorFormat == 2) // v5.5.0 direct / v5.4.0 four-stream
+            if (errorFormat == 4) // v5.6.0 bitmask-only
+            {
+                fourStreamChunkCount = br.ReadInt32();
+                int compModeLen = br.ReadInt32();
+                compMode = compModeLen > 0 ? br.ReadBytes(compModeLen) : Array.Empty<byte>();
+                int compBitmaskLen = br.ReadInt32();
+                compBitmask = compBitmaskLen > 0 ? br.ReadBytes(compBitmaskLen) : Array.Empty<byte>();
+            }
+            else if (errorFormat == 3 || errorFormat == 2) // v5.5.0 direct / v5.4.0 four-stream
             {
                 fourStreamChunkCount = br.ReadInt32();
                 int compModeLen = br.ReadInt32();
@@ -448,7 +508,33 @@ public class CcfPackOptimizerService : BackgroundService
             byte[] errorPayload;
             int errorOriginalLength;
 
-            if (errorFormat == 3 || errorFormat == 2) // v5.5.0 direct / v5.4.0 four-stream
+            if (errorFormat == 4) // v5.6.0 bitmask-only
+            {
+                using var dMode = new Decompressor();
+                byte[] rawMode = compMode.Length > 0 ? dMode.Unwrap(compMode).ToArray() : Array.Empty<byte>();
+                byte[] rawBitmask = compBitmask.Length > 0 ? dMode.Unwrap(compBitmask).ToArray() : Array.Empty<byte>();
+
+                using var c = new Compressor(3);
+                byte[] zMode = c.Wrap(rawMode).ToArray();
+                byte[] zBitmask = c.Wrap(rawBitmask).ToArray();
+                byte[] zVals = c.Wrap(originalData).ToArray();
+
+                using var errMs = new MemoryStream();
+                using var errBw = new BinaryWriter(errMs, Encoding.UTF8, leaveOpen: true);
+                errBw.Write(patchCount);
+                errBw.Write(originalSize);
+                errBw.Write(fourStreamChunkCount);
+                errBw.Write(zMode.Length);
+                errBw.Write(zBitmask.Length);
+                errBw.Write(zVals.Length);
+                errBw.Write(zMode);
+                errBw.Write(zBitmask);
+                errBw.Write(zVals);
+                errBw.Flush();
+                errorPayload = errMs.ToArray();
+                errorOriginalLength = errorPayload.Length;
+            }
+            else if (errorFormat == 3 || errorFormat == 2) // v5.5.0 direct / v5.4.0 four-stream
             {
                 using var dMode = new Decompressor();
                 byte[] rawMode = compMode.Length > 0 ? dMode.Unwrap(compMode).ToArray() : Array.Empty<byte>();
@@ -544,7 +630,7 @@ public class CcfPackOptimizerService : BackgroundService
         bw.Write(versionBytes);
         bw.Write(refs.Length);
 
-        if (version is "v5.3.0" or "v5.4.0" or "v5.5.0")
+        if (version is "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
         {
             bw.Write(errorPayload.Length);
             bw.Write(errorPayload.Length);
@@ -559,7 +645,7 @@ public class CcfPackOptimizerService : BackgroundService
             bw.Write(errorPayload.Length);
         }
 
-        if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0")
+        if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
             bw.Write(trim.Length);
 
         bw.Write(refs);
@@ -1168,7 +1254,7 @@ public class CcfPackOptimizerService : BackgroundService
             int refsLen = BitConverter.ToInt32(file, pos); pos += 4;
 
             int errorCompLen;
-            if (version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0")
+            if (version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
             {
                 errorCompLen = BitConverter.ToInt32(file, pos); pos += 4;
                 pos += 4;
@@ -1178,7 +1264,7 @@ public class CcfPackOptimizerService : BackgroundService
                 errorCompLen = BitConverter.ToInt32(file, pos); pos += 4;
             }
 
-            if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0")
+            if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
                 pos += 4;
 
             int errorOffset = pos + refsLen;
@@ -1187,7 +1273,19 @@ public class CcfPackOptimizerService : BackgroundService
             byte[] errorPayload = new byte[errorCompLen];
             Buffer.BlockCopy(file, errorOffset, errorPayload, 0, errorCompLen);
 
-            if ((version is "v5.5.0" or "v5.4.0") && errorCompLen >= 28)
+            if (version == "v5.6.0" && errorCompLen >= 24)
+            {
+                int compModeLen = BitConverter.ToInt32(errorPayload, 12);
+                int compBitmaskLen = BitConverter.ToInt32(errorPayload, 16);
+                int compValLen = BitConverter.ToInt32(errorPayload, 20);
+                int valOffset2 = 24 + compModeLen + compBitmaskLen;
+                if (valOffset2 + compValLen <= errorCompLen)
+                {
+                    using var decomp = new Decompressor();
+                    return decomp.Unwrap(errorPayload.AsSpan(valOffset2, compValLen)).ToArray();
+                }
+            }
+            else if ((version is "v5.5.0" or "v5.4.0") && errorCompLen >= 28)
             {
                 int compModeLen = BitConverter.ToInt32(errorPayload, 12);
                 int compSkipLen = BitConverter.ToInt32(errorPayload, 16);
