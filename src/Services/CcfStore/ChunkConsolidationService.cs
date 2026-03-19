@@ -214,8 +214,8 @@ public class ChunkConsolidationService : BackgroundService
         // Phase 5: Build optimized pack (groups by fingerprint for P-frame delta)
         var result = await CcfPackOptimizerService.PackEntriesAsync(store, allEntries, ct);
 
-        // Phase 6: Delete source packs where ALL entries were migrated
-        int deletedPacks = 0;
+        // Phase 6: Cleanup source packs where ALL entries were migrated (journaled for crash-recovery)
+        var fullyMigratedSourcePacks = new List<string>();
         foreach (var packId in packsToRepack)
         {
             int expected = packEntryCounts.TryGetValue(packId, out var n) ? n : 0;
@@ -224,14 +224,20 @@ public class ChunkConsolidationService : BackgroundService
 
             if (migrated == expected && expected > 0)
             {
-                if (store.DeletePack(packId))
-                    deletedPacks++;
+                fullyMigratedSourcePacks.Add(packId);
             }
             else
             {
                 Console.WriteLine($"[ChunkConsolidation] Kept pack {packId} (migrated {migrated}/{expected})");
             }
         }
+
+        await CcfPackOptimizerService.ApplyCleanupWithJournalAsync(
+            store,
+            result.PackId,
+            Array.Empty<string>(),
+            fullyMigratedSourcePacks,
+            ct);
 
         LastRepackedEntries = result.EntryCount;
 
@@ -243,7 +249,7 @@ public class ChunkConsolidationService : BackgroundService
         Console.WriteLine($"[ChunkConsolidation] Consolidated {result.EntryCount} entries → {result.PackId}: " +
             $"inner={result.InnerBytes / 1024.0:F1}KB → zstd={result.CompressedBytes / 1024.0:F1}KB ({ratio * 100:F1}%), " +
             $"P-frame: {result.PframeDeltaCount} deltas in {result.PframeGroups} families, " +
-            $"deleted {deletedPacks}/{packsToRepack.Count} source packs ({sw.ElapsedMilliseconds}ms)");
+            $"cleanup scheduled for {fullyMigratedSourcePacks.Count}/{packsToRepack.Count} source packs ({sw.ElapsedMilliseconds}ms)");
     }
 
     /// <summary>

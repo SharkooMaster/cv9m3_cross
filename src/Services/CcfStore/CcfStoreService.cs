@@ -42,7 +42,7 @@ public class CcfStoreService
     public async Task StoreCcfAsync(string fileId, byte[] ccfBytes, CancellationToken ct = default)
     {
         string path = GetCcfPath(fileId);
-        await File.WriteAllBytesAsync(path, ccfBytes, ct);
+        await WriteFileAtomicAsync(path, ccfBytes, ct);
         Console.WriteLine($"[CcfStore] Stored {fileId}.ccf ({ccfBytes.Length} bytes)");
     }
 
@@ -164,8 +164,8 @@ public class CcfStoreService
 
     public async Task StorePackAsync(string packId, byte[] packData, byte[] indexData, CancellationToken ct = default)
     {
-        await File.WriteAllBytesAsync(Path.Combine(_packsDir, $"{packId}.pack"), packData, ct);
-        await File.WriteAllBytesAsync(Path.Combine(_packsDir, $"{packId}.idx"), indexData, ct);
+        await WriteFileAtomicAsync(Path.Combine(_packsDir, $"{packId}.pack"), packData, ct);
+        await WriteFileAtomicAsync(Path.Combine(_packsDir, $"{packId}.idx"), indexData, ct);
         Console.WriteLine($"[CcfStore] Stored pack {packId} ({packData.Length} bytes, {indexData.Length} byte index)");
     }
 
@@ -220,7 +220,7 @@ public class CcfStoreService
     public async Task StoreDictAsync(byte[] dictData, CancellationToken ct = default)
     {
         string path = Path.Combine(_dictDir, "latest.dict");
-        await File.WriteAllBytesAsync(path, dictData, ct);
+        await WriteFileAtomicAsync(path, dictData, ct);
         Console.WriteLine($"[CcfStore] Stored dictionary ({dictData.Length} bytes)");
     }
 
@@ -297,6 +297,45 @@ public class CcfStoreService
     }
 
     private string GetCcfPath(string fileId) => Path.Combine(_ccfDir, $"{fileId}.ccf");
+
+    private static async Task WriteFileAtomicAsync(string finalPath, byte[] bytes, CancellationToken ct)
+    {
+        string? dir = Path.GetDirectoryName(finalPath);
+        if (string.IsNullOrWhiteSpace(dir))
+            throw new InvalidOperationException($"Invalid target path: {finalPath}");
+
+        Directory.CreateDirectory(dir);
+        string tempPath = Path.Combine(dir, $".{Path.GetFileName(finalPath)}.{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            await using (var fs = new FileStream(
+                             tempPath,
+                             FileMode.CreateNew,
+                             FileAccess.Write,
+                             FileShare.None,
+                             bufferSize: 1024 * 1024,
+                             options: FileOptions.WriteThrough))
+            {
+                await fs.WriteAsync(bytes, ct);
+                await fs.FlushAsync(ct);
+            }
+
+            File.Move(tempPath, finalPath, overwrite: true);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempPath))
+                    File.Delete(tempPath);
+            }
+            catch
+            {
+                // Best-effort cleanup.
+            }
+        }
+    }
 
     private static readonly byte[] PackMagic = "CCP\0"u8.ToArray();
 

@@ -38,8 +38,15 @@ builder.Services.AddOpenTelemetry()
     });
 
 builder.Services.AddHostedService<AgentHealthWatcher>();
-builder.Services.AddHostedService<Cross.Services.CcfStore.CcfPackOptimizerService>();
-builder.Services.AddHostedService<Cross.Services.CcfStore.ChunkConsolidationService>();
+if (Globals.EnableCcfBackgroundServices)
+{
+    builder.Services.AddHostedService<Cross.Services.CcfStore.CcfPackOptimizerService>();
+    builder.Services.AddHostedService<Cross.Services.CcfStore.ChunkConsolidationService>();
+}
+else
+{
+    Console.WriteLine("[Cross] CCF background services disabled by env flag");
+}
 ConfigureServices(builder.Services);
 
 // Configure Kestrel to allow HTTP/2 without TLS

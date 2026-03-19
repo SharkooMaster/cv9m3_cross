@@ -96,6 +96,10 @@ public static class Globals
         string.Equals(Environment.GetEnvironmentVariable("ENABLE_CCF_STORE"), "true",
             StringComparison.OrdinalIgnoreCase);
 
+    public static bool EnableCcfBackgroundServices =
+        !string.Equals(Environment.GetEnvironmentVariable("CCF_BACKGROUND_SERVICES_DISABLED"), "true",
+            StringComparison.OrdinalIgnoreCase);
+
     public static string CcfStorePath =
         Environment.GetEnvironmentVariable("CCF_STORE_PATH") ?? "/data/ccf-store";
 

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Cross.Utilities;
 using ZstdSharp;
 
@@ -96,6 +97,14 @@ public class CcfPackOptimizerService : BackgroundService
     {
         public required LoadedEntry Entry;
         public byte[]? PframePayload;
+    }
+
+    private sealed class CleanupTransaction
+    {
+        public string PackId { get; init; } = string.Empty;
+        public List<string> UnpackedIds { get; init; } = new();
+        public List<string> SourcePackIds { get; init; } = new();
+        public DateTime CreatedUtc { get; init; } = DateTime.UtcNow;
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -583,6 +592,7 @@ public class CcfPackOptimizerService : BackgroundService
         }
 
         Console.WriteLine($"[CcfPackOptimizer] Started. PackThreshold={Globals.CcfPackThreshold}, DictThreshold={DictTrainThreshold}, Interval={Globals.CcfPackIntervalSec}s, PackVersion={PackVersion}");
+        await RecoverCleanupTransactionsAsync(CcfStoreService.Instance, stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -747,27 +757,33 @@ public class CcfPackOptimizerService : BackgroundService
 
         var packResult = await PackEntriesAsync(store, loadedEntries, ct);
 
-        // Delete source unpacked files that were compacted.
-        foreach (var entry in loadedEntries)
-        {
-            if (entry.SourcePackId == null)
-                store.DeleteCcf(entry.FileId);
-        }
-
-        // Delete source packs only when all of their indexed entries were compacted this cycle.
+        // Keep source packs that were only partially migrated this cycle.
+        var fullyMigratedSourcePacks = new List<string>();
         foreach (var (packId, ids) in selectedPacks)
         {
             int loaded = loadedByPack.TryGetValue(packId, out var n) ? n : 0;
             if (loaded == ids.Count && ids.Count > 0)
             {
-                if (!store.DeletePack(packId))
-                    Console.WriteLine($"[CcfPackOptimizer] Failed deleting migrated source pack {packId}");
+                fullyMigratedSourcePacks.Add(packId);
             }
             else
             {
                 Console.WriteLine($"[CcfPackOptimizer] Kept source pack {packId} (loaded {loaded}/{ids.Count} entries this cycle)");
             }
         }
+
+        var packedUnpackedIds = loadedEntries
+            .Where(e => e.SourcePackId == null)
+            .Select(e => e.FileId)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        await ApplyCleanupWithJournalAsync(
+            store,
+            packResult.PackId,
+            packedUnpackedIds,
+            fullyMigratedSourcePacks,
+            ct);
 
         LastPackedCount = packResult.EntryCount;
         LastPackSavedBytes = packResult.TotalRawBytes - packResult.PackBytes;
@@ -982,6 +998,130 @@ public class CcfPackOptimizerService : BackgroundService
             CompressedBytes = compressedPayload.Length,
             PackBytes = packData.Length
         };
+    }
+
+    internal static async Task ApplyCleanupWithJournalAsync(
+        CcfStoreService store,
+        string packId,
+        IReadOnlyCollection<string> unpackedIds,
+        IReadOnlyCollection<string> sourcePackIds,
+        CancellationToken ct)
+    {
+        string? txPath = null;
+        try
+        {
+            var tx = new CleanupTransaction
+            {
+                PackId = packId,
+                UnpackedIds = unpackedIds
+                    .Where(id => !string.IsNullOrWhiteSpace(id))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList(),
+                SourcePackIds = sourcePackIds
+                    .Where(id => !string.IsNullOrWhiteSpace(id))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList()
+            };
+
+            txPath = await WriteCleanupTransactionAsync(tx, ct);
+            bool done = ApplyCleanupTransaction(store, tx);
+            if (done && txPath != null)
+                TryDeleteTransaction(txPath);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CcfPackOptimizer] Cleanup journal write/apply failed for {packId}: {ex.Message}");
+            if (txPath != null)
+                Console.WriteLine($"[CcfPackOptimizer] Cleanup transaction retained at {txPath}");
+        }
+    }
+
+    private static async Task RecoverCleanupTransactionsAsync(CcfStoreService store, CancellationToken ct)
+    {
+        string dir = GetCleanupTransactionDir();
+        if (!Directory.Exists(dir)) return;
+
+        foreach (var txFile in Directory.EnumerateFiles(dir, "*.json"))
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                string json = await File.ReadAllTextAsync(txFile, ct);
+                var tx = JsonSerializer.Deserialize<CleanupTransaction>(json);
+                if (tx == null || string.IsNullOrWhiteSpace(tx.PackId))
+                {
+                    TryDeleteTransaction(txFile);
+                    continue;
+                }
+
+                string packPath = Path.Combine(store.PacksDirectory, $"{tx.PackId}.pack");
+                if (!File.Exists(packPath))
+                {
+                    Console.WriteLine($"[CcfPackOptimizer] Pending cleanup {Path.GetFileName(txFile)} has no target pack yet; leaving transaction");
+                    continue;
+                }
+
+                bool done = ApplyCleanupTransaction(store, tx);
+                if (done)
+                {
+                    TryDeleteTransaction(txFile);
+                    Console.WriteLine($"[CcfPackOptimizer] Recovered cleanup transaction for {tx.PackId}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[CcfPackOptimizer] Failed recovering cleanup transaction {txFile}: {ex.Message}");
+            }
+        }
+    }
+
+    private static bool ApplyCleanupTransaction(CcfStoreService store, CleanupTransaction tx)
+    {
+        foreach (var fileId in tx.UnpackedIds)
+            store.DeleteCcf(fileId);
+
+        bool allPacksDeleted = true;
+        foreach (var sourcePackId in tx.SourcePackIds)
+        {
+            if (!store.DeletePack(sourcePackId))
+            {
+                allPacksDeleted = false;
+                Console.WriteLine($"[CcfPackOptimizer] Failed deleting migrated source pack {sourcePackId} (will retry)");
+            }
+        }
+
+        return allPacksDeleted;
+    }
+
+    private static async Task<string> WriteCleanupTransactionAsync(CleanupTransaction tx, CancellationToken ct)
+    {
+        string dir = GetCleanupTransactionDir();
+        Directory.CreateDirectory(dir);
+
+        string txPath = Path.Combine(dir, $"{tx.PackId}.json");
+        string tmpPath = $"{txPath}.{Guid.NewGuid():N}.tmp";
+        string json = JsonSerializer.Serialize(tx);
+        await File.WriteAllTextAsync(tmpPath, json, ct);
+        File.Move(tmpPath, txPath, true);
+        return txPath;
+    }
+
+    private static void TryDeleteTransaction(string txPath)
+    {
+        try
+        {
+            if (File.Exists(txPath))
+                File.Delete(txPath);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CcfPackOptimizer] Failed deleting cleanup transaction {txPath}: {ex.Message}");
+        }
+    }
+
+    private static string GetCleanupTransactionDir()
+    {
+        return Path.Combine(Globals.CcfStorePath, "optimizer-tx");
     }
 
     private static byte[]? TrainDictionaryFromCcfs(List<(string FileId, byte[] Data)> ccfEntries)
