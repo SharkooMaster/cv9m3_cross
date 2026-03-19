@@ -120,7 +120,34 @@ public static class Globals
         int.TryParse(Environment.GetEnvironmentVariable("CCF_COMPACTION_MAX_DURATION_SEC"), out var cds) ? cds : 45;
 
     public static int CcfCompactionMaxWorkingSetMb =
-        int.TryParse(Environment.GetEnvironmentVariable("CCF_COMPACTION_MAX_WORKING_SET_MB"), out var cws) ? cws : 1024;
+        int.TryParse(Environment.GetEnvironmentVariable("CCF_COMPACTION_MAX_WORKING_SET_MB"), out var cws) ? cws : 0;
+
+    public static int CcfOptimizerParallelism =
+        int.TryParse(Environment.GetEnvironmentVariable("CCF_OPTIMIZER_PARALLELISM"), out var cop) ? cop : 0;
+
+    internal static readonly SemaphoreSlim CcfOptimizationLock = new(1, 1);
+
+    /// <summary>
+    /// Returns a memory budget based on current available system memory.
+    /// Container-aware via GC.GetGCMemoryInfo (respects cgroup limits).
+    /// </summary>
+    public static long GetDynamicMemoryBudget(double fraction = 0.50)
+    {
+        try
+        {
+            var gcInfo = GC.GetGCMemoryInfo();
+            long totalAvailable = gcInfo.TotalAvailableMemoryBytes;
+            long currentUsage = Environment.WorkingSet;
+            long freeHeadroom = totalAvailable - currentUsage;
+            long budget = (long)(freeHeadroom * fraction);
+            return Math.Clamp(budget, 256L * 1024 * 1024, 8L * 1024 * 1024 * 1024);
+        }
+        catch
+        {
+            return 512L * 1024 * 1024;
+        }
+    }
+
     //public static string GatewayLoadbalancer = "192.168.50.241";
     // Allow running outside Kubernetes/Docker by overriding via env var.
     // Examples:

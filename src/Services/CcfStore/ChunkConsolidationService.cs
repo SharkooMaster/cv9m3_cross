@@ -1,30 +1,28 @@
+using System.Security.Cryptography;
 using System.Text;
 using Cross.Utilities;
-using Cross.Services.Grpc.Agent;
 
 namespace Cross.Services.CcfStore;
 
 /// <summary>
-/// Phase A: Background service that scans stored CCFs, builds a reverse chunk index,
-/// identifies groups of similar chunks, computes centroids, and logs potential savings.
-/// Only active when EnableCcfStore is true (cluster-store mode).
-/// Read-only — does not modify any CCFs or agent chunk data.
+/// Background service that identifies suboptimally packed CCFs and triggers targeted
+/// repacking for better P-frame delta compression. Scans packs to find families
+/// (same RefsFingerprint) scattered across multiple packs, then consolidates them
+/// into optimized packs where families are co-located.
+/// Coordinates with CcfPackOptimizerService via a shared lock.
 /// </summary>
 public class ChunkConsolidationService : BackgroundService
 {
-    private static readonly TimeSpan ScanInterval = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan ScanInterval = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan InitialDelay = TimeSpan.FromMinutes(5);
-    private const int MinRefsForAnalysis = 3;
-    private const int MaxChunkFetchesPerCycle = 500;
-    private const double SimilarityThreshold = 0.70;
+    private const int MaxPacksPerCycle = 8;
+    private const int MinFamilySize = 3;
 
     public static volatile bool IsRunning;
     public static DateTime? LastScanUtc;
-    public static int LastTotalChunksScanned;
-    public static int LastGroupsFound;
-    public static long LastEstimatedSavings;
-
-    private readonly ChunkReferenceServiceClient _chunkClient = new();
+    public static int LastScannedPacks;
+    public static int LastRepackedEntries;
+    public static int LastScatteredFamilies;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -34,24 +32,22 @@ public class ChunkConsolidationService : BackgroundService
             return;
         }
 
-        Console.WriteLine("[ChunkConsolidation] Service started, waiting for initial data accumulation...");
+        Console.WriteLine("[ChunkConsolidation] Action service started, waiting for initial data...");
         await Task.Delay(InitialDelay, stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                IsRunning = true;
-                await RunConsolidationAnalysis(stoppingToken);
+                await RunConsolidationCycle(stoppingToken);
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ChunkConsolidation] Scan error: {ex.Message}");
+                Console.WriteLine($"[ChunkConsolidation] Cycle error: {ex.Message}");
             }
             finally
             {
-                IsRunning = false;
                 LastScanUtc = DateTime.UtcNow;
             }
 
@@ -59,407 +55,227 @@ public class ChunkConsolidationService : BackgroundService
         }
     }
 
-    private async Task RunConsolidationAnalysis(CancellationToken ct)
+    private async Task RunConsolidationCycle(CancellationToken ct)
+    {
+        if (!await Globals.CcfOptimizationLock.WaitAsync(TimeSpan.FromSeconds(10), ct))
+        {
+            Console.WriteLine("[ChunkConsolidation] Skipping cycle, optimizer holds lock");
+            return;
+        }
+
+        try
+        {
+            IsRunning = true;
+            await RunConsolidationCycleInner(ct);
+        }
+        finally
+        {
+            IsRunning = false;
+            Globals.CcfOptimizationLock.Release();
+        }
+    }
+
+    private async Task RunConsolidationCycleInner(CancellationToken ct)
     {
         var store = CcfStoreService.Instance;
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        long memoryBudget = Globals.GetDynamicMemoryBudget(0.30);
+        DateTime deadline = DateTime.UtcNow.AddMinutes(3);
 
-        // Step 1: Collect all CCF file IDs (unpacked + packed)
-        var allCcfIds = new List<string>();
-        foreach (var id in store.ListUnpackedCcfs())
-            allCcfIds.Add(id);
-        foreach (var id in store.ListPackedCcfIds())
-            allCcfIds.Add(id);
+        // Phase 1: Lightweight fingerprint scan per pack.
+        // Track which RefsFingerprint families live in each pack.
+        var packFamilies = new Dictionary<string, Dictionary<string, List<string>>>(StringComparer.OrdinalIgnoreCase);
+        var globalFamilies = new Dictionary<string, List<(string FileId, string PackId)>>();
+        int scanned = 0;
+        long bytesRead = 0;
 
-        if (allCcfIds.Count < 10)
-        {
-            Console.WriteLine($"[ChunkConsolidation] Only {allCcfIds.Count} CCFs in store, skipping analysis");
-            return;
-        }
-
-        Console.WriteLine($"[ChunkConsolidation] Scanning {allCcfIds.Count} CCFs for chunk reference analysis...");
-
-        // Step 2: Parse each CCF's ref table, build reverse index
-        // Key: (bucketId, bucketIndex), Value: list of CCF fileIds referencing it
-        var reverseIndex = new Dictionary<(ulong BucketId, ulong BucketIndex), List<string>>();
-        int parsedCount = 0;
-        int parseErrors = 0;
-
-        foreach (var fileId in allCcfIds)
+        foreach (var (packId, packBytes) in store.ListPacks())
         {
             ct.ThrowIfCancellationRequested();
-            try
-            {
-                byte[]? ccfData = await store.GetCcfAsync(fileId, ct);
-                if (ccfData == null) continue;
+            if (DateTime.UtcNow >= deadline || bytesRead > memoryBudget) break;
 
-                var refs = ExtractChunkRefs(ccfData);
-                foreach (var r in refs)
-                {
-                    if (r.BucketId == 0 && r.BucketIndex == 0) continue;
-                    var key = (r.BucketId, r.BucketIndex);
-                    if (!reverseIndex.TryGetValue(key, out var list))
-                    {
-                        list = new List<string>();
-                        reverseIndex[key] = list;
-                    }
-                    if (!list.Contains(fileId))
-                        list.Add(fileId);
-                }
-                parsedCount++;
-            }
-            catch (Exception ex)
+            var fpMap = new Dictionary<string, List<string>>();
+
+            foreach (var fileId in store.ListPackEntryIds(packId))
             {
-                parseErrors++;
-                if (parseErrors <= 5)
-                    Console.WriteLine($"[ChunkConsolidation] Parse error on {fileId}: {ex.Message}");
+                if (string.IsNullOrWhiteSpace(fileId)) continue;
+
+                byte[]? data = await store.GetCcfAsync(fileId, ct);
+                if (data == null) continue;
+
+                bytesRead += data.Length;
+                string? fp = ExtractRefsFingerprintLight(data);
+                if (fp == null) continue;
+
+                if (!fpMap.TryGetValue(fp, out var fpList))
+                {
+                    fpList = new List<string>();
+                    fpMap[fp] = fpList;
+                }
+                fpList.Add(fileId);
+
+                if (!globalFamilies.TryGetValue(fp, out var gList))
+                {
+                    gList = new List<(string, string)>();
+                    globalFamilies[fp] = gList;
+                }
+                gList.Add((fileId, packId));
+
+                scanned++;
             }
+
+            if (fpMap.Count > 0)
+                packFamilies[packId] = fpMap;
         }
 
-        int totalUniqueChunks = reverseIndex.Count;
-        int multiRefChunks = reverseIndex.Count(kv => kv.Value.Count >= MinRefsForAnalysis);
+        LastScannedPacks = packFamilies.Count;
 
-        Console.WriteLine($"[ChunkConsolidation] Parsed {parsedCount} CCFs ({parseErrors} errors), " +
-            $"{totalUniqueChunks} unique chunk refs, {multiRefChunks} chunks referenced by {MinRefsForAnalysis}+ CCFs");
-
-        LastTotalChunksScanned = totalUniqueChunks;
-
-        if (multiRefChunks == 0)
+        if (packFamilies.Count < 2)
         {
-            Console.WriteLine("[ChunkConsolidation] No chunks with enough cross-CCF references for grouping");
-            LastGroupsFound = 0;
-            LastEstimatedSavings = 0;
+            Console.WriteLine($"[ChunkConsolidation] Only {packFamilies.Count} packs scanned, nothing to consolidate");
             return;
         }
 
-        // Step 3: Fetch chunk bytes for highly-referenced chunks
-        var candidateChunks = reverseIndex
-            .Where(kv => kv.Value.Count >= MinRefsForAnalysis)
+        // Phase 2: Find families scattered across 2+ different packs
+        var scatteredFamilies = globalFamilies
+            .Where(kv => kv.Value.Count >= MinFamilySize)
+            .Where(kv => kv.Value.Select(v => v.PackId).Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1)
             .OrderByDescending(kv => kv.Value.Count)
-            .Take(MaxChunkFetchesPerCycle)
             .ToList();
 
-        Console.WriteLine($"[ChunkConsolidation] Fetching {candidateChunks.Count} candidate chunks from agents...");
+        LastScatteredFamilies = scatteredFamilies.Count;
 
-        var chunkData = new Dictionary<(ulong, ulong), byte[]>();
-        int fetchSuccess = 0, fetchFail = 0;
-
-        foreach (var (key, ccfIds) in candidateChunks)
+        if (scatteredFamilies.Count == 0)
         {
-            ct.ThrowIfCancellationRequested();
-            try
-            {
-                string bitstring = UlongToBitstring(key.BucketId);
-                string targetAgent = RendezvousRouter.PickAgent(bitstring);
-                byte[]? data = await _chunkClient.GetChunkByReferenceAsync(
-                    key.BucketId, key.BucketIndex, targetAgent, ct);
-
-                if (data != null && data.Length > 0)
-                {
-                    chunkData[key] = data;
-                    fetchSuccess++;
-                }
-                else
-                {
-                    fetchFail++;
-                }
-
-                if (fetchSuccess % 50 == 0 && fetchSuccess > 0)
-                    await Task.Delay(10, ct);
-            }
-            catch (Exception ex)
-            {
-                fetchFail++;
-                if (fetchFail <= 3)
-                    Console.WriteLine($"[ChunkConsolidation] Fetch error for ({key.BucketId},{key.BucketIndex}): {ex.Message}");
-            }
-        }
-
-        Console.WriteLine($"[ChunkConsolidation] Fetched {fetchSuccess} chunks ({fetchFail} failures)");
-
-        if (fetchSuccess < 2)
-        {
-            LastGroupsFound = 0;
-            LastEstimatedSavings = 0;
+            Console.WriteLine($"[ChunkConsolidation] Scanned {scanned} entries in {packFamilies.Count} packs, " +
+                $"no scattered families found ({sw.ElapsedMilliseconds}ms)");
             return;
         }
 
-        // Step 4: Group similar chunks using byte-level similarity
-        var chunkList = chunkData.ToList();
-        var groups = GroupSimilarChunks(chunkList, ct);
+        Console.WriteLine($"[ChunkConsolidation] Found {scatteredFamilies.Count} scattered families " +
+            $"across {packFamilies.Count} packs ({scanned} entries, {sw.ElapsedMilliseconds}ms)");
 
-        Console.WriteLine($"[ChunkConsolidation] Found {groups.Count} groups of similar chunks");
-        LastGroupsFound = groups.Count;
-
-        // Step 5: For each group, compute centroid and estimate savings
-        long totalEstimatedSavings = 0;
-        int groupIdx = 0;
-
-        foreach (var group in groups)
+        // Phase 3: Select source packs that contain scattered family members
+        var packsToRepack = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (_, members) in scatteredFamilies)
         {
-            ct.ThrowIfCancellationRequested();
-            if (group.Count < 2) continue;
-
-            byte[] centroid = ComputeCentroid(group.Select(g => g.Data).ToList());
-            int centroidSize = centroid.Length;
-
-            int totalOriginalErrors = 0;
-            int totalCentroidErrors = 0;
-
-            foreach (var member in group)
-            {
-                int originalErrors = CountDifferences(member.Data, new byte[member.Data.Length]);
-                int centroidErrors = CountDifferences(member.Data, centroid);
-
-                int ccfRefsCount = reverseIndex.TryGetValue(member.Key, out var refs) ? refs.Count : 0;
-                totalOriginalErrors += originalErrors * ccfRefsCount;
-                totalCentroidErrors += centroidErrors * ccfRefsCount;
-            }
-
-            long savedBytes = totalOriginalErrors - totalCentroidErrors;
-            if (savedBytes > 0)
-                totalEstimatedSavings += savedBytes;
-
-            if (groupIdx < 5)
-            {
-                Console.WriteLine($"[ChunkConsolidation]   Group {groupIdx + 1}: {group.Count} chunks, " +
-                    $"avg errors before={totalOriginalErrors / Math.Max(1, group.Count)}, " +
-                    $"avg errors with centroid={totalCentroidErrors / Math.Max(1, group.Count)}, " +
-                    $"estimated byte savings={savedBytes}");
-            }
-            groupIdx++;
+            if (packsToRepack.Count >= MaxPacksPerCycle) break;
+            foreach (var (_, packId) in members)
+                packsToRepack.Add(packId);
         }
 
-        LastEstimatedSavings = totalEstimatedSavings;
-        sw.Stop();
+        Console.WriteLine($"[ChunkConsolidation] Targeting {packsToRepack.Count} packs for family consolidation");
 
-        Console.WriteLine($"[ChunkConsolidation] Analysis complete in {sw.ElapsedMilliseconds}ms: " +
-            $"{groups.Count} groups, estimated savings={totalEstimatedSavings / 1024.0:F1}KB " +
-            $"across {parsedCount} CCFs");
+        // Phase 4: Load ALL entries from selected packs and repack optimally
+        var allEntries = new List<CcfPackOptimizerService.LoadedEntry>();
+        var packEntryCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        long loadBytes = 0;
+
+        foreach (var packId in packsToRepack)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (loadBytes > memoryBudget) break;
+
+            var ids = store.ListPackEntryIds(packId)
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            int loaded = 0;
+            foreach (var fileId in ids)
+            {
+                byte[]? data = await store.GetCcfAsync(fileId, ct);
+                if (data == null) continue;
+
+                loadBytes += data.Length;
+                var comp = CcfPackOptimizerService.ParseCcfComponents(data);
+                allEntries.Add(new CcfPackOptimizerService.LoadedEntry
+                {
+                    FileId = fileId,
+                    Ccf = data,
+                    Comp = comp,
+                    SourcePackId = packId
+                });
+                loaded++;
+            }
+
+            packEntryCounts[packId] = ids.Count;
+        }
+
+        if (allEntries.Count < 2)
+        {
+            Console.WriteLine("[ChunkConsolidation] Not enough entries loaded for repacking");
+            return;
+        }
+
+        Console.WriteLine($"[ChunkConsolidation] Loaded {allEntries.Count} entries ({loadBytes / 1024 / 1024}MB) " +
+            $"from {packsToRepack.Count} packs, building optimized pack...");
+
+        // Phase 5: Build optimized pack (groups by fingerprint for P-frame delta)
+        var result = await CcfPackOptimizerService.PackEntriesAsync(store, allEntries, ct);
+
+        // Phase 6: Delete source packs where ALL entries were migrated
+        int deletedPacks = 0;
+        foreach (var packId in packsToRepack)
+        {
+            int expected = packEntryCounts.TryGetValue(packId, out var n) ? n : 0;
+            int migrated = allEntries.Count(e =>
+                string.Equals(e.SourcePackId, packId, StringComparison.OrdinalIgnoreCase));
+
+            if (migrated == expected && expected > 0)
+            {
+                if (store.DeletePack(packId))
+                    deletedPacks++;
+            }
+            else
+            {
+                Console.WriteLine($"[ChunkConsolidation] Kept pack {packId} (migrated {migrated}/{expected})");
+            }
+        }
+
+        LastRepackedEntries = result.EntryCount;
+
+        CcfPackOptimizerService.PframeGroupsFound += result.PframeGroups;
+        CcfPackOptimizerService.PframeDeltaCount += result.PframeDeltaCount;
+        CcfPackOptimizerService.PframeSavedBytes += result.PframeSavedBytes;
+
+        double ratio = result.InnerBytes > 0 ? 1.0 - (double)result.CompressedBytes / result.InnerBytes : 0;
+        Console.WriteLine($"[ChunkConsolidation] Consolidated {result.EntryCount} entries → {result.PackId}: " +
+            $"inner={result.InnerBytes / 1024.0:F1}KB → zstd={result.CompressedBytes / 1024.0:F1}KB ({ratio * 100:F1}%), " +
+            $"P-frame: {result.PframeDeltaCount} deltas in {result.PframeGroups} families, " +
+            $"deleted {deletedPacks}/{packsToRepack.Count} source packs ({sw.ElapsedMilliseconds}ms)");
     }
 
     /// <summary>
-    /// Extract (bucketId, bucketIndex) pairs from a CCF's reference section.
-    /// Supports both v5.x compact ref table and v3.x legacy formats.
+    /// Lightweight fingerprint: parse CCF header to extract refs section and hash it.
+    /// Does NOT decompress error streams — only reads version + refs.
     /// </summary>
-    private static List<(ulong BucketId, ulong BucketIndex)> ExtractChunkRefs(byte[] file)
+    internal static string? ExtractRefsFingerprintLight(byte[] file)
     {
-        var refs = new List<(ulong, ulong)>();
         try
         {
-            if (file.Length < 12) return refs;
-
+            if (file.Length < 12) return null;
             int pos = 0;
             int versionLen = BitConverter.ToInt32(file, pos); pos += 4;
-            if (versionLen <= 0 || versionLen > 20 || pos + versionLen > file.Length) return refs;
+            if (versionLen <= 0 || versionLen > 20 || pos + versionLen > file.Length) return null;
 
             string version = Encoding.UTF8.GetString(file, pos, versionLen); pos += versionLen;
             int refsLen = BitConverter.ToInt32(file, pos); pos += 4;
 
             bool hasOrigLen = version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0";
-            pos += 4; // errorCompLen
+            pos += 4;
             if (hasOrigLen) pos += 4;
 
             bool hasTrim = version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0";
             if (hasTrim) pos += 4;
 
             int refsOffset = pos;
-            if (refsOffset + refsLen > file.Length) return refs;
+            if (refsLen <= 0 || refsOffset + refsLen > file.Length) return null;
 
-            if (version is "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0")
-            {
-                int off = refsOffset;
-                if (off + 6 > file.Length) return refs;
-
-                int chunkCount = BitConverter.ToInt32(file, off); off += 4;
-                ushort refTableSize = BitConverter.ToUInt16(file, off); off += 2;
-
-                if (off + refTableSize * 16 > file.Length) return refs;
-
-                var refTable = new (ulong BucketId, ulong BucketIndex)[refTableSize];
-                for (int i = 0; i < refTableSize; i++)
-                {
-                    ulong bucketId = BitConverter.ToUInt64(file, off); off += 8;
-                    ulong bucketIndex = BitConverter.ToUInt64(file, off); off += 8;
-                    refTable[i] = (bucketId, bucketIndex);
-                }
-
-                for (int i = 0; i < chunkCount && off < file.Length; i++)
-                {
-                    byte flag = file[off++];
-                    switch (flag)
-                    {
-                        case 0x00:
-                            break;
-                        case 0x01:
-                        case 0x02:
-                        {
-                            if (off + 2 > file.Length) return refs;
-                            ushort tableIdx = BitConverter.ToUInt16(file, off); off += 2;
-                            if (tableIdx < refTableSize)
-                                refs.Add(refTable[tableIdx]);
-                            break;
-                        }
-                        case 0x04:
-                        {
-                            if (off >= file.Length) return refs;
-                            int donorCount = file[off++];
-                            for (int d = 0; d < donorCount; d++)
-                            {
-                                if (off + 2 > file.Length) return refs;
-                                ushort tableIdx = BitConverter.ToUInt16(file, off); off += 2;
-                                if (tableIdx < refTableSize)
-                                    refs.Add(refTable[tableIdx]);
-                            }
-                            off += 8 + 32 + 64; // matchBitmap + selectors + donorPositions
-                            break;
-                        }
-                        case 0x05:
-                        {
-                            int bitmaskLen = (Globals.chunkSize + 7) / 8;
-                            for (int d = 0; d < 2; d++)
-                            {
-                                if (off + 2 > file.Length) return refs;
-                                ushort tableIdx = BitConverter.ToUInt16(file, off); off += 2;
-                                if (tableIdx < refTableSize)
-                                    refs.Add(refTable[tableIdx]);
-                            }
-                            off += bitmaskLen;
-                            break;
-                        }
-                        default:
-                            return refs;
-                    }
-                }
-            }
+            return Convert.ToHexString(
+                SHA256.HashData(file.AsSpan(refsOffset, refsLen))
+            ).ToLowerInvariant();
         }
-        catch { }
-        return refs;
-    }
-
-    /// <summary>
-    /// Group chunks by byte-level similarity using single-linkage clustering.
-    /// </summary>
-    private static List<List<((ulong BucketId, ulong BucketIndex) Key, byte[] Data)>> GroupSimilarChunks(
-        List<KeyValuePair<(ulong, ulong), byte[]>> chunks, CancellationToken ct)
-    {
-        int n = chunks.Count;
-        int[] parent = new int[n];
-        for (int i = 0; i < n; i++) parent[i] = i;
-
-        int Find(int x)
-        {
-            while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
-            return x;
-        }
-
-        void Union(int a, int b)
-        {
-            int ra = Find(a), rb = Find(b);
-            if (ra != rb) parent[ra] = rb;
-        }
-
-        for (int i = 0; i < n && !ct.IsCancellationRequested; i++)
-        {
-            for (int j = i + 1; j < n; j++)
-            {
-                if (Find(i) == Find(j)) continue;
-
-                double sim = ByteSimilarity(chunks[i].Value, chunks[j].Value);
-                if (sim >= SimilarityThreshold)
-                    Union(i, j);
-            }
-        }
-
-        var groupMap = new Dictionary<int, List<int>>();
-        for (int i = 0; i < n; i++)
-        {
-            int root = Find(i);
-            if (!groupMap.TryGetValue(root, out var list))
-            {
-                list = new List<int>();
-                groupMap[root] = list;
-            }
-            list.Add(i);
-        }
-
-        var result = new List<List<((ulong, ulong) Key, byte[] Data)>>();
-        foreach (var (_, members) in groupMap)
-        {
-            if (members.Count < 2) continue;
-            var group = members.Select(i => (chunks[i].Key, chunks[i].Value)).ToList();
-            result.Add(group);
-        }
-
-        return result;
-    }
-
-    private static double ByteSimilarity(byte[] a, byte[] b)
-    {
-        int len = Math.Min(a.Length, b.Length);
-        if (len == 0) return 0;
-
-        int matching = 0;
-        for (int i = 0; i < len; i++)
-        {
-            if (a[i] == b[i]) matching++;
-        }
-        return (double)matching / Math.Max(a.Length, b.Length);
-    }
-
-    /// <summary>
-    /// Compute a per-byte majority-vote centroid from a set of chunks.
-    /// For each byte position, picks the value that appears most often.
-    /// </summary>
-    private static byte[] ComputeCentroid(List<byte[]> chunks)
-    {
-        if (chunks.Count == 0) return Array.Empty<byte>();
-        int len = chunks[0].Length;
-
-        byte[] centroid = new byte[len];
-        int[] counts = new int[256];
-
-        for (int pos = 0; pos < len; pos++)
-        {
-            Array.Clear(counts, 0, 256);
-            foreach (var chunk in chunks)
-            {
-                if (pos < chunk.Length)
-                    counts[chunk[pos]]++;
-            }
-
-            int bestVal = 0, bestCount = 0;
-            for (int v = 0; v < 256; v++)
-            {
-                if (counts[v] > bestCount)
-                {
-                    bestCount = counts[v];
-                    bestVal = v;
-                }
-            }
-            centroid[pos] = (byte)bestVal;
-        }
-        return centroid;
-    }
-
-    private static int CountDifferences(byte[] a, byte[] b)
-    {
-        int len = Math.Max(a.Length, b.Length);
-        int diffs = 0;
-        for (int i = 0; i < len; i++)
-        {
-            byte va = i < a.Length ? a[i] : (byte)0;
-            byte vb = i < b.Length ? b[i] : (byte)0;
-            if (va != vb) diffs++;
-        }
-        return diffs;
-    }
-
-    private static string UlongToBitstring(ulong packed)
-    {
-        char[] chars = new char[64];
-        for (int i = 0; i < 64; i++)
-            chars[i] = (packed & (1UL << i)) != 0 ? '1' : '0';
-        return new string(chars);
+        catch { return null; }
     }
 }

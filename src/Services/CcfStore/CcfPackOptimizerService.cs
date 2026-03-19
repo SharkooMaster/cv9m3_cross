@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using Cross.Utilities;
@@ -77,12 +78,24 @@ public class CcfPackOptimizerService : BackgroundService
 
     private const double PframeSavingsThreshold = 0.85;
 
-    private sealed class LoadedEntry
+    internal sealed class LoadedEntry
     {
         public string FileId { get; init; } = string.Empty;
         public byte[] Ccf { get; init; } = Array.Empty<byte>();
         public CcfComponents Comp { get; init; } = new();
         public string? SourcePackId { get; init; }
+    }
+
+    private sealed class ProcessedFamily
+    {
+        public required LoadedEntry Base;
+        public List<ProcessedMember> Members = new();
+    }
+
+    private sealed class ProcessedMember
+    {
+        public required LoadedEntry Entry;
+        public byte[]? PframePayload;
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -592,15 +605,22 @@ public class CcfPackOptimizerService : BackgroundService
 
     private async Task RunOptimizationCycle(CancellationToken ct)
     {
-        IsRunning = true;
+        if (!await Globals.CcfOptimizationLock.WaitAsync(TimeSpan.FromSeconds(5), ct))
+        {
+            Console.WriteLine("[CcfPackOptimizer] Skipping cycle, consolidation service holds lock");
+            return;
+        }
+
         try
         {
+            IsRunning = true;
             await RunOptimizationCycleInner(ct);
         }
         finally
         {
             IsRunning = false;
             LastRunUtc = DateTime.UtcNow;
+            Globals.CcfOptimizationLock.Release();
         }
     }
 
@@ -678,7 +698,9 @@ public class CcfPackOptimizerService : BackgroundService
         var loadedEntries = new List<LoadedEntry>(capacity: Math.Min(candidateIds.Count, 4096));
         long bytesRead = 0;
         long maxReadBytes = Math.Max(64L * 1024 * 1024, Globals.CcfCompactionMaxReadBytesPerCycle);
-        long maxWorkingSetBytes = Math.Max(256L, Globals.CcfCompactionMaxWorkingSetMb) * 1024L * 1024L;
+        long maxWorkingSetBytes = Globals.CcfCompactionMaxWorkingSetMb > 0
+            ? (long)Globals.CcfCompactionMaxWorkingSetMb * 1024L * 1024L
+            : Globals.GetDynamicMemoryBudget();
         DateTime deadline = DateTime.UtcNow.AddSeconds(Math.Max(5, Globals.CcfCompactionMaxDurationSec));
         var loadedByPack = selectedPacks.Keys.ToDictionary(k => k, _ => 0, StringComparer.OrdinalIgnoreCase);
 
@@ -693,7 +715,7 @@ public class CcfPackOptimizerService : BackgroundService
 
             if (Environment.WorkingSet > maxWorkingSetBytes && loadedEntries.Count >= 2)
             {
-                Console.WriteLine($"[CcfPackOptimizer] Working set guard hit ({Environment.WorkingSet / 1024 / 1024}MB >= {Globals.CcfCompactionMaxWorkingSetMb}MB), ending load phase");
+                Console.WriteLine($"[CcfPackOptimizer] Memory guard hit ({Environment.WorkingSet / 1024 / 1024}MB >= {maxWorkingSetBytes / 1024 / 1024}MB), ending load phase");
                 break;
             }
 
@@ -721,7 +743,7 @@ public class CcfPackOptimizerService : BackgroundService
             return;
         }
 
-        Console.WriteLine($"[CcfPackOptimizer] Packing loaded set: entries={loadedEntries.Count}, read={bytesRead / 1024 / 1024}MB, loadTime={loadSw.ElapsedMilliseconds}ms");
+        Console.WriteLine($"[CcfPackOptimizer] Packing loaded set: entries={loadedEntries.Count}, read={bytesRead / 1024 / 1024}MB, memBudget={maxWorkingSetBytes / 1024 / 1024}MB, loadTime={loadSw.ElapsedMilliseconds}ms");
 
         var packResult = await PackEntriesAsync(store, loadedEntries, ct);
 
@@ -766,7 +788,7 @@ public class CcfPackOptimizerService : BackgroundService
             $"P-frame: {packResult.PframeDeltaCount} deltas in {packResult.PframeGroups} families (saved {packResult.PframeSavedBytes / 1024.0:F1}KB inner)");
     }
 
-    private sealed class PackBuildResult
+    internal sealed class PackBuildResult
     {
         public string PackId { get; init; } = string.Empty;
         public int EntryCount { get; init; }
@@ -779,7 +801,7 @@ public class CcfPackOptimizerService : BackgroundService
         public long PackBytes { get; init; }
     }
 
-    private async Task<PackBuildResult> PackEntriesAsync(CcfStoreService store, List<LoadedEntry> entries, CancellationToken ct)
+    internal static async Task<PackBuildResult> PackEntriesAsync(CcfStoreService store, List<LoadedEntry> entries, CancellationToken ct)
     {
         long totalRawBytes = 0;
         foreach (var entry in entries)
@@ -793,9 +815,80 @@ public class CcfPackOptimizerService : BackgroundService
         var ungrouped = entries.Where(e => !e.Comp.IsValid || e.Comp.RefsFingerprint.Length == 0).ToList();
 
         int pframeGroups = groups.Count(g => g.Count() > 1);
-        int cyclePframeDelta = 0;
-        long cyclePframeSaved = 0;
 
+        // ── Phase 1: Parallel P-frame delta computation per family ──
+        int parallelism = Globals.CcfOptimizerParallelism > 0
+            ? Globals.CcfOptimizerParallelism
+            : Math.Max(1, Math.Min(Environment.ProcessorCount / 2, 8));
+
+        var multiGroups = groups.Where(g => g.Count() > 1).ToList();
+        var familyResults = new ConcurrentBag<ProcessedFamily>();
+
+        if (multiGroups.Count > 0)
+        {
+            Console.WriteLine($"[CcfPackOptimizer] Parallel P-frame: {multiGroups.Count} families, parallelism={parallelism}");
+
+            Parallel.ForEach(multiGroups, new ParallelOptions
+            {
+                MaxDegreeOfParallelism = parallelism,
+                CancellationToken = ct
+            }, group =>
+            {
+                var members = group.ToList();
+                var family = new ProcessedFamily { Base = members[0] };
+                var baseMember = members[0];
+
+                for (int m = 1; m < members.Count; m++)
+                {
+                    var member = members[m];
+                    var pm = new ProcessedMember { Entry = member };
+
+                    if (member.Comp.IsValid && baseMember.Comp.IsValid)
+                    {
+                        try
+                        {
+                            byte[] memberSrc = member.Comp.DeltaSource;
+                            byte[] baseSrc = baseMember.Comp.DeltaSource;
+                            byte[] delta = new byte[memberSrc.Length];
+                            int limit = Math.Min(memberSrc.Length, baseSrc.Length);
+                            for (int i = 0; i < limit; i++)
+                                delta[i] = (byte)((memberSrc[i] - baseSrc[i]) & 0xFF);
+                            for (int i = limit; i < memberSrc.Length; i++)
+                                delta[i] = memberSrc[i];
+
+                            using var zc = new Compressor(19);
+                            byte[] compDelta = zc.Wrap(delta).ToArray();
+                            byte[] pframePayload = BuildPFramePayload(member.Comp, compDelta);
+
+                            if (pframePayload.Length < member.Ccf.Length * PframeSavingsThreshold)
+                            {
+                                byte[]? reconstructed = ReconstructCcfFromPFrame(pframePayload, baseMember.Ccf);
+                                if (reconstructed != null)
+                                {
+                                    var reconComp = ParseCcfComponents(reconstructed);
+                                    if (reconComp.IsValid &&
+                                        reconComp.DeltaSource.Length == memberSrc.Length &&
+                                        reconComp.DeltaSource.AsSpan().SequenceEqual(memberSrc))
+                                    {
+                                        pm.PframePayload = pframePayload;
+                                    }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[CcfPackOptimizer] P-frame failed for {member.FileId}: {ex.Message}");
+                        }
+                    }
+
+                    family.Members.Add(pm);
+                }
+
+                familyResults.Add(family);
+            });
+        }
+
+        // ── Phase 2: Sequential assembly into pack format ──
         string packId = $"pack-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("N")[..8]}";
         using var innerMs = new MemoryStream();
         using var idxMs = new MemoryStream();
@@ -807,6 +900,8 @@ public class CcfPackOptimizerService : BackgroundService
 
         WriteInt32(idxMs, entries.Count);
         int entryIndex = 0;
+        int cyclePframeDelta = 0;
+        long cyclePframeSaved = 0;
 
         void WriteIFrame(string fileId, byte[] ccfBytes)
         {
@@ -834,66 +929,27 @@ public class CcfPackOptimizerService : BackgroundService
 
         foreach (var group in groups)
         {
-            ct.ThrowIfCancellationRequested();
-            var members = group.ToList();
-            if (members.Count == 1)
-            {
-                WriteIFrame(members[0].FileId, members[0].Ccf);
-                continue;
-            }
+            if (group.Count() == 1)
+                WriteIFrame(group.First().FileId, group.First().Ccf);
+        }
 
-            var baseMember = members[0];
-            WriteIFrame(baseMember.FileId, baseMember.Ccf);
+        foreach (var family in familyResults)
+        {
+            WriteIFrame(family.Base.FileId, family.Base.Ccf);
             int baseEntryIndex = entryIndex - 1;
 
-            for (int m = 1; m < members.Count; m++)
+            foreach (var pm in family.Members)
             {
-                var member = members[m];
-                bool usedPFrame = false;
-
-                if (member.Comp.IsValid && baseMember.Comp.IsValid)
+                if (pm.PframePayload != null)
                 {
-                    try
-                    {
-                        byte[] memberSrc = member.Comp.DeltaSource;
-                        byte[] baseSrc = baseMember.Comp.DeltaSource;
-                        byte[] delta = new byte[memberSrc.Length];
-                        int limit = Math.Min(memberSrc.Length, baseSrc.Length);
-                        for (int i = 0; i < limit; i++)
-                            delta[i] = (byte)((memberSrc[i] - baseSrc[i]) & 0xFF);
-                        for (int i = limit; i < memberSrc.Length; i++)
-                            delta[i] = memberSrc[i];
-
-                        using var zc = new Compressor(19);
-                        byte[] compDelta = zc.Wrap(delta).ToArray();
-                        byte[] pframePayload = BuildPFramePayload(member.Comp, compDelta);
-
-                        if (pframePayload.Length < member.Ccf.Length * PframeSavingsThreshold)
-                        {
-                            byte[]? reconstructed = ReconstructCcfFromPFrame(pframePayload, baseMember.Ccf);
-                            if (reconstructed != null)
-                            {
-                                var reconComp = ParseCcfComponents(reconstructed);
-                                if (reconComp.IsValid &&
-                                    reconComp.DeltaSource.Length == memberSrc.Length &&
-                                    reconComp.DeltaSource.AsSpan().SequenceEqual(memberSrc))
-                                {
-                                    WritePFrame(member.FileId, pframePayload, baseEntryIndex);
-                                    cyclePframeSaved += member.Ccf.Length - pframePayload.Length;
-                                    cyclePframeDelta++;
-                                    usedPFrame = true;
-                                }
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[CcfPackOptimizer] P-frame failed for {member.FileId}: {ex.Message}");
-                    }
+                    WritePFrame(pm.Entry.FileId, pm.PframePayload, baseEntryIndex);
+                    cyclePframeDelta++;
+                    cyclePframeSaved += pm.Entry.Ccf.Length - pm.PframePayload.Length;
                 }
-
-                if (!usedPFrame)
-                    WriteIFrame(member.FileId, member.Ccf);
+                else
+                {
+                    WriteIFrame(pm.Entry.FileId, pm.Entry.Ccf);
+                }
             }
         }
 
