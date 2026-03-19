@@ -142,7 +142,7 @@ public static class Globals
             var gcInfo = GC.GetGCMemoryInfo();
             long totalAvailable = gcInfo.TotalAvailableMemoryBytes;
             long ceiling = (long)(totalAvailable * fraction);
-            return Math.Clamp(ceiling, 1024L * 1024 * 1024, 32L * 1024 * 1024 * 1024);
+            return Math.Clamp(ceiling, 1024L * 1024 * 1024, 48L * 1024 * 1024 * 1024);
         }
         catch
         {

@@ -801,11 +801,19 @@ public class CcfPackOptimizerService : BackgroundService
         var loadedEntries = new List<LoadedEntry>(capacity: Math.Min(candidateIds.Count, 4096));
         long bytesRead = 0;
         long maxReadBytes = Math.Max(64L * 1024 * 1024, Globals.CcfCompactionMaxReadBytesPerCycle);
-        long maxWorkingSetBytes = Globals.CcfCompactionMaxWorkingSetMb > 0
+        long configuredCeiling = Globals.CcfCompactionMaxWorkingSetMb > 0
             ? (long)Globals.CcfCompactionMaxWorkingSetMb * 1024L * 1024L
             : Globals.GetDynamicWorkingSetCeiling(0.85);
+
+        long baselineWs = Environment.WorkingSet;
+        const long MinLoadHeadroom = 512L * 1024 * 1024; // always allow at least 512MB of loading
+        long effectiveCeiling = Math.Max(configuredCeiling, baselineWs + MinLoadHeadroom);
+
         DateTime deadline = DateTime.UtcNow.AddSeconds(Math.Max(5, Globals.CcfCompactionMaxDurationSec));
         var loadedByPack = selectedPacks.Keys.ToDictionary(k => k, _ => 0, StringComparer.OrdinalIgnoreCase);
+
+        if (baselineWs > configuredCeiling)
+            Console.WriteLine($"[CcfPackOptimizer] Baseline working set ({baselineWs / 1024 / 1024}MB) exceeds configured ceiling ({configuredCeiling / 1024 / 1024}MB), using effective ceiling {effectiveCeiling / 1024 / 1024}MB");
 
         foreach (var (fileId, sourcePackId) in candidateIds)
         {
@@ -816,9 +824,9 @@ public class CcfPackOptimizerService : BackgroundService
             if (bytesRead >= maxReadBytes && loadedEntries.Count >= 2)
                 break;
 
-            if (Environment.WorkingSet > maxWorkingSetBytes && loadedEntries.Count >= 2)
+            if (Environment.WorkingSet > effectiveCeiling && loadedEntries.Count >= 2)
             {
-                Console.WriteLine($"[CcfPackOptimizer] Memory guard hit ({Environment.WorkingSet / 1024 / 1024}MB >= {maxWorkingSetBytes / 1024 / 1024}MB), ending load phase");
+                Console.WriteLine($"[CcfPackOptimizer] Memory guard hit ({Environment.WorkingSet / 1024 / 1024}MB >= {effectiveCeiling / 1024 / 1024}MB, baseline={baselineWs / 1024 / 1024}MB), ending load phase");
                 break;
             }
 
@@ -846,7 +854,7 @@ public class CcfPackOptimizerService : BackgroundService
             return;
         }
 
-        Console.WriteLine($"[CcfPackOptimizer] Packing loaded set: entries={loadedEntries.Count}, read={bytesRead / 1024 / 1024}MB, memBudget={maxWorkingSetBytes / 1024 / 1024}MB, loadTime={loadSw.ElapsedMilliseconds}ms");
+        Console.WriteLine($"[CcfPackOptimizer] Packing loaded set: entries={loadedEntries.Count}, read={bytesRead / 1024 / 1024}MB, ceiling={effectiveCeiling / 1024 / 1024}MB, baseline={baselineWs / 1024 / 1024}MB, loadTime={loadSw.ElapsedMilliseconds}ms");
 
         var packResult = await PackEntriesAsync(store, loadedEntries, ct);
 
