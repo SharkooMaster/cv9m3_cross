@@ -150,12 +150,12 @@ public class CcfPackOptimizerService : BackgroundService
             int refsLen = BitConverter.ToInt32(file, pos); pos += 4;
 
             int errorCompLen;
-            bool hasOrigLen = comp.Version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0";
+            bool hasOrigLen = comp.Version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0";
             errorCompLen = BitConverter.ToInt32(file, pos); pos += 4;
             if (hasOrigLen) pos += 4; // skip errorOrigLen
 
             int trimLen = 0;
-            bool hasTrim = comp.Version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0";
+            bool hasTrim = comp.Version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0";
             if (hasTrim) { trimLen = BitConverter.ToInt32(file, pos); pos += 4; }
 
             int refsOffset = pos;
@@ -187,7 +187,7 @@ public class CcfPackOptimizerService : BackgroundService
             byte[] errorPayload = new byte[errorCompLen];
             if (errorCompLen > 0) Buffer.BlockCopy(file, errorOffset, errorPayload, 0, errorCompLen);
 
-            if (comp.Version == "v5.6.0" && errorCompLen >= 24)
+            if ((comp.Version == "v5.6.0" || comp.Version == "v6.0.0") && errorCompLen >= 24)
             {
                 comp.IsDirectPatch = true;
                 comp.PatchCount = BitConverter.ToInt32(errorPayload, 0);
@@ -371,7 +371,7 @@ public class CcfPackOptimizerService : BackgroundService
         using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
 
         bw.Write(comp.OriginalCcfLength);
-        bool isBitmaskOnly = comp.IsDirectPatch && (comp.Version == "v5.6.0");
+        bool isBitmaskOnly = comp.IsDirectPatch && comp.Version is "v5.6.0" or "v6.0.0";
         byte errorFormat = isBitmaskOnly ? (byte)4 : comp.IsDirectPatch ? (byte)3 : comp.IsFourStream ? (byte)2 : comp.IsSplitStream ? (byte)0 : (byte)1;
         bw.Write(errorFormat);
         bw.Write(comp.PatchCount);
@@ -632,7 +632,7 @@ public class CcfPackOptimizerService : BackgroundService
         bw.Write(versionBytes);
         bw.Write(refs.Length);
 
-        if (version is "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
+        if (version is "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0")
         {
             bw.Write(errorPayload.Length);
             bw.Write(errorPayload.Length);
@@ -647,7 +647,7 @@ public class CcfPackOptimizerService : BackgroundService
             bw.Write(errorPayload.Length);
         }
 
-        if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
+        if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0")
             bw.Write(trim.Length);
 
         bw.Write(refs);
@@ -703,12 +703,6 @@ public class CcfPackOptimizerService : BackgroundService
 
     private async Task RunOptimizationCycle(CancellationToken ct)
     {
-        if (!await Globals.CcfOptimizationLock.WaitAsync(TimeSpan.FromSeconds(5), ct))
-        {
-            Console.WriteLine("[CcfPackOptimizer] Skipping cycle, consolidation service holds lock");
-            return;
-        }
-
         try
         {
             IsRunning = true;
@@ -718,7 +712,6 @@ public class CcfPackOptimizerService : BackgroundService
         {
             IsRunning = false;
             LastRunUtc = DateTime.UtcNow;
-            Globals.CcfOptimizationLock.Release();
         }
     }
 
@@ -881,53 +874,81 @@ public class CcfPackOptimizerService : BackgroundService
 
         Console.WriteLine($"[CcfPackOptimizer] Packing loaded set: entries={loadedEntries.Count}, read={bytesRead / 1024 / 1024}MB, ceiling={effectiveCeiling / 1024 / 1024}MB, baseline={baselineWs / 1024 / 1024}MB, loadTime={loadSw.ElapsedMilliseconds}ms");
 
-        var packResult = await PackEntriesAsync(store, loadedEntries, ct);
-
-        // After duplication guard, all remaining source packs should be fully loaded.
-        var fullyMigratedSourcePacks = new List<string>();
-        foreach (var (packId, ids) in selectedPacks)
+        if (!await Globals.CcfOptimizationLock.WaitAsync(TimeSpan.FromSeconds(60), ct))
         {
-            int loaded = loadedByPack.TryGetValue(packId, out var n) ? n : 0;
-            if (loaded == ids.Count && ids.Count > 0)
-            {
-                fullyMigratedSourcePacks.Add(packId);
-            }
-            else
-            {
-                Console.WriteLine($"[CcfPackOptimizer] WARNING: source pack {packId} not fully migrated after duplication guard ({loaded}/{ids.Count}) — skipping delete");
-            }
+            Console.WriteLine("[CcfPackOptimizer] Could not acquire write lock in 60s, aborting pack phase");
+            return;
         }
+        try
+        {
+            var livePacks = store.ListPacks().Select(p => p.PackId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var stalePacks = selectedPacks.Keys.Where(p => !livePacks.Contains(p)).ToList();
+            if (stalePacks.Count > 0)
+            {
+                foreach (var pid in stalePacks)
+                {
+                    Console.WriteLine($"[CcfPackOptimizer] Source pack {pid} deleted by another service, evicting its entries");
+                    loadedEntries.RemoveAll(e => string.Equals(e.SourcePackId, pid, StringComparison.OrdinalIgnoreCase));
+                    selectedPacks.Remove(pid);
+                }
+                if (loadedEntries.Count < 2)
+                {
+                    Console.WriteLine("[CcfPackOptimizer] Not enough entries after stale-pack eviction");
+                    return;
+                }
+            }
 
-        var packedUnpackedIds = loadedEntries
-            .Where(e => e.SourcePackId == null)
-            .Select(e => e.FileId)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
+            var packResult = await PackEntriesAsync(store, loadedEntries, ct);
 
-        await ApplyCleanupWithJournalAsync(
-            store,
-            packResult.PackId,
-            packedUnpackedIds,
-            fullyMigratedSourcePacks,
-            ct);
+            var fullyMigratedSourcePacks = new List<string>();
+            foreach (var (packId, ids) in selectedPacks)
+            {
+                int loaded = loadedByPack.TryGetValue(packId, out var n) ? n : 0;
+                if (loaded == ids.Count && ids.Count > 0)
+                {
+                    fullyMigratedSourcePacks.Add(packId);
+                }
+                else
+                {
+                    Console.WriteLine($"[CcfPackOptimizer] WARNING: source pack {packId} not fully migrated ({loaded}/{ids.Count}) — skipping delete");
+                }
+            }
 
-        LastPackedCount = packResult.EntryCount;
-        LastPackSavedBytes = packResult.TotalRawBytes - packResult.PackBytes;
-        TotalPackedAllTime += packResult.EntryCount;
-        TotalPackRawBytes += packResult.InnerBytes;
-        TotalPackCompressedBytes += packResult.CompressedBytes;
-        PframeGroupsFound += packResult.PframeGroups;
-        PframeDeltaCount += packResult.PframeDeltaCount;
-        PframeSavedBytes += packResult.PframeSavedBytes;
+            var packedUnpackedIds = loadedEntries
+                .Where(e => e.SourcePackId == null)
+                .Select(e => e.FileId)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
 
-        double compressionRatio = packResult.InnerBytes > 0
-            ? 1.0 - (double)packResult.CompressedBytes / packResult.InnerBytes
-            : 0;
+            await ApplyCleanupWithJournalAsync(
+                store,
+                packResult.PackId,
+                packedUnpackedIds,
+                fullyMigratedSourcePacks,
+                ct);
 
-        Console.WriteLine($"[CcfPackOptimizer] Packed {packResult.EntryCount} CCFs into {packResult.PackId}: " +
-            $"raw={packResult.TotalRawBytes / 1024.0:F1}KB → inner={packResult.InnerBytes / 1024.0:F1}KB → " +
-            $"zstd={packResult.CompressedBytes / 1024.0:F1}KB ({compressionRatio * 100:F1}% pack compression), " +
-            $"P-frame: {packResult.PframeDeltaCount} deltas in {packResult.PframeGroups} families (saved {packResult.PframeSavedBytes / 1024.0:F1}KB inner)");
+            LastPackedCount = packResult.EntryCount;
+            LastPackSavedBytes = packResult.TotalRawBytes - packResult.PackBytes;
+            TotalPackedAllTime += packResult.EntryCount;
+            TotalPackRawBytes += packResult.InnerBytes;
+            TotalPackCompressedBytes += packResult.CompressedBytes;
+            PframeGroupsFound += packResult.PframeGroups;
+            PframeDeltaCount += packResult.PframeDeltaCount;
+            PframeSavedBytes += packResult.PframeSavedBytes;
+
+            double compressionRatio = packResult.InnerBytes > 0
+                ? 1.0 - (double)packResult.CompressedBytes / packResult.InnerBytes
+                : 0;
+
+            Console.WriteLine($"[CcfPackOptimizer] Packed {packResult.EntryCount} CCFs into {packResult.PackId}: " +
+                $"raw={packResult.TotalRawBytes / 1024.0:F1}KB → inner={packResult.InnerBytes / 1024.0:F1}KB → " +
+                $"zstd={packResult.CompressedBytes / 1024.0:F1}KB ({compressionRatio * 100:F1}% pack compression), " +
+                $"P-frame: {packResult.PframeDeltaCount} deltas in {packResult.PframeGroups} families (saved {packResult.PframeSavedBytes / 1024.0:F1}KB inner)");
+        }
+        finally
+        {
+            Globals.CcfOptimizationLock.Release();
+        }
     }
 
     internal sealed class PackBuildResult
@@ -1305,7 +1326,7 @@ public class CcfPackOptimizerService : BackgroundService
             int refsLen = BitConverter.ToInt32(file, pos); pos += 4;
 
             int errorCompLen;
-            if (version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
+            if (version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0")
             {
                 errorCompLen = BitConverter.ToInt32(file, pos); pos += 4;
                 pos += 4;
@@ -1315,7 +1336,7 @@ public class CcfPackOptimizerService : BackgroundService
                 errorCompLen = BitConverter.ToInt32(file, pos); pos += 4;
             }
 
-            if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
+            if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0")
                 pos += 4;
 
             int errorOffset = pos + refsLen;
@@ -1324,7 +1345,7 @@ public class CcfPackOptimizerService : BackgroundService
             byte[] errorPayload = new byte[errorCompLen];
             Buffer.BlockCopy(file, errorOffset, errorPayload, 0, errorCompLen);
 
-            if (version == "v5.6.0" && errorCompLen >= 24)
+            if ((version == "v5.6.0" || version == "v6.0.0") && errorCompLen >= 24)
             {
                 int compModeLen = BitConverter.ToInt32(errorPayload, 12);
                 int compBitmaskLen = BitConverter.ToInt32(errorPayload, 16);

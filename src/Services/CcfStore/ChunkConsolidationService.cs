@@ -69,12 +69,6 @@ public class ChunkConsolidationService : BackgroundService
 
     private async Task RunConsolidationCycle(CancellationToken ct)
     {
-        if (!await Globals.CcfOptimizationLock.WaitAsync(TimeSpan.FromSeconds(10), ct))
-        {
-            Console.WriteLine("[ChunkConsolidation] Skipping cycle, optimizer holds lock");
-            return;
-        }
-
         try
         {
             IsRunning = true;
@@ -83,7 +77,6 @@ public class ChunkConsolidationService : BackgroundService
         finally
         {
             IsRunning = false;
-            Globals.CcfOptimizationLock.Release();
         }
     }
 
@@ -227,49 +220,78 @@ public class ChunkConsolidationService : BackgroundService
         Console.WriteLine($"[ChunkConsolidation] Loaded {allEntries.Count} entries ({loadBytes / 1024 / 1024}MB) " +
             $"from {packsToRepack.Count} packs, building optimized pack...");
 
-        // Phase 5: Build optimized pack (groups by fingerprint for P-frame delta)
-        var result = await CcfPackOptimizerService.PackEntriesAsync(store, allEntries, ct);
-
-        // Phase 6: Cleanup source packs where ALL entries were migrated (journaled for crash-recovery)
-        var fullyMigratedSourcePacks = new List<string>();
-        foreach (var packId in packsToRepack)
+        // Acquire write lock only for pack creation + cleanup.
+        // The scanning and loading phases above run lock-free so the optimizer can work concurrently.
+        if (!await Globals.CcfOptimizationLock.WaitAsync(TimeSpan.FromSeconds(60), ct))
         {
-            int expected = packEntryCounts.TryGetValue(packId, out var n) ? n : 0;
-            int migrated = allEntries.Count(e =>
-                string.Equals(e.SourcePackId, packId, StringComparison.OrdinalIgnoreCase));
-
-            if (migrated == expected && expected > 0)
-            {
-                fullyMigratedSourcePacks.Add(packId);
-            }
-            else
-            {
-                Console.WriteLine($"[ChunkConsolidation] Kept pack {packId} (migrated {migrated}/{expected})");
-            }
+            Console.WriteLine("[ChunkConsolidation] Could not acquire write lock in 60s, aborting repack phase");
+            return;
         }
+        try
+        {
+            var livePacks = store.ListPacks().Select(p => p.PackId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var stalePacks = packsToRepack.Where(p => !livePacks.Contains(p)).ToList();
+            if (stalePacks.Count > 0)
+            {
+                foreach (var pid in stalePacks)
+                {
+                    Console.WriteLine($"[ChunkConsolidation] Source pack {pid} deleted by optimizer, evicting its entries");
+                    allEntries.RemoveAll(e => string.Equals(e.SourcePackId, pid, StringComparison.OrdinalIgnoreCase));
+                    packsToRepack.Remove(pid);
+                }
+                if (allEntries.Count < 2)
+                {
+                    Console.WriteLine("[ChunkConsolidation] Not enough entries after stale-pack eviction");
+                    return;
+                }
+            }
 
-        await CcfPackOptimizerService.ApplyCleanupWithJournalAsync(
-            store,
-            result.PackId,
-            Array.Empty<string>(),
-            fullyMigratedSourcePacks,
-            ct);
+            var result = await CcfPackOptimizerService.PackEntriesAsync(store, allEntries, ct);
 
-        LastRepackedEntries = result.EntryCount;
-        LastConsolidationUtc = DateTime.UtcNow;
-        LastConsolidationSavedBytes = Math.Max(0, sourcePackBytes - result.PackBytes);
-        TotalConsolidationSavedBytes += LastConsolidationSavedBytes;
+            var fullyMigratedSourcePacks = new List<string>();
+            foreach (var packId in packsToRepack)
+            {
+                int expected = packEntryCounts.TryGetValue(packId, out var n) ? n : 0;
+                int migrated = allEntries.Count(e =>
+                    string.Equals(e.SourcePackId, packId, StringComparison.OrdinalIgnoreCase));
 
-        CcfPackOptimizerService.PframeGroupsFound += result.PframeGroups;
-        CcfPackOptimizerService.PframeDeltaCount += result.PframeDeltaCount;
-        CcfPackOptimizerService.PframeSavedBytes += result.PframeSavedBytes;
+                if (migrated == expected && expected > 0)
+                {
+                    fullyMigratedSourcePacks.Add(packId);
+                }
+                else
+                {
+                    Console.WriteLine($"[ChunkConsolidation] Kept pack {packId} (migrated {migrated}/{expected})");
+                }
+            }
 
-        double ratio = result.InnerBytes > 0 ? 1.0 - (double)result.CompressedBytes / result.InnerBytes : 0;
-        Console.WriteLine($"[ChunkConsolidation] Consolidated {result.EntryCount} entries → {result.PackId}: " +
-            $"inner={result.InnerBytes / 1024.0:F1}KB → zstd={result.CompressedBytes / 1024.0:F1}KB ({ratio * 100:F1}%), " +
-            $"P-frame: {result.PframeDeltaCount} deltas in {result.PframeGroups} families, " +
-            $"consolidationSaved={LastConsolidationSavedBytes / 1024.0:F1}KB, " +
-            $"cleanup scheduled for {fullyMigratedSourcePacks.Count}/{packsToRepack.Count} source packs ({sw.ElapsedMilliseconds}ms)");
+            await CcfPackOptimizerService.ApplyCleanupWithJournalAsync(
+                store,
+                result.PackId,
+                Array.Empty<string>(),
+                fullyMigratedSourcePacks,
+                ct);
+
+            LastRepackedEntries = result.EntryCount;
+            LastConsolidationUtc = DateTime.UtcNow;
+            LastConsolidationSavedBytes = Math.Max(0, sourcePackBytes - result.PackBytes);
+            TotalConsolidationSavedBytes += LastConsolidationSavedBytes;
+
+            CcfPackOptimizerService.PframeGroupsFound += result.PframeGroups;
+            CcfPackOptimizerService.PframeDeltaCount += result.PframeDeltaCount;
+            CcfPackOptimizerService.PframeSavedBytes += result.PframeSavedBytes;
+
+            double ratio = result.InnerBytes > 0 ? 1.0 - (double)result.CompressedBytes / result.InnerBytes : 0;
+            Console.WriteLine($"[ChunkConsolidation] Consolidated {result.EntryCount} entries → {result.PackId}: " +
+                $"inner={result.InnerBytes / 1024.0:F1}KB → zstd={result.CompressedBytes / 1024.0:F1}KB ({ratio * 100:F1}%), " +
+                $"P-frame: {result.PframeDeltaCount} deltas in {result.PframeGroups} families, " +
+                $"consolidationSaved={LastConsolidationSavedBytes / 1024.0:F1}KB, " +
+                $"cleanup scheduled for {fullyMigratedSourcePacks.Count}/{packsToRepack.Count} source packs ({sw.ElapsedMilliseconds}ms)");
+        }
+        finally
+        {
+            Globals.CcfOptimizationLock.Release();
+        }
     }
 
     /// <summary>
@@ -289,11 +311,11 @@ public class ChunkConsolidationService : BackgroundService
             string version = Encoding.UTF8.GetString(file, pos, versionLen); pos += versionLen;
             int refsLen = BitConverter.ToInt32(file, pos); pos += 4;
 
-            bool hasOrigLen = version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0";
+            bool hasOrigLen = version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0";
             pos += 4;
             if (hasOrigLen) pos += 4;
 
-            bool hasTrim = version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0";
+            bool hasTrim = version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0";
             if (hasTrim) pos += 4;
 
             int refsOffset = pos;

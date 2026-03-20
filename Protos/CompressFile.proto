@@ -51,6 +51,8 @@ message FileMetadata {
   // a file_id is returned (instead of streaming the CCF bytes to the client).
   // The client can later call DecompressById to retrieve the original file.
   bool store_on_cluster = 10;
+  // Preferred encoding version (e.g. "v6.0.0"). Empty = use server default.
+  string preferred_encoding = 11;
 }
 
 message FileIdRequest {

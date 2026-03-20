@@ -361,6 +361,7 @@ public class CompressFileService : FileService.FileServiceBase
             var firstMsg = requestStream.Current;
             float maxErrorRate = 0f;
             bool storeOnCluster = false;
+            string preferredEncoding = "";
             if (firstMsg.PayloadCase == FileUploadRequest.PayloadOneofCase.Metadata)
             {
                 fileName = firstMsg.Metadata.FileName;
@@ -368,6 +369,7 @@ public class CompressFileService : FileService.FileServiceBase
                 declaredSha256 = firstMsg.Metadata.Sha256;
                 maxErrorRate = firstMsg.Metadata.MaxErrorRate;
                 storeOnCluster = firstMsg.Metadata.StoreOnCluster && Globals.EnableCcfStore;
+                preferredEncoding = firstMsg.Metadata?.PreferredEncoding ?? "";
             }
 
             bool willUseWindowed = declaredSize > (ulong)windowedThreshold;
@@ -396,12 +398,12 @@ public class CompressFileService : FileService.FileServiceBase
                 if (willUseWindowed)
                 {
                     await HandleWindowedPipeline(requestStream, responseStream, context,
-                        (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate, storeOnCluster);
+                        (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate, storeOnCluster, preferredEncoding);
                 }
                 else
                 {
                     await HandleMonolithicCompression(requestStream, responseStream, context,
-                        tempPath, (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate, storeOnCluster);
+                        tempPath, (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate, storeOnCluster, preferredEncoding);
                 }
             }
             finally
@@ -448,7 +450,8 @@ public class CompressFileService : FileService.FileServiceBase
         ByteString? declaredSha256,
         long effectiveLimit,
         float maxErrorRate = 0f,
-        bool storeOnCluster = false)
+        bool storeOnCluster = false,
+        string preferredEncoding = "")
     {
         int windowSize = MyCrossService.WindowSize;
         int parallelism = GetPipelineParallelism();
@@ -476,7 +479,7 @@ public class CompressFileService : FileService.FileServiceBase
 
         Stream outputStream = storeOnCluster ? (Stream)clusterTempFs! : grpcStream!;
         var pipelineTask = RunCompressionPipeline(
-            windowChannel.Reader, outputStream, declaredSize, blockCount, parallelism, context.CancellationToken, maxErrorRate);
+            windowChannel.Reader, outputStream, declaredSize, blockCount, parallelism, context.CancellationToken, maxErrorRate, preferredEncoding);
 
         // ── Receive loop: accumulate gRPC chunks into window buffers ──
         byte[] currentBuf = new byte[windowSize];
@@ -634,7 +637,8 @@ public class CompressFileService : FileService.FileServiceBase
         int blockCount,
         int parallelism,
         CancellationToken ct,
-        float maxErrorRate = 0f)
+        float maxErrorRate = 0f,
+        string preferredEncoding = "")
     {
         var crossService = new MyCrossService();
 
@@ -670,7 +674,7 @@ public class CompressFileService : FileService.FileServiceBase
                     {
                         Console.WriteLine($"[Pipeline] Compressing block {item.Index + 1}/{blockCount} ({item.Data.Length} bytes)...");
                         var sw = System.Diagnostics.Stopwatch.StartNew();
-                        (byte[] compressed, int refs, int chunks, long dcBytes, float blockAvgErr, long blockErrPayload) = await crossService.CompressFileWithStats(item.Data, maxErrorRate);
+                        (byte[] compressed, int refs, int chunks, long dcBytes, float blockAvgErr, long blockErrPayload) = await crossService.CompressFileWithStats(item.Data, maxErrorRate, preferredEncoding);
                         sw.Stop();
                         Console.WriteLine($"[Pipeline] Block {item.Index + 1}/{blockCount}: {item.Data.Length} → {compressed.Length} ({sw.ElapsedMilliseconds}ms)");
 
@@ -735,7 +739,8 @@ public class CompressFileService : FileService.FileServiceBase
         ByteString? declaredSha256,
         long effectiveLimit,
         float maxErrorRate = 0f,
-        bool storeOnCluster = false)
+        bool storeOnCluster = false,
+        string preferredEncoding = "")
     {
         long receivedBytes = 0;
         byte[] uploadedSha256;
@@ -789,7 +794,7 @@ public class CompressFileService : FileService.FileServiceBase
         byte[] fileBytes = await File.ReadAllBytesAsync(tempPath, context.CancellationToken);
 
         var compressSw = System.Diagnostics.Stopwatch.StartNew();
-        (byte[] compressedBytes, int referencesFound, int totalChunks, long dcBytesStored, float avgErrorRate, long errorPayloadBytes) = await crossService.CompressFileWithStats(fileBytes, maxErrorRate);
+        (byte[] compressedBytes, int referencesFound, int totalChunks, long dcBytesStored, float avgErrorRate, long errorPayloadBytes) = await crossService.CompressFileWithStats(fileBytes, maxErrorRate, preferredEncoding);
         compressSw.Stop();
         fileBytes = null!;
 
@@ -1070,7 +1075,7 @@ public class CompressFileService : FileService.FileServiceBase
             resp.PackCompressionRatio = CcfPackOptimizerService.TotalPackRawBytes > 0
                 ? 1.0 - (double)CcfPackOptimizerService.TotalPackCompressedBytes / CcfPackOptimizerService.TotalPackRawBytes
                 : 0;
-            resp.EncodingVersion = "v5.6.0";
+            resp.EncodingVersion = Globals.CcfEncodingV6 ? "v6.0.0" : "v5.6.0";
             resp.PframeGroups = CcfPackOptimizerService.PframeGroupsFound;
             resp.PframeDeltaCount = CcfPackOptimizerService.PframeDeltaCount;
             resp.PframeSavedBytes = CcfPackOptimizerService.PframeSavedBytes;

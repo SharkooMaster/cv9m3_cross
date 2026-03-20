@@ -35,8 +35,10 @@ public class CrossService : ICross
     // v5.0.0: Compact ref table with (bucketId, bucketIndex) as ulong pairs replaces inline 32-byte
     //         SHA256 storageGuids. Per-chunk refs use uint16 table indices into the ref table.
     //         Uses standard header (ParseHeader), zstd on error dict, SHA256 hash — same as v3.1.0.
-    private const string EncodingVersion = "v5.6.0";
-    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0", "v5.1.0", "v5.2.0", "v5.3.0", "v5.4.0", "v5.5.0", "v5.6.0" };
+    private static string GetEncodingVersion(string preferredEncoding = "")
+        => preferredEncoding == "v6.0.0" || (string.IsNullOrEmpty(preferredEncoding) && Globals.CcfEncodingV6)
+            ? "v6.0.0" : "v5.6.0";
+    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0", "v5.1.0", "v5.2.0", "v5.3.0", "v5.4.0", "v5.5.0", "v5.6.0", "v6.0.0" };
     string headID = "";
     private readonly global::Cross.Services.Grpc.Agent.ChunkReferenceServiceClient _chunkReferenceClient = new();
 
@@ -212,7 +214,7 @@ public class CrossService : ICross
         bw.Write(references.Length);
 
         byte[] errorPayload;
-        if (version is "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
+        if (version is "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0")
         {
             errorPayload = errorDictionary;
             bw.Write(errorPayload.Length);
@@ -373,7 +375,7 @@ public class CrossService : ICross
         // v3.1.0+: error dictionary is zstd-compressed; header has [compressedLen][originalLen]
         // v5.3.0+: sub-streams are internally compressed; both lengths are identical
         int errorOriginalLength = errorLength; // for uncompressed versions, original == stored
-        if (version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
+        if (version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0")
         {
             errorOriginalLength = BitConverter.ToInt32(payload.Slice(offset, IntSize));
             offset += IntSize;
@@ -381,13 +383,268 @@ public class CrossService : ICross
 
         // v2.1.0+: trim chunk length is stored in the header
         int trimLength = -1; // -1 means "not present" (v2.0.0 compat)
-        if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
+        if (version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0")
         {
             trimLength = BitConverter.ToInt32(payload.Slice(offset, IntSize));
             offset += IntSize;
         }
 
         return (version, referencesLength, errorLength, errorOriginalLength, trimLength, offset);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  v6.0.0 TRANSFORM PROGRAM ENCODER
+    //  Opcodes: 0x01=CONST_FIELD, 0x02=SEQ_FIELD, 0x03=LITERAL_PATCH
+    // ═══════════════════════════════════════════════════════════════════
+    private const byte V6_CONST_FIELD = 0x01;
+    private const byte V6_SEQ_FIELD = 0x02;
+    private const byte V6_LITERAL_PATCH = 0x03;
+
+    private static byte[] EncodeErrorsV6(
+        List<(ushort Offset, byte Value)>[] chunkErrors,
+        int chunkCount, int chunkSize, int patchCount, int totalBytes)
+    {
+        // Coverage map: track which (chunk, byte) errors are claimed by instructions
+        var covered = new HashSet<long>();
+        long CoverKey(int chunk, int bytePos) => ((long)chunk << 16) | (uint)bytePos;
+
+        // Build column index: for each byte position, sorted list of (chunkIdx, value)
+        var columns = new Dictionary<int, List<(int Chunk, byte Value)>>();
+        for (int i = 0; i < chunkCount; i++)
+        {
+            foreach (var (off, val) in chunkErrors[i])
+            {
+                if (!columns.TryGetValue(off, out var list))
+                {
+                    list = new List<(int, byte)>();
+                    columns[off] = list;
+                }
+                list.Add((i, val));
+            }
+        }
+
+        // Detect patterns in each column: find maximal contiguous chunk ranges
+        // with constant or arithmetic-sequence values
+        var candidates = new List<(int ByteOffset, int ChunkStart, int ChunkEnd, bool IsSeq, byte ConstVal, byte Delta, int Savings)>();
+
+        foreach (var (bytePos, entries) in columns)
+        {
+            if (entries.Count < 3) continue;
+
+            int runStart = 0;
+            while (runStart < entries.Count)
+            {
+                int runEnd = runStart;
+                byte startVal = entries[runStart].Value;
+                int startChunk = entries[runStart].Chunk;
+
+                // Extend run: consecutive chunk indices with constant or sequential values
+                bool isConst = true;
+                byte seqDelta = 0;
+                if (runStart + 1 < entries.Count && entries[runStart + 1].Chunk == startChunk + 1)
+                    seqDelta = (byte)(entries[runStart + 1].Value - startVal);
+
+                while (runEnd + 1 < entries.Count)
+                {
+                    int nextChunk = entries[runEnd + 1].Chunk;
+                    byte nextVal = entries[runEnd + 1].Value;
+                    int curChunk = entries[runEnd].Chunk;
+
+                    if (nextChunk != curChunk + 1) break;
+
+                    byte expectedConst = startVal;
+                    byte expectedSeq = (byte)(startVal + (byte)((nextChunk - startChunk) * seqDelta));
+
+                    if (nextVal == expectedConst) { runEnd++; continue; }
+                    if (nextVal == expectedSeq) { isConst = false; runEnd++; continue; }
+                    break;
+                }
+
+                int runLen = runEnd - runStart + 1;
+                if (runLen >= 3)
+                {
+                    int chunkStart = entries[runStart].Chunk;
+                    int chunkEnd = entries[runEnd].Chunk;
+                    // Savings: each covered error avoids a 5-byte residual entry.
+                    // Instruction cost: CONST=9, SEQ=10 (for 1-byte field)
+                    int instrCost = (isConst || seqDelta == 0) ? 9 : 10;
+                    int savings = runLen * 5 - instrCost;
+                    if (savings > 0)
+                    {
+                        candidates.Add((bytePos, chunkStart, chunkEnd,
+                            !isConst && seqDelta != 0, startVal, seqDelta, savings));
+                    }
+                }
+
+                runStart = runEnd + 1;
+            }
+        }
+
+        // Group adjacent byte positions with matching chunk ranges and compatible patterns
+        candidates.Sort((a, b) =>
+        {
+            int c = a.ChunkStart.CompareTo(b.ChunkStart);
+            if (c != 0) return c;
+            c = a.ChunkEnd.CompareTo(b.ChunkEnd);
+            if (c != 0) return c;
+            return a.ByteOffset.CompareTo(b.ByteOffset);
+        });
+
+        // Greedy: emit instructions sorted by savings (descending)
+        candidates.Sort((a, b) => b.Savings.CompareTo(a.Savings));
+
+        using var progMs = new MemoryStream();
+        using var progBw = new BinaryWriter(progMs, Encoding.UTF8, leaveOpen: true);
+        int instrCount = 0;
+
+        // Placeholder for instruction count
+        long instrCountPos = progMs.Position;
+        progBw.Write((ushort)0);
+
+        foreach (var cand in candidates)
+        {
+            // Check if any error in this range is already covered
+            bool conflict = false;
+            for (int ci = cand.ChunkStart; ci <= cand.ChunkEnd && !conflict; ci++)
+                if (covered.Contains(CoverKey(ci, cand.ByteOffset)))
+                    conflict = true;
+            if (conflict) continue;
+
+            // Mark covered
+            for (int ci = cand.ChunkStart; ci <= cand.ChunkEnd; ci++)
+                covered.Add(CoverKey(ci, cand.ByteOffset));
+
+            if (cand.IsSeq)
+            {
+                progBw.Write(V6_SEQ_FIELD);
+                progBw.Write((ushort)cand.ChunkStart);
+                progBw.Write((ushort)cand.ChunkEnd);
+                progBw.Write((ushort)cand.ByteOffset);
+                progBw.Write((byte)1);
+                progBw.Write(cand.ConstVal);
+                progBw.Write(cand.Delta);
+            }
+            else
+            {
+                progBw.Write(V6_CONST_FIELD);
+                progBw.Write((ushort)cand.ChunkStart);
+                progBw.Write((ushort)cand.ChunkEnd);
+                progBw.Write((ushort)cand.ByteOffset);
+                progBw.Write((byte)1);
+                progBw.Write(cand.ConstVal);
+            }
+            instrCount++;
+        }
+
+        // Also emit LITERAL_PATCH for chunks with few scattered uncovered errors
+        // (more compact than individual residual entries when errors are clustered)
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (chunkErrors[i].Count == 0) continue;
+            var uncovered = chunkErrors[i]
+                .Where(e => !covered.Contains(CoverKey(i, e.Offset)))
+                .ToList();
+            if (uncovered.Count == 0) continue;
+
+            // Find contiguous runs of uncovered errors for LITERAL_PATCH
+            uncovered.Sort((a, b) => a.Offset.CompareTo(b.Offset));
+            int ri = 0;
+            while (ri < uncovered.Count)
+            {
+                int start = uncovered[ri].Offset;
+                int end = start;
+                while (ri + 1 < uncovered.Count && uncovered[ri + 1].Offset <= end + 2)
+                {
+                    ri++;
+                    end = uncovered[ri].Offset;
+                }
+                int patchLen = end - start + 1;
+                int patchErrors = uncovered.Count(e => e.Offset >= start && e.Offset <= end);
+                // LITERAL_PATCH costs 7 + patchLen bytes vs 5*patchErrors residual entries
+                if (patchLen <= 255 && 7 + patchLen < 5 * patchErrors)
+                {
+                    progBw.Write(V6_LITERAL_PATCH);
+                    progBw.Write((ushort)i);
+                    progBw.Write((ushort)start);
+                    progBw.Write((ushort)patchLen);
+                    // Write original bytes at this range
+                    // We need the original values — reconstruct from chunkErrors
+                    // For positions in [start, end], either from chunkErrors or 0 (base byte)
+                    var errMap = chunkErrors[i].ToDictionary(e => (int)e.Offset, e => e.Value);
+                    for (int b = start; b <= end; b++)
+                        progBw.Write(errMap.TryGetValue(b, out byte v) ? v : (byte)0);
+
+                    for (int b = start; b <= end; b++)
+                        covered.Add(CoverKey(i, b));
+                    instrCount++;
+                }
+                ri++;
+            }
+        }
+
+        // Write actual instruction count
+        progBw.Flush();
+        long savedPos = progMs.Position;
+        progMs.Position = instrCountPos;
+        progBw.Write((ushort)instrCount);
+        progMs.Position = savedPos;
+        progBw.Flush();
+
+        byte[] rawProgram = progMs.ToArray();
+
+        // Build residual: all uncovered (chunk, offset, value) triples
+        using var resMs = new MemoryStream();
+        using var resBw = new BinaryWriter(resMs, Encoding.UTF8, leaveOpen: true);
+        int residualCount = 0;
+        long resCountPos = resMs.Position;
+        resBw.Write(0); // placeholder
+
+        for (int i = 0; i < chunkCount; i++)
+        {
+            foreach (var (off, val) in chunkErrors[i])
+            {
+                if (covered.Contains(CoverKey(i, off))) continue;
+                resBw.Write((ushort)i);
+                resBw.Write((ushort)off);
+                resBw.Write(val);
+                residualCount++;
+            }
+        }
+
+        resBw.Flush();
+        resMs.Position = resCountPos;
+        resBw.Write(residualCount);
+        resBw.Flush();
+        byte[] rawResidual = resMs.ToArray();
+
+        // Compress both blobs
+        using var zc = new Compressor(19);
+        byte[] zstdProgram = zc.Wrap(rawProgram).ToArray();
+        byte[] zstdResidual = zc.Wrap(rawResidual).ToArray();
+
+        // Assemble final payload
+        using var outMs = new MemoryStream();
+        using var outBw = new BinaryWriter(outMs, Encoding.UTF8, leaveOpen: true);
+        outBw.Write(patchCount);
+        outBw.Write(totalBytes);
+        outBw.Write(chunkCount);
+        outBw.Write((ushort)chunkSize);
+        outBw.Write(zstdProgram.Length);
+        outBw.Write(zstdResidual.Length);
+        outBw.Write(zstdProgram);
+        outBw.Write(zstdResidual);
+        outBw.Flush();
+
+        int coveredErrors = covered.Count;
+        Console.WriteLine($"[Compress] PatchEncode(v6.0.0): " +
+            $"totalBytes={totalBytes}, patches={patchCount}, " +
+            $"instructions={instrCount}, coveredByProgram={coveredErrors} ({100.0 * coveredErrors / Math.Max(1, patchCount):F1}%), " +
+            $"residual={residualCount}, " +
+            $"program={rawProgram.Length}→{zstdProgram.Length}, " +
+            $"residual={rawResidual.Length}→{zstdResidual.Length}, " +
+            $"totalPayload={outMs.Length}");
+
+        return outMs.ToArray();
     }
 
     private List<QueryObject> GetQueryObjects(List<byte[]> _fileChunks, List<float[]> _vectors, List<string> _bitStrings)
@@ -465,8 +722,9 @@ public class CrossService : ICross
     }
 
     // Local/in-process helper: returns compressed bytes plus per-file reference stats
-    public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks, long DatacenterBytesStored, float AverageErrorRate, long ErrorPayloadBytes)> CompressFileWithStats(byte[] _file, float maxErrorRate = 0f)
+    public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks, long DatacenterBytesStored, float AverageErrorRate, long ErrorPayloadBytes)> CompressFileWithStats(byte[] _file, float maxErrorRate = 0f, string preferredEncoding = "")
     {
+        string encodingVersion = GetEncodingVersion(preferredEncoding);
         float bloatThreshold = maxErrorRate > 0f && maxErrorRate <= 1f
             ? maxErrorRate
             : Globals.BloatGuardThreshold;
@@ -2250,11 +2508,7 @@ public class CrossService : ICross
 
         // v5.0.0: references are built by BuildV5References (ref table + compact indices)
 
-        // ── ERROR ENCODING (v5.6.0): bitmask-only with direct byte replacement ──
-        // 1-bit mode per chunk: 0=duplicate, 1=bitmask+values.
-        // Eliminates the skip stream entirely — sparse bitmasks compress better
-        // under zstd-19 than variable-length skip varints, and decode faster
-        // (direct bit indexing vs sequential varint walk).
+        // ── ERROR ENCODING ──
         byte[] errorDictionaryBytes;
         {
             using var stage = Observability.StartStage("PatchEncode");
@@ -2265,13 +2519,9 @@ public class CrossService : ICross
             int totalBytes = chunkCount * cs;
             int bitmaskBytes = cs / 8;
 
-            byte[] modeBitfield = new byte[(chunkCount + 7) / 8];
-            using var bitmaskMs = new MemoryStream();
-            using var valMs = new MemoryStream();
-
+            // Phase 1: compute per-chunk diffs (shared by v5.6.0 and v6.0.0)
+            var chunkErrors = new List<(ushort Offset, byte Value)>[chunkCount];
             int patchCount = 0;
-            int dupChunks = 0;
-            int bitmaskChunks = 0;
 
             for (int i = 0; i < chunkCount; i++)
             {
@@ -2279,109 +2529,103 @@ public class CrossService : ICross
                 byte[] baseChunk;
 
                 if (mosaicInfos.TryGetValue(i, out var mosaicForDiff))
-                {
                     baseChunk = mosaicForDiff.StitchedBase;
-                }
                 else if (sorted[i].NeedToStore && sorted[i].BucketId != 0)
-                {
                     baseChunk = fileChunks[i];
-                }
                 else if (!representativeSet.Contains(i) && sorted[groupRepresentative[i]].NeedToStore
                          && sorted[groupRepresentative[i]].BucketId != 0)
-                {
                     baseChunk = fileChunks[groupRepresentative[i]];
-                }
                 else if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
-                {
                     baseChunk = sorted[i].Chunk.ToByteArray();
-                }
                 else
-                {
                     baseChunk = Array.Empty<byte>();
-                }
 
                 int baseLen = Math.Min(baseChunk.Length, cs);
-                byte[] mask = new byte[bitmaskBytes];
-                int errs = 0;
-
+                var errs = new List<(ushort Offset, byte Value)>();
                 for (int b = 0; b < cs; b++)
                 {
                     byte refByte = b < baseLen ? baseChunk[b] : (byte)0;
                     if (original[b] != refByte)
-                    {
-                        mask[b >> 3] |= (byte)(1 << (b & 7));
-                        errs++;
-                    }
+                        errs.Add(((ushort)b, original[b]));
                 }
-
-                patchCount += errs;
-
-                if (errs == 0)
-                {
-                    dupChunks++;
-                }
-                else
-                {
-                    modeBitfield[i >> 3] |= (byte)(1 << (i & 7));
-                    bitmaskChunks++;
-
-                    bitmaskMs.Write(mask, 0, bitmaskBytes);
-                    for (int b = 0; b < cs; b++)
-                    {
-                        if ((mask[b >> 3] & (1 << (b & 7))) != 0)
-                            valMs.WriteByte(original[b]);
-                    }
-                }
+                chunkErrors[i] = errs;
+                patchCount += errs.Count;
             }
 
-            byte[] rawMode = modeBitfield;
-            byte[] rawBitmasks = bitmaskMs.ToArray();
-            byte[] rawVals = valMs.ToArray();
-
-            var liveDict = Globals.EnableCcfStore
-                ? CcfPackOptimizerService.LiveDictionary
-                : null;
-
-            byte[] zstdMode, zstdBitmasks, zstdVals;
-            if (liveDict != null)
+            if (encodingVersion == "v6.0.0")
             {
-                using var c1 = new Compressor(19); c1.LoadDictionary(liveDict);
-                zstdMode = c1.Wrap(rawMode).ToArray();
-                using var c2 = new Compressor(19); c2.LoadDictionary(liveDict);
-                zstdBitmasks = c2.Wrap(rawBitmasks).ToArray();
-                using var c3 = new Compressor(19); c3.LoadDictionary(liveDict);
-                zstdVals = c3.Wrap(rawVals).ToArray();
+                errorDictionaryBytes = EncodeErrorsV6(chunkErrors, chunkCount, cs, patchCount, totalBytes);
             }
             else
             {
-                using var c = new Compressor(19);
-                zstdMode = c.Wrap(rawMode).ToArray();
-                zstdBitmasks = c.Wrap(rawBitmasks).ToArray();
-                zstdVals = c.Wrap(rawVals).ToArray();
+                // v5.6.0: 3-stream bitmask encoding
+                byte[] modeBitfield = new byte[(chunkCount + 7) / 8];
+                using var bitmaskMs = new MemoryStream();
+                using var valMs = new MemoryStream();
+                int dupChunks = 0, bitmaskChunks = 0;
+
+                for (int i = 0; i < chunkCount; i++)
+                {
+                    if (chunkErrors[i].Count == 0) { dupChunks++; continue; }
+
+                    modeBitfield[i >> 3] |= (byte)(1 << (i & 7));
+                    bitmaskChunks++;
+
+                    byte[] mask = new byte[bitmaskBytes];
+                    foreach (var (off, _) in chunkErrors[i])
+                        mask[off >> 3] |= (byte)(1 << (off & 7));
+                    bitmaskMs.Write(mask, 0, bitmaskBytes);
+
+                    foreach (var (_, val) in chunkErrors[i])
+                        valMs.WriteByte(val);
+                }
+
+                byte[] rawMode = modeBitfield;
+                byte[] rawBitmasks = bitmaskMs.ToArray();
+                byte[] rawVals = valMs.ToArray();
+
+                var liveDict = Globals.EnableCcfStore ? CcfPackOptimizerService.LiveDictionary : null;
+                byte[] zstdMode, zstdBitmasks, zstdVals;
+                if (liveDict != null)
+                {
+                    using var c1 = new Compressor(19); c1.LoadDictionary(liveDict);
+                    zstdMode = c1.Wrap(rawMode).ToArray();
+                    using var c2 = new Compressor(19); c2.LoadDictionary(liveDict);
+                    zstdBitmasks = c2.Wrap(rawBitmasks).ToArray();
+                    using var c3 = new Compressor(19); c3.LoadDictionary(liveDict);
+                    zstdVals = c3.Wrap(rawVals).ToArray();
+                }
+                else
+                {
+                    using var c = new Compressor(19);
+                    zstdMode = c.Wrap(rawMode).ToArray();
+                    zstdBitmasks = c.Wrap(rawBitmasks).ToArray();
+                    zstdVals = c.Wrap(rawVals).ToArray();
+                }
+
+                using var outMs = new MemoryStream();
+                using var bw2 = new BinaryWriter(outMs, Encoding.UTF8, leaveOpen: true);
+                bw2.Write(patchCount);
+                bw2.Write(totalBytes);
+                bw2.Write(chunkCount);
+                bw2.Write(zstdMode.Length);
+                bw2.Write(zstdBitmasks.Length);
+                bw2.Write(zstdVals.Length);
+                bw2.Write(zstdMode);
+                bw2.Write(zstdBitmasks);
+                bw2.Write(zstdVals);
+                bw2.Flush();
+                errorDictionaryBytes = outMs.ToArray();
+
+                Console.WriteLine($"[Compress] PatchEncode(v5.6.0): {phaseSw.ElapsedMilliseconds}ms, " +
+                    $"totalBytes={totalBytes}, patches={patchCount} ({100.0 * patchCount / totalBytes:F1}%), " +
+                    $"dup={dupChunks}, bitmask={bitmaskChunks} (of {chunkCount}), " +
+                    $"modeStream={rawMode.Length}→{zstdMode.Length}, " +
+                    $"bitmaskStream={rawBitmasks.Length}→{zstdBitmasks.Length}, valStream={rawVals.Length}→{zstdVals.Length}, " +
+                    $"totalErrorPayload={errorDictionaryBytes.Length}");
             }
 
-            using var outMs = new MemoryStream();
-            using var bw2 = new BinaryWriter(outMs, Encoding.UTF8, leaveOpen: true);
-            bw2.Write(patchCount);
-            bw2.Write(totalBytes);
-            bw2.Write(chunkCount);
-            bw2.Write(zstdMode.Length);
-            bw2.Write(zstdBitmasks.Length);
-            bw2.Write(zstdVals.Length);
-            bw2.Write(zstdMode);
-            bw2.Write(zstdBitmasks);
-            bw2.Write(zstdVals);
-            bw2.Flush();
-
-            errorDictionaryBytes = outMs.ToArray();
-
             phaseSw.Stop();
-            Console.WriteLine($"[Compress] PatchEncode(v5.6.0): {phaseSw.ElapsedMilliseconds}ms, " +
-                $"totalBytes={totalBytes}, patches={patchCount} ({100.0 * patchCount / totalBytes:F1}%), " +
-                $"dup={dupChunks}, bitmask={bitmaskChunks} (of {chunkCount}), " +
-                $"modeStream={rawMode.Length}→{zstdMode.Length}, " +
-                $"bitmaskStream={rawBitmasks.Length}→{zstdBitmasks.Length}, valStream={rawVals.Length}→{zstdVals.Length}, " +
-                $"totalErrorPayload={errorDictionaryBytes.Length}");
             Observability.RecordStage("PatchEncode", phaseSw.Elapsed.TotalMilliseconds,
                 ("total_bytes", totalBytes), ("patch_count", patchCount), ("raw_bytes", errorDictionaryBytes.Length));
         }
@@ -2407,7 +2651,7 @@ public class CrossService : ICross
 
             byte[] fileHash = SHA256.HashData(_file);
             toReturn = BuildCompressedPayload(
-                EncodingVersion,
+                encodingVersion,
                 refBytes,
                 errorDictionaryBytes,
                 trimmedChunk.ToArray(),
@@ -2941,7 +3185,7 @@ public class CrossService : ICross
         // Byte-merge metadata for 0x05 refs (pair merge with per-byte bitmask)
         var byteMergeRefs = new Dictionary<int, (List<(ulong BucketId, string StorageGuid, ulong BucketIndex)> Donors, byte[] Bitmask)>();
 
-        if (header.Version is "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
+        if (header.Version is "v5.0.0" or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0")
         {
             // v5.x: compact ref table + ushort indices
             // [4 bytes: chunkCount] [2 bytes: refTableSize]
@@ -3229,9 +3473,10 @@ public class CrossService : ICross
         bool isFourStreamPatch = (header.Version == "v5.4.0");
         bool isDirectPatch = (header.Version == "v5.5.0");
         bool isBitmaskOnlyPatch = (header.Version == "v5.6.0");
+        bool isTransformProgram = (header.Version == "v6.0.0");
         (int startPos, int runLength, short diffValue)[]? patches = null;
 
-        if (header.Version is "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0")
+        if (header.Version is "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0")
         {
             errorBytes = new byte[header.ErrorLength];
             Buffer.BlockCopy(file, errorOffset, errorBytes, 0, header.ErrorLength);
@@ -3248,7 +3493,7 @@ public class CrossService : ICross
             Buffer.BlockCopy(file, errorOffset, errorBytes, 0, header.ErrorLength);
         }
 
-        if (!isXorPatch && !isSkipXorPatch && !isRunXorPatch && !isSplitStreamPatch && !isFourStreamPatch && !isDirectPatch && !isBitmaskOnlyPatch)
+        if (!isXorPatch && !isSkipXorPatch && !isRunXorPatch && !isSplitStreamPatch && !isFourStreamPatch && !isDirectPatch && !isBitmaskOnlyPatch && !isTransformProgram)
         {
             using var errorMs = new MemoryStream(errorBytes, writable: false);
             using var reader = new BinaryReader(errorMs, Encoding.UTF8, leaveOpen: true);
@@ -3531,7 +3776,100 @@ public class CrossService : ICross
         }
 
         // ── Apply error encoding ──
-        if (isBitmaskOnlyPatch)
+        if (isTransformProgram)
+        {
+            // v6.0.0: transform program decoder
+            using var errMs = new MemoryStream(errorBytes, writable: false);
+            using var errBr = new BinaryReader(errMs);
+            int v6PatchCount = errBr.ReadInt32();
+            int v6TotalBytes = errBr.ReadInt32();
+            int v6ChunkCount = errBr.ReadInt32();
+            int v6ChunkSize = errBr.ReadUInt16();
+            int progBlobLen = errBr.ReadInt32();
+            int resBlobLen = errBr.ReadInt32();
+
+            byte[] progBlob = new byte[progBlobLen];
+            errMs.ReadExactly(progBlob, 0, progBlobLen);
+            byte[] resBlob = new byte[resBlobLen];
+            errMs.ReadExactly(resBlob, 0, resBlobLen);
+
+            using var d = new Decompressor();
+            byte[] rawProg = d.Unwrap(progBlob).ToArray();
+            byte[] rawRes = d.Unwrap(resBlob).ToArray();
+
+            // Execute program instructions
+            using var pMs = new MemoryStream(rawProg, writable: false);
+            using var pBr = new BinaryReader(pMs);
+            int instrCount = pBr.ReadUInt16();
+
+            for (int inst = 0; inst < instrCount; inst++)
+            {
+                byte opcode = pBr.ReadByte();
+                switch (opcode)
+                {
+                    case 0x01: // CONST_FIELD
+                    {
+                        int cStart = pBr.ReadUInt16();
+                        int cEnd = pBr.ReadUInt16();
+                        int bOff = pBr.ReadUInt16();
+                        int fLen = pBr.ReadByte();
+                        byte[] vals = pBr.ReadBytes(fLen);
+                        for (int ci = cStart; ci <= cEnd; ci++)
+                        {
+                            int bufOff = ci * v6ChunkSize + bOff;
+                            for (int f = 0; f < fLen && bufOff + f < baseBuffer.Length; f++)
+                                baseBuffer[bufOff + f] = vals[f];
+                        }
+                        break;
+                    }
+                    case 0x02: // SEQ_FIELD
+                    {
+                        int cStart = pBr.ReadUInt16();
+                        int cEnd = pBr.ReadUInt16();
+                        int bOff = pBr.ReadUInt16();
+                        int fLen = pBr.ReadByte();
+                        byte[] startVal = pBr.ReadBytes(fLen);
+                        byte[] delta = pBr.ReadBytes(fLen);
+                        for (int ci = cStart; ci <= cEnd; ci++)
+                        {
+                            int step = ci - cStart;
+                            int bufOff = ci * v6ChunkSize + bOff;
+                            for (int f = 0; f < fLen && bufOff + f < baseBuffer.Length; f++)
+                                baseBuffer[bufOff + f] = (byte)(startVal[f] + step * delta[f]);
+                        }
+                        break;
+                    }
+                    case 0x03: // LITERAL_PATCH
+                    {
+                        int cIdx = pBr.ReadUInt16();
+                        int bOff = pBr.ReadUInt16();
+                        int pLen = pBr.ReadUInt16();
+                        byte[] vals = pBr.ReadBytes(pLen);
+                        int bufOff = cIdx * v6ChunkSize + bOff;
+                        for (int f = 0; f < pLen && bufOff + f < baseBuffer.Length; f++)
+                            baseBuffer[bufOff + f] = vals[f];
+                        break;
+                    }
+                    default:
+                        throw new InvalidDataException($"v6.0.0: unknown opcode 0x{opcode:X2}");
+                }
+            }
+
+            // Apply residual entries
+            using var rMs = new MemoryStream(rawRes, writable: false);
+            using var rBr = new BinaryReader(rMs);
+            int resCount = rBr.ReadInt32();
+            for (int r = 0; r < resCount; r++)
+            {
+                int cIdx = rBr.ReadUInt16();
+                int bOff = rBr.ReadUInt16();
+                byte val = rBr.ReadByte();
+                int bufOff = cIdx * v6ChunkSize + bOff;
+                if (bufOff < baseBuffer.Length)
+                    baseBuffer[bufOff] = val;
+            }
+        }
+        else if (isBitmaskOnlyPatch)
         {
             // v5.6.0: bitmask-only with direct byte replacement, 1-bit mode per chunk
             using var errMs = new MemoryStream(errorBytes, writable: false);

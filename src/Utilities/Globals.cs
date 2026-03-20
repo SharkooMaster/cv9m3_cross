@@ -129,6 +129,10 @@ public static class Globals
     public static int CcfOptimizerParallelism =
         int.TryParse(Environment.GetEnvironmentVariable("CCF_OPTIMIZER_PARALLELISM"), out var cop) ? cop : 0;
 
+    public static bool CcfEncodingV6 =
+        string.Equals(Environment.GetEnvironmentVariable("CCF_ENCODING_V6"), "true",
+            StringComparison.OrdinalIgnoreCase);
+
     internal static readonly SemaphoreSlim CcfOptimizationLock = new(1, 1);
 
     /// <summary>
