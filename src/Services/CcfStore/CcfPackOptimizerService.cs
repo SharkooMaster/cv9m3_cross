@@ -130,6 +130,7 @@ public class CcfPackOptimizerService : BackgroundService
         public int FourStreamChunkCount;
         public bool IsValid;
         public string RefsFingerprint = "";
+        public string FamilyKey = "";
         public int OriginalCcfLength;
         public byte[] DeltaSource => (IsFourStream || IsDirectPatch) ? RawValues : IsSplitStream ? RawValues : RawError;
     }
@@ -354,6 +355,7 @@ public class CcfPackOptimizerService : BackgroundService
             }
 
             comp.RefsFingerprint = Convert.ToHexString(SHA256.HashData(comp.Refs)).ToLowerInvariant();
+            comp.FamilyKey = CcfFamilyKey.Build(comp.Version, comp.Refs);
         }
         catch { /* leave IsValid = false */ }
         return comp;
@@ -924,21 +926,45 @@ public class CcfPackOptimizerService : BackgroundService
         foreach (var entry in entries)
             totalRawBytes += entry.Ccf.Length;
 
-        var groups = entries
-            .Where(e => e.Comp.IsValid && e.Comp.RefsFingerprint.Length > 0)
+        var valid = entries.Where(e => e.Comp.IsValid && e.Comp.RefsFingerprint.Length > 0).ToList();
+
+        // Hybrid family discovery:
+        // 1) exact refs fingerprint groups (high precision),
+        // 2) overlap-aware family key for remaining entries (higher recall).
+        var exactGroups = valid
             .GroupBy(e => e.Comp.RefsFingerprint)
+            .Select(g => g.ToList())
             .ToList();
 
-        var ungrouped = entries.Where(e => !e.Comp.IsValid || e.Comp.RefsFingerprint.Length == 0).ToList();
+        var exactMulti = exactGroups.Where(g => g.Count > 1).ToList();
+        var usedByExact = new HashSet<string>(
+            exactMulti.SelectMany(g => g.Select(e => e.FileId)),
+            StringComparer.OrdinalIgnoreCase);
 
-        int pframeGroups = groups.Count(g => g.Count() > 1);
+        var overlapMulti = valid
+            .Where(e => !usedByExact.Contains(e.FileId) && !string.IsNullOrWhiteSpace(e.Comp.FamilyKey))
+            .GroupBy(e => e.Comp.FamilyKey)
+            .Where(g => g.Count() > 1)
+            .Select(g => g.ToList())
+            .ToList();
+
+        var multiGroups = exactMulti.Concat(overlapMulti).ToList();
+        int pframeGroups = multiGroups.Count;
+
+        var allGroupedIds = new HashSet<string>(
+            multiGroups.SelectMany(g => g.Select(e => e.FileId)),
+            StringComparer.OrdinalIgnoreCase);
+        var ungrouped = entries.Where(e => !allGroupedIds.Contains(e.FileId)).ToList();
+
+        if (overlapMulti.Count > 0)
+        {
+            Console.WriteLine($"[CcfPackOptimizer] Family discovery: exact={exactMulti.Count}, overlap={overlapMulti.Count}");
+        }
 
         // ── Phase 1: Parallel P-frame delta computation per family ──
         int parallelism = Globals.CcfOptimizerParallelism > 0
             ? Globals.CcfOptimizerParallelism
             : Math.Max(1, Math.Min(Environment.ProcessorCount / 2, 8));
-
-        var multiGroups = groups.Where(g => g.Count() > 1).ToList();
         var familyResults = new ConcurrentBag<ProcessedFamily>();
 
         if (multiGroups.Count > 0)
@@ -951,7 +977,7 @@ public class CcfPackOptimizerService : BackgroundService
                 CancellationToken = ct
             }, group =>
             {
-                var members = group.ToList();
+                var members = group;
                 var family = new ProcessedFamily { Base = members[0] };
                 var baseMember = members[0];
 
@@ -1042,12 +1068,6 @@ public class CcfPackOptimizerService : BackgroundService
             int entrySize = 1 + 4 + 4 + pframePayload.Length;
             WriteIndexEntry(idxMs, fileId, offset, entrySize);
             entryIndex++;
-        }
-
-        foreach (var group in groups)
-        {
-            if (group.Count() == 1)
-                WriteIFrame(group.First().FileId, group.First().Ccf);
         }
 
         foreach (var family in familyResults)

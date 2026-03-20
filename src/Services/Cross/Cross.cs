@@ -2175,21 +2175,48 @@ public class CrossService : ICross
 
             await Task.WhenAll(reStoreTasks);
 
-            // ── CRITICAL: Sweep bloated chunks for any that ended up with BucketId=0 ──
-            // This catches individual store failures within a successful batch (agent returns Id=0
-            // for one item but succeeds for others). Without this, sorted[i].Chunk still has the old
-            // matched bytes but the zero BucketId makes it a zero-ref → base mismatch → corruption.
+            // ── CRITICAL: Sweep bloated chunks for store failures and poor agent matches ──
+            int postRestoreOverrides = 0;
+            int postRestoreZeroId = 0;
+            int maxBloatBytes = (int)(Globals.chunkSize * bloatThreshold);
+
             foreach (var i in bloatedDiffRestore)
             {
                 if (sorted[i].BucketId == 0)
                 {
                     sorted[i].Chunk = ByteString.Empty;
                     sorted[i].StorageGuid = "";
+                    postRestoreZeroId++;
+                    continue;
+                }
+
+                if (!sorted[i].NeedToStore && sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
+                {
+                    byte[] baseBytes = sorted[i].Chunk.ToByteArray();
+                    if (chunkMap.TryGetValue(i, out var orig) && orig != null)
+                    {
+                        int diffBytes = 0;
+                        int len = Math.Min(orig.Length, baseBytes.Length);
+                        for (int b = 0; b < len; b++)
+                        {
+                            if (orig[b] != baseBytes[b]) diffBytes++;
+                        }
+                        for (int b = len; b < orig.Length; b++) diffBytes++;
+
+                        if (diffBytes > maxBloatBytes)
+                        {
+                            sorted[i].NeedToStore = true;
+                            sorted[i].Similarity = 1.0f;
+                            postRestoreOverrides++;
+                        }
+                    }
                 }
             }
 
             phaseSw.Stop();
-            Console.WriteLine($"[Compress] BloatRestore: {phaseSw.ElapsedMilliseconds}ms, {bloatedDiffRestore.Count} chunks re-stored");
+            Console.WriteLine($"[Compress] BloatRestore: {phaseSw.ElapsedMilliseconds}ms, {bloatedDiffRestore.Count} chunks re-stored" +
+                (postRestoreOverrides > 0 ? $", {postRestoreOverrides} agent matches overridden (exceeded {bloatThreshold:P0} bloat threshold)" : "") +
+                (postRestoreZeroId > 0 ? $", {postRestoreZeroId} store failures" : ""));
         }
 
         // ── Post-BloatRestore: re-propagate rep results to non-reps ──

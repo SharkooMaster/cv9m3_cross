@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using System.Text;
 using Cross.Utilities;
 
@@ -274,7 +273,8 @@ public class ChunkConsolidationService : BackgroundService
     }
 
     /// <summary>
-    /// Lightweight fingerprint: parse CCF header to extract refs section and hash it.
+    /// Lightweight family key: parse CCF header to extract refs section and build
+    /// an overlap-aware key (with exact-hash fallback).
     /// Does NOT decompress error streams — only reads version + refs.
     /// </summary>
     internal static string? ExtractRefsFingerprintLight(byte[] file)
@@ -299,9 +299,8 @@ public class ChunkConsolidationService : BackgroundService
             int refsOffset = pos;
             if (refsLen <= 0 || refsOffset + refsLen > file.Length) return null;
 
-            return Convert.ToHexString(
-                SHA256.HashData(file.AsSpan(refsOffset, refsLen))
-            ).ToLowerInvariant();
+            byte[] refs = file.AsSpan(refsOffset, refsLen).ToArray();
+            return CcfFamilyKey.Build(version, refs);
         }
         catch { return null; }
     }
