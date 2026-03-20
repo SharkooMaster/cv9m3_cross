@@ -787,10 +787,10 @@ public class CcfPackOptimizerService : BackgroundService
             Console.WriteLine($"[CcfPackOptimizer] Global compaction enabled: sourcePacks={selectedPacks.Count}, candidates={unpackedCandidates.Count + packCandidates.Count}, readBudget={readBudget / 1024 / 1024}MB");
         }
 
-        // Prioritize source pack entries when global compaction is enabled, so we
-        // actually compact packs under load instead of repeatedly only taking 1-2 unpacked files.
+        // Unpacked CCFs first (they always need packing and never cause duplication),
+        // then source-pack entries for re-compaction if budget remains.
         var candidateIds = Globals.CcfGlobalCompactionEnabled
-            ? packCandidates.Concat(unpackedCandidates).ToList()
+            ? unpackedCandidates.Concat(packCandidates).ToList()
             : unpackedCandidates;
 
         if (candidateIds.Count < Globals.CcfPackThreshold)
@@ -850,9 +850,32 @@ public class CcfPackOptimizerService : BackgroundService
         }
 
         loadSw.Stop();
+
+        // ── Duplication guard ──
+        // If a source pack wasn't fully loaded (memory/budget/deadline cut it short),
+        // its entries must NOT go into the new pack — otherwise entries live in both
+        // the old and new pack, causing runaway storage growth every cycle.
+        var partialPacks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (packId, ids) in selectedPacks)
+        {
+            int loaded = loadedByPack.TryGetValue(packId, out var n) ? n : 0;
+            if (loaded < ids.Count)
+            {
+                partialPacks.Add(packId);
+                if (loaded > 0)
+                    Console.WriteLine($"[CcfPackOptimizer] Evicting {loaded} entries from partially-loaded source pack {packId} ({loaded}/{ids.Count}) — prevents duplication");
+            }
+        }
+        if (partialPacks.Count > 0)
+        {
+            loadedEntries.RemoveAll(e => e.SourcePackId != null && partialPacks.Contains(e.SourcePackId));
+            foreach (var pid in partialPacks)
+                selectedPacks.Remove(pid);
+        }
+
         if (loadedEntries.Count < 2)
         {
-            Console.WriteLine($"[CcfPackOptimizer] Not enough readable CCFs to pack (loaded={loadedEntries.Count}, read={bytesRead / 1024}KB)");
+            Console.WriteLine($"[CcfPackOptimizer] Not enough readable CCFs to pack after duplication guard (loaded={loadedEntries.Count}, read={bytesRead / 1024}KB)");
             return;
         }
 
@@ -860,7 +883,7 @@ public class CcfPackOptimizerService : BackgroundService
 
         var packResult = await PackEntriesAsync(store, loadedEntries, ct);
 
-        // Keep source packs that were only partially migrated this cycle.
+        // After duplication guard, all remaining source packs should be fully loaded.
         var fullyMigratedSourcePacks = new List<string>();
         foreach (var (packId, ids) in selectedPacks)
         {
@@ -871,7 +894,7 @@ public class CcfPackOptimizerService : BackgroundService
             }
             else
             {
-                Console.WriteLine($"[CcfPackOptimizer] Kept source pack {packId} (loaded {loaded}/{ids.Count} entries this cycle)");
+                Console.WriteLine($"[CcfPackOptimizer] WARNING: source pack {packId} not fully migrated after duplication guard ({loaded}/{ids.Count}) — skipping delete");
             }
         }
 
