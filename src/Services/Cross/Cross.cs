@@ -2177,8 +2177,11 @@ public class CrossService : ICross
 
             // ── CRITICAL: Sweep bloated chunks for store failures and poor agent matches ──
             int postRestoreOverrides = 0;
+            int postRestoreReStored = 0;
+            int postRestoreForcedZeroRef = 0;
             int postRestoreZeroId = 0;
             int maxBloatBytes = (int)(Globals.chunkSize * bloatThreshold);
+            var overrideNeedsReStore = new List<int>();
 
             foreach (var i in bloatedDiffRestore)
             {
@@ -2208,14 +2211,153 @@ public class CrossService : ICross
                             sorted[i].NeedToStore = true;
                             sorted[i].Similarity = 1.0f;
                             postRestoreOverrides++;
+                            overrideNeedsReStore.Add(i);
                         }
                     }
                 }
             }
 
+            // Enforce hard byte-error ceiling:
+            // any overridden chunk MUST be re-stored as a self-base. If agent-side
+            // dedup still returns a high-error base, force zero-ref fallback so no
+            // over-threshold reuse reference survives into final encoding.
+            if (overrideNeedsReStore.Count > 0)
+            {
+                var overrideGroups = new Dictionary<string, List<(int index, QueryResponseObject response, byte[] chunk, float[] vector, string bucketString)>>();
+                foreach (var i in overrideNeedsReStore)
+                {
+                    if (!chunkMap.TryGetValue(i, out var chunkBytes) || chunkBytes == null) continue;
+                    var agent = sorted[i].TargetAgent ?? mainAgents[i];
+                    if (!overrideGroups.TryGetValue(agent, out var list))
+                    {
+                        list = new List<(int, QueryResponseObject, byte[], float[], string)>();
+                        overrideGroups[agent] = list;
+                    }
+                    list.Add((i, sorted[i], chunkBytes, vectors[i], bitStrings[i]));
+                }
+
+                const int MAX_OVERRIDE_RESTORE_PER_BATCH = 1000;
+                var overrideTasks = new List<Task>();
+                foreach (var kv in overrideGroups)
+                {
+                    var agent = kv.Key;
+                    var items = kv.Value;
+                    for (int batchStart = 0; batchStart < items.Count; batchStart += MAX_OVERRIDE_RESTORE_PER_BATCH)
+                    {
+                        int batchEnd = Math.Min(batchStart + MAX_OVERRIDE_RESTORE_PER_BATCH, items.Count);
+                        var batchItems = items.Skip(batchStart).Take(batchEnd - batchStart).ToList();
+
+                        overrideTasks.Add(Task.Run(async () =>
+                        {
+                            var batchReq = new BatchStoreVector_Req();
+                            foreach (var item in batchItems)
+                            {
+                                var req = new StoreVector_Req
+                                {
+                                    TargetIp = agent,
+                                    Bitstring = item.bucketString,
+                                    HeadRouteID = ""
+                                };
+                                req.Vector.AddRange(item.vector);
+                                req.Chunk = ByteString.CopyFrom(item.chunk);
+                                batchReq.Items.Add(req);
+                            }
+
+                            var overrideAgent = agent;
+                            bool done = false;
+                            while (!done)
+                            {
+                                try
+                                {
+                                    var client = GrpcChannelFactory.GetClient(
+                                        target: overrideAgent,
+                                        ctor: chan => new StoreVector.StoreVectorClient(chan),
+                                        roundRobin: false, port: 5000);
+
+                                    var batchRes = await client.BatchStoreAsync(batchReq,
+                                        deadline: DateTime.UtcNow.AddSeconds(30));
+
+                                    for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
+                                    {
+                                        var item = batchItems[j];
+                                        var storeRes = batchRes.Results[j];
+
+                                        item.response.BucketId = storeRes.Id;
+                                        item.response.BucketKey = storeRes.Index;
+                                        item.response.StorageGuid = storeRes.StorageGuid ?? "";
+
+                                        if (!storeRes.WasDeduplicated)
+                                        {
+                                            // Fresh self-store: base==original, zero diff.
+                                            item.response.NeedToStore = true;
+                                            item.response.Duplicate = false;
+                                            item.response.Similarity = 1.0f;
+                                            item.response.Chunk = ByteString.Empty;
+                                            Interlocked.Increment(ref postRestoreReStored);
+                                            continue;
+                                        }
+
+                                        // Agent still deduped this chunk. Accept only if byte diff is within threshold.
+                                        byte[] baseBytes = storeRes.BaseChunk?.ToByteArray() ?? Array.Empty<byte>();
+                                        int diffBytes = Globals.chunkSize;
+                                        if (chunkMap.TryGetValue(item.index, out var orig) && orig != null && baseBytes.Length > 0)
+                                        {
+                                            diffBytes = 0;
+                                            int len = Math.Min(orig.Length, baseBytes.Length);
+                                            for (int b = 0; b < len; b++)
+                                            {
+                                                if (orig[b] != baseBytes[b]) diffBytes++;
+                                            }
+                                            for (int b = len; b < orig.Length; b++) diffBytes++;
+                                        }
+
+                                        if (diffBytes <= maxBloatBytes)
+                                        {
+                                            item.response.NeedToStore = false;
+                                            item.response.Duplicate = true;
+                                            item.response.Similarity = storeRes.Similarity;
+                                            item.response.Chunk = storeRes.BaseChunk ?? ByteString.Empty;
+                                        }
+                                        else
+                                        {
+                                            // Hard ceiling enforcement: never keep an over-threshold reused base.
+                                            // Fallback to zero-ref; patch stream will carry full bytes for correctness.
+                                            item.response.BucketId = 0;
+                                            item.response.BucketKey = 0;
+                                            item.response.StorageGuid = "";
+                                            item.response.Chunk = ByteString.Empty;
+                                            item.response.NeedToStore = false;
+                                            item.response.Duplicate = false;
+                                            item.response.Similarity = 0f;
+                                            Interlocked.Increment(ref postRestoreForcedZeroRef);
+                                        }
+                                    }
+                                    done = true;
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"[Compress] Override re-store to {overrideAgent} failed: {ex.Message}, waiting for recovery...");
+                                    try
+                                    {
+                                        await AgentHealthWatcher.Instance.WaitForAgentAsync(overrideAgent, CancellationToken.None);
+                                    }
+                                    catch (OperationCanceledException) { return; }
+                                    overrideAgent = RendezvousRouter.ResolveAgentIp(overrideAgent);
+                                    Console.WriteLine($"[Compress] Agent recovered (now {overrideAgent}), retrying override re-store...");
+                                }
+                            }
+                        }));
+                    }
+                }
+
+                await Task.WhenAll(overrideTasks);
+            }
+
             phaseSw.Stop();
             Console.WriteLine($"[Compress] BloatRestore: {phaseSw.ElapsedMilliseconds}ms, {bloatedDiffRestore.Count} chunks re-stored" +
                 (postRestoreOverrides > 0 ? $", {postRestoreOverrides} agent matches overridden (exceeded {bloatThreshold:P0} bloat threshold)" : "") +
+                (postRestoreReStored > 0 ? $", {postRestoreReStored} overrides re-stored as self-base" : "") +
+                (postRestoreForcedZeroRef > 0 ? $", {postRestoreForcedZeroRef} overrides forced to zero-ref (agent dedup remained above threshold)" : "") +
                 (postRestoreZeroId > 0 ? $", {postRestoreZeroId} store failures" : ""));
         }
 
