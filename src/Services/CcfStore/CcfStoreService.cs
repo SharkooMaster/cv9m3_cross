@@ -339,8 +339,8 @@ public class CcfStoreService
 
     private static readonly byte[] PackMagic = "CCP\0"u8.ToArray();
 
-    // Cache: decompressed inner payload + pack version
-    private readonly Dictionary<string, (byte[] Data, int Version, DateTime LastAccess)> _packCache = new();
+    // Cache: decompressed inner payload + pack version + ref catalog
+    private readonly Dictionary<string, (byte[] Data, int Version, List<(ulong, ulong)>? Catalog, DateTime LastAccess)> _packCache = new();
     private readonly object _cacheLock = new();
     private const int MaxCachedPacks = 8;
 
@@ -361,7 +361,7 @@ public class CcfStoreService
             string packFile = Path.ChangeExtension(idxFile, ".pack");
             if (!File.Exists(packFile)) continue;
 
-            var (innerPayload, packVersion) = await GetInnerPayload(packFile, ct);
+            var (innerPayload, packVersion, catalog) = await GetInnerPayload(packFile, ct);
             if (innerPayload.Length == 0) continue;
 
             long offset = entry.Value.Offset;
@@ -377,7 +377,7 @@ public class CcfStoreService
                 return data;
             }
 
-            // v3: offset points to frameType byte, length = 9 + dataLength
+            // v3+: offset points to frameType byte, length = 9 + dataLength
             if (offset + 9 > innerPayload.Length) continue;
             byte frameType = innerPayload[offset];
             int baseIndex = BitConverter.ToInt32(innerPayload, (int)offset + 1);
@@ -390,6 +390,8 @@ public class CcfStoreService
             {
                 byte[] data = new byte[dataLength];
                 Buffer.BlockCopy(innerPayload, (int)dataStart3, data, 0, dataLength);
+                if (catalog != null)
+                    data = CcfPackOptimizerService.ExpandCcfRefs(data, catalog);
                 return data;
             }
 
@@ -438,7 +440,10 @@ public class CcfStoreService
                 continue;
             }
 
-            // Cache the reconstructed CCF
+            if (catalog != null)
+                reconstructed = CcfPackOptimizerService.ExpandCcfRefs(reconstructed, catalog);
+
+            // Cache the expanded reconstructed CCF
             lock (_pframeCacheLock)
             {
                 _pframeCache[pframeCacheKey] = (reconstructed, DateTime.UtcNow);
@@ -454,19 +459,19 @@ public class CcfStoreService
         return null;
     }
 
-    private async Task<(byte[] Inner, int Version)> GetInnerPayload(string packFile, CancellationToken ct)
+    private async Task<(byte[] Inner, int Version, List<(ulong, ulong)>? Catalog)> GetInnerPayload(string packFile, CancellationToken ct)
     {
         lock (_cacheLock)
         {
             if (_packCache.TryGetValue(packFile, out var cached))
             {
-                _packCache[packFile] = (cached.Data, cached.Version, DateTime.UtcNow);
-                return (cached.Data, cached.Version);
+                _packCache[packFile] = (cached.Data, cached.Version, cached.Catalog, DateTime.UtcNow);
+                return (cached.Data, cached.Version, cached.Catalog);
             }
         }
 
         byte[] fileData = await File.ReadAllBytesAsync(packFile, ct);
-        if (fileData.Length < 12) return (fileData, 1);
+        if (fileData.Length < 12) return (fileData, 1, null);
 
         bool isMagic = fileData[0] == PackMagic[0] && fileData[1] == PackMagic[1]
                     && fileData[2] == PackMagic[2] && fileData[3] == PackMagic[3];
@@ -491,9 +496,34 @@ public class CcfStoreService
             inner = fileData;
         }
 
+        List<(ulong, ulong)>? catalog = null;
+        if (version >= 4 && inner.Length >= 8)
+        {
+            try
+            {
+                int cPos = 0;
+                cPos += 4; // entryCount
+                int dictSize = BitConverter.ToInt32(inner, cPos); cPos += 4;
+                cPos += dictSize;
+                if (cPos + 4 <= inner.Length)
+                {
+                    int catalogCount = BitConverter.ToInt32(inner, cPos); cPos += 4;
+                    catalog = new List<(ulong, ulong)>(catalogCount);
+                    for (int i = 0; i < catalogCount && cPos + 16 <= inner.Length; i++)
+                    {
+                        ulong id = BitConverter.ToUInt64(inner, cPos);
+                        ulong key = BitConverter.ToUInt64(inner, cPos + 8);
+                        catalog.Add((id, key));
+                        cPos += 16;
+                    }
+                }
+            }
+            catch { catalog = null; }
+        }
+
         lock (_cacheLock)
         {
-            _packCache[packFile] = (inner, version, DateTime.UtcNow);
+            _packCache[packFile] = (inner, version, catalog, DateTime.UtcNow);
             if (_packCache.Count > MaxCachedPacks)
             {
                 var oldest = _packCache.OrderBy(kv => kv.Value.LastAccess).First().Key;
@@ -501,7 +531,7 @@ public class CcfStoreService
             }
         }
 
-        return (inner, version);
+        return (inner, version, catalog);
     }
 
     private bool PackIndexContains(string fileId)

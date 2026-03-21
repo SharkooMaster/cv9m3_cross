@@ -12,9 +12,9 @@ namespace Cross.Services.CcfStore;
 /// with P-frame cross-file delta compression, trains a shared zstd dictionary,
 /// and removes individual CCFs after packing.
 ///
-/// Pack format v3 (P-frame delta compression):
+/// Pack format v4 (ref catalog + full-CCF P-frame delta):
 ///   [4B] magic "CCP\0"
-///   [4B] version = 3
+///   [4B] version = 4
 ///   [4B] decompressedSize
 ///   [remainder] zstd-19 compressed inner payload
 ///
@@ -22,11 +22,15 @@ namespace Cross.Services.CcfStore;
 ///     [4B] entryCount
 ///     [4B] dictSize (0 = no dictionary)
 ///     [dictSize B] dictionary
+///     [4B] catalogCount
+///     [catalogCount * 16B] global ref catalog: (bucketId:u64, bucketKey:u64)
 ///     Per entry:
-///       [1B] frameType: 0 = I-frame, 1 = P-frame (subtraction delta)
+///       [1B] frameType: 0 = I-frame, 1 = P-frame (full-CCF subtraction delta)
 ///       [4B] baseIndex: -1 for I-frame, positional index for P-frame
 ///       [4B] dataLength
-///       [dataLength B] data (I-frame: raw CCF, P-frame: PFramePayload)
+///       [dataLength B] data (I-frame: compact CCF, P-frame: PFramePayload)
+///     Compact CCF: ref table entries are 4-byte catalog indices instead of 16-byte pairs.
+///     On extraction, ExpandCcfRefs restores the original CCF format.
 ///
 /// Pack format v2 (legacy, zstd-compressed):
 ///   [4B] magic "CCP\0"  [4B] version = 2  [4B] decompressedSize
@@ -42,7 +46,7 @@ namespace Cross.Services.CcfStore;
 public class CcfPackOptimizerService : BackgroundService
 {
     private static readonly byte[] PackMagic = "CCP\0"u8.ToArray();
-    private const int PackVersion = 3;
+    private const int PackVersion = 4;
     public static long TotalPackRawBytes;
     public static long TotalPackCompressedBytes;
 
@@ -82,7 +86,7 @@ public class CcfPackOptimizerService : BackgroundService
     internal sealed class LoadedEntry
     {
         public string FileId { get; init; } = string.Empty;
-        public byte[] Ccf { get; init; } = Array.Empty<byte>();
+        public byte[] Ccf { get; set; } = Array.Empty<byte>();
         public CcfComponents Comp { get; init; } = new();
         public string? SourcePackId { get; init; }
     }
@@ -410,87 +414,33 @@ public class CcfPackOptimizerService : BackgroundService
     //  P-frame payload building & reconstruction
     // ───────────────────────────────────────────────────────────────────
 
-    internal static byte[] BuildPFramePayload(CcfComponents comp, byte[] compressedDelta)
+    internal static byte[] BuildPFramePayload(byte[] memberCcf, byte[] baseCcf)
     {
-        using var ms = new MemoryStream();
+        int memberLen = memberCcf.Length;
+        int baseLen = baseCcf.Length;
+        int overlap = Math.Min(memberLen, baseLen);
+
+        byte[] delta = new byte[memberLen];
+        for (int i = 0; i < overlap; i++)
+            delta[i] = (byte)((memberCcf[i] - baseCcf[i]) & 0xFF);
+        if (memberLen > overlap)
+            Buffer.BlockCopy(memberCcf, overlap, delta, overlap, memberLen - overlap);
+
+        using var zc = new Compressor(19);
+        byte[] compDelta = zc.Wrap(delta).ToArray();
+
+        using var ms = new MemoryStream(4 + 4 + compDelta.Length);
         using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
-
-        bw.Write(comp.OriginalCcfLength);
-        bool isV6 = comp.IsV6Program;
-        bool isBitmaskOnly = !isV6 && comp.IsDirectPatch && comp.Version == "v5.6.0";
-        byte errorFormat = isV6 ? (byte)5 : isBitmaskOnly ? (byte)4
-            : comp.IsDirectPatch ? (byte)3 : comp.IsFourStream ? (byte)2
-            : comp.IsSplitStream ? (byte)0 : (byte)1;
-        bw.Write(errorFormat);
-        bw.Write(comp.PatchCount);
-        bw.Write(comp.OriginalSize);
-
-        if (isV6)
-        {
-            bw.Write(comp.FourStreamChunkCount);
-            bw.Write(comp.V6ChunkSize);
-            using var c = new Compressor(19);
-            byte[] portableProg = c.Wrap(comp.V6RawProgram).ToArray();
-            bw.Write(portableProg.Length);
-            bw.Write(portableProg);
-        }
-        else if (isBitmaskOnly)
-        {
-            bw.Write(comp.FourStreamChunkCount);
-            using var c = new Compressor(19);
-            byte[] portableMode = c.Wrap(comp.ModeBitfield).ToArray();
-            byte[] portableBitmask = c.Wrap(comp.RawBitmask).ToArray();
-            bw.Write(portableMode.Length);
-            bw.Write(portableMode);
-            bw.Write(portableBitmask.Length);
-            bw.Write(portableBitmask);
-        }
-        else if (comp.IsDirectPatch || comp.IsFourStream)
-        {
-            bw.Write(comp.FourStreamChunkCount);
-            using var c = new Compressor(19);
-            byte[] portableMode = c.Wrap(comp.ModeBitfield).ToArray();
-            byte[] portableSkip = c.Wrap(comp.RawSkip).ToArray();
-            byte[] portableBitmask = c.Wrap(comp.RawBitmask).ToArray();
-            bw.Write(portableMode.Length);
-            bw.Write(portableMode);
-            bw.Write(portableSkip.Length);
-            bw.Write(portableSkip);
-            bw.Write(portableBitmask.Length);
-            bw.Write(portableBitmask);
-        }
-        else if (comp.IsSplitStream)
-        {
-            using var c = new Compressor(19);
-            byte[] portableSkip = c.Wrap(comp.RawSkip).ToArray();
-            bw.Write(portableSkip.Length);
-            bw.Write(portableSkip);
-        }
-        else
-        {
-            bw.Write(0); // no skip stream for single-blob
-        }
-
-        bw.Write(compressedDelta.Length);
-        bw.Write(compressedDelta);
-
-        var versionBytes = Encoding.UTF8.GetBytes(comp.Version);
-        bw.Write(versionBytes.Length);
-        bw.Write(versionBytes);
-        bw.Write(comp.Refs.Length);
-        if (comp.Refs.Length > 0) bw.Write(comp.Refs);
-        bw.Write(comp.Trim.Length);
-        if (comp.Trim.Length > 0) bw.Write(comp.Trim);
-        bw.Write(comp.Hash.Length);
-        if (comp.Hash.Length > 0) bw.Write(comp.Hash);
-
+        bw.Write(memberLen);
+        bw.Write(compDelta.Length);
+        bw.Write(compDelta);
         bw.Flush();
         return ms.ToArray();
     }
 
     /// <summary>
     /// Reconstruct the original CCF from a P-frame payload and the base I-frame CCF bytes.
-    /// Returns null on failure.
+    /// V2 format: full-CCF byte-level delta. Returns null on failure.
     /// </summary>
     internal static byte[]? ReconstructCcfFromPFrame(byte[] pframeData, byte[] baseCcf)
     {
@@ -499,212 +449,23 @@ public class CcfPackOptimizerService : BackgroundService
             using var ms = new MemoryStream(pframeData);
             using var br = new BinaryReader(ms, Encoding.UTF8);
 
-            int _origLen = br.ReadInt32();
-            byte errorFormat = br.ReadByte();
-            int patchCount = br.ReadInt32();
-            int originalSize = br.ReadInt32();
-
-            int fourStreamChunkCount = 0;
-            byte[] compMode = Array.Empty<byte>();
-            byte[] compSkip = Array.Empty<byte>();
-            byte[] compBitmask = Array.Empty<byte>();
-
-            int v6ChunkSize = 0;
-            byte[] v6CompProg = Array.Empty<byte>();
-
-            if (errorFormat == 5) // v6.0.0 transform program
-            {
-                fourStreamChunkCount = br.ReadInt32();
-                v6ChunkSize = br.ReadUInt16();
-                int compProgLen = br.ReadInt32();
-                v6CompProg = compProgLen > 0 ? br.ReadBytes(compProgLen) : Array.Empty<byte>();
-            }
-            else if (errorFormat == 4) // v5.6.0 bitmask-only
-            {
-                fourStreamChunkCount = br.ReadInt32();
-                int compModeLen = br.ReadInt32();
-                compMode = compModeLen > 0 ? br.ReadBytes(compModeLen) : Array.Empty<byte>();
-                int compBitmaskLen = br.ReadInt32();
-                compBitmask = compBitmaskLen > 0 ? br.ReadBytes(compBitmaskLen) : Array.Empty<byte>();
-            }
-            else if (errorFormat == 3 || errorFormat == 2) // v5.5.0 direct / v5.4.0 four-stream
-            {
-                fourStreamChunkCount = br.ReadInt32();
-                int compModeLen = br.ReadInt32();
-                compMode = compModeLen > 0 ? br.ReadBytes(compModeLen) : Array.Empty<byte>();
-                int compSkipLen = br.ReadInt32();
-                compSkip = compSkipLen > 0 ? br.ReadBytes(compSkipLen) : Array.Empty<byte>();
-                int compBitmaskLen = br.ReadInt32();
-                compBitmask = compBitmaskLen > 0 ? br.ReadBytes(compBitmaskLen) : Array.Empty<byte>();
-            }
-            else if (errorFormat == 0) // v5.3.0 split-stream
-            {
-                int compSkipLen = br.ReadInt32();
-                compSkip = compSkipLen > 0 ? br.ReadBytes(compSkipLen) : Array.Empty<byte>();
-            }
-            else // single-blob
-            {
-                int compSkipLen = br.ReadInt32();
-                compSkip = compSkipLen > 0 ? br.ReadBytes(compSkipLen) : Array.Empty<byte>();
-            }
-
+            int memberLen = br.ReadInt32();
             int compDeltaLen = br.ReadInt32();
             byte[] compDelta = br.ReadBytes(compDeltaLen);
 
-            int versionLen = br.ReadInt32();
-            string version = Encoding.UTF8.GetString(br.ReadBytes(versionLen));
-            int refsLen = br.ReadInt32();
-            byte[] refs = refsLen > 0 ? br.ReadBytes(refsLen) : Array.Empty<byte>();
-            int trimLen = br.ReadInt32();
-            byte[] trim = trimLen > 0 ? br.ReadBytes(trimLen) : Array.Empty<byte>();
-            int hashLen = br.ReadInt32();
-            byte[] hash = hashLen > 0 ? br.ReadBytes(hashLen) : Array.Empty<byte>();
-
             using var decomp = new Decompressor();
-            byte[] rawDelta = decomp.Unwrap(compDelta).ToArray();
+            byte[] delta = decomp.Unwrap(compDelta).ToArray();
 
-            var baseComp = ParseCcfComponents(baseCcf);
-            if (!baseComp.IsValid) return null;
-            byte[] baseData = baseComp.DeltaSource;
+            if (delta.Length != memberLen) return null;
 
-            byte[] originalData = new byte[rawDelta.Length];
-            for (int i = 0; i < rawDelta.Length; i++)
-            {
-                byte b = i < baseData.Length ? baseData[i] : (byte)0;
-                originalData[i] = (byte)((rawDelta[i] + b) & 0xFF);
-            }
+            int overlap = Math.Min(memberLen, baseCcf.Length);
+            byte[] result = new byte[memberLen];
+            for (int i = 0; i < overlap; i++)
+                result[i] = (byte)((delta[i] + baseCcf[i]) & 0xFF);
+            if (memberLen > overlap)
+                Buffer.BlockCopy(delta, overlap, result, overlap, memberLen - overlap);
 
-            byte[] errorPayload;
-            int errorOriginalLength;
-
-            if (errorFormat == 5) // v6.0.0 transform program
-            {
-                // originalData = reconstructed V6RawResidual
-                // v6CompProg = zstd-compressed program (carried in full)
-                using var dProg = new Decompressor();
-                byte[] rawProg = v6CompProg.Length > 0 ? dProg.Unwrap(v6CompProg).ToArray() : Array.Empty<byte>();
-
-                // Re-compress program and residual into v6.0.0 error payload format
-                using var c = new Compressor(19);
-                byte[] zProg = c.Wrap(rawProg).ToArray();
-                byte[] zRes = c.Wrap(originalData).ToArray();
-
-                using var errMs = new MemoryStream();
-                using var errBw = new BinaryWriter(errMs, Encoding.UTF8, leaveOpen: true);
-                errBw.Write(patchCount);
-                errBw.Write(originalSize);
-                errBw.Write(fourStreamChunkCount);
-                errBw.Write((ushort)v6ChunkSize);
-                errBw.Write(zProg.Length);
-                errBw.Write(zRes.Length);
-                errBw.Write(zProg);
-                errBw.Write(zRes);
-                errBw.Flush();
-                errorPayload = errMs.ToArray();
-                errorOriginalLength = errorPayload.Length;
-            }
-            else if (errorFormat == 4) // v5.6.0 bitmask-only
-            {
-                using var dMode = new Decompressor();
-                byte[] rawMode = compMode.Length > 0 ? dMode.Unwrap(compMode).ToArray() : Array.Empty<byte>();
-                byte[] rawBitmask = compBitmask.Length > 0 ? dMode.Unwrap(compBitmask).ToArray() : Array.Empty<byte>();
-
-                using var c = new Compressor(3);
-                byte[] zMode = c.Wrap(rawMode).ToArray();
-                byte[] zBitmask = c.Wrap(rawBitmask).ToArray();
-                byte[] zVals = c.Wrap(originalData).ToArray();
-
-                using var errMs = new MemoryStream();
-                using var errBw = new BinaryWriter(errMs, Encoding.UTF8, leaveOpen: true);
-                errBw.Write(patchCount);
-                errBw.Write(originalSize);
-                errBw.Write(fourStreamChunkCount);
-                errBw.Write(zMode.Length);
-                errBw.Write(zBitmask.Length);
-                errBw.Write(zVals.Length);
-                errBw.Write(zMode);
-                errBw.Write(zBitmask);
-                errBw.Write(zVals);
-                errBw.Flush();
-                errorPayload = errMs.ToArray();
-                errorOriginalLength = errorPayload.Length;
-            }
-            else if (errorFormat == 3 || errorFormat == 2) // v5.5.0 direct / v5.4.0 four-stream
-            {
-                using var dMode = new Decompressor();
-                byte[] rawMode = compMode.Length > 0 ? dMode.Unwrap(compMode).ToArray() : Array.Empty<byte>();
-                byte[] rawSkip = compSkip.Length > 0 ? dMode.Unwrap(compSkip).ToArray() : Array.Empty<byte>();
-                byte[] rawBitmask = compBitmask.Length > 0 ? dMode.Unwrap(compBitmask).ToArray() : Array.Empty<byte>();
-
-                using var c = new Compressor(3);
-                byte[] zMode = c.Wrap(rawMode).ToArray();
-                byte[] zSkip = c.Wrap(rawSkip).ToArray();
-                byte[] zBitmask = c.Wrap(rawBitmask).ToArray();
-                byte[] zVals = c.Wrap(originalData).ToArray();
-
-                using var errMs = new MemoryStream();
-                using var errBw = new BinaryWriter(errMs, Encoding.UTF8, leaveOpen: true);
-                errBw.Write(patchCount);
-                errBw.Write(originalSize);
-                errBw.Write(fourStreamChunkCount);
-                errBw.Write(zMode.Length);
-                errBw.Write(zSkip.Length);
-                errBw.Write(zBitmask.Length);
-                errBw.Write(zVals.Length);
-                errBw.Write(zMode);
-                errBw.Write(zSkip);
-                errBw.Write(zBitmask);
-                errBw.Write(zVals);
-                errBw.Flush();
-                errorPayload = errMs.ToArray();
-                errorOriginalLength = errorPayload.Length;
-            }
-            else if (errorFormat == 0) // v5.3.0 split-stream
-            {
-                byte[] rawSkip;
-                if (compSkip.Length > 0)
-                {
-                    using var dSkip = new Decompressor();
-                    rawSkip = dSkip.Unwrap(compSkip).ToArray();
-                }
-                else
-                {
-                    rawSkip = Array.Empty<byte>();
-                }
-
-                using var c = new Compressor(3);
-                byte[] zSkip = c.Wrap(rawSkip).ToArray();
-                byte[] zVals = c.Wrap(originalData).ToArray();
-
-                using var errMs = new MemoryStream();
-                using var errBw = new BinaryWriter(errMs, Encoding.UTF8, leaveOpen: true);
-                errBw.Write(patchCount);
-                errBw.Write(originalSize);
-                errBw.Write(zSkip.Length);
-                errBw.Write(zVals.Length);
-                errBw.Write(zSkip);
-                errBw.Write(zVals);
-                errBw.Flush();
-                errorPayload = errMs.ToArray();
-                errorOriginalLength = errorPayload.Length;
-            }
-            else // single-blob
-            {
-                errorOriginalLength = originalData.Length;
-                bool needsCompression = version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0";
-                if (needsCompression)
-                {
-                    using var c = new Compressor(3);
-                    errorPayload = c.Wrap(originalData).ToArray();
-                }
-                else
-                {
-                    errorPayload = originalData;
-                    errorOriginalLength = errorPayload.Length;
-                }
-            }
-
-            return ReassembleCcf(version, refs, errorPayload, errorOriginalLength, trim, hash);
+            return result;
         }
         catch (Exception ex)
         {
@@ -751,6 +512,161 @@ public class CcfPackOptimizerService : BackgroundService
         bw.Flush();
 
         return ms.ToArray();
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    //  Pack-level reference catalog: compact / expand CCF refs
+    // ───────────────────────────────────────────────────────────────────
+
+    internal static List<(ulong BucketId, ulong BucketKey)> ExtractRefTablePairs(byte[] refs)
+    {
+        var result = new List<(ulong, ulong)>();
+        if (refs.Length < 6) return result;
+        ushort refTableCount = BitConverter.ToUInt16(refs, 4);
+        int pos = 6;
+        for (int i = 0; i < refTableCount && pos + 16 <= refs.Length; i++)
+        {
+            ulong id = BitConverter.ToUInt64(refs, pos);
+            ulong key = BitConverter.ToUInt64(refs, pos + 8);
+            result.Add((id, key));
+            pos += 16;
+        }
+        return result;
+    }
+
+    internal static byte[] CompactCcfRefs(byte[] ccf, Dictionary<(ulong, ulong), int> catalog)
+    {
+        if (ccf.Length < 12) return ccf;
+        try
+        {
+            int pos = 0;
+            int versionLen = BitConverter.ToInt32(ccf, pos); pos += 4;
+            if (versionLen <= 0 || versionLen > 20 || pos + versionLen > ccf.Length) return ccf;
+            string version = Encoding.UTF8.GetString(ccf, pos, versionLen); pos += versionLen;
+
+            int refsLenFieldPos = pos;
+            int refsLen = BitConverter.ToInt32(ccf, pos); pos += 4;
+
+            bool hasOrigLen = version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0"
+                or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0";
+            pos += 4; // errorCompLen
+            if (hasOrigLen) pos += 4;
+
+            bool hasTrim = version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0"
+                or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0";
+            if (hasTrim) pos += 4;
+
+            int refsDataStart = pos;
+            int afterRefs = refsDataStart + refsLen;
+            if (afterRefs > ccf.Length || refsLen < 6) return ccf;
+
+            int rPos = refsDataStart;
+            int chunkCount = BitConverter.ToInt32(ccf, rPos); rPos += 4;
+            ushort refTableCount = BitConverter.ToUInt16(ccf, rPos); rPos += 2;
+            int refTableEnd = rPos + refTableCount * 16;
+            int perChunkLen = afterRefs - refTableEnd;
+            if (refTableEnd > ccf.Length || perChunkLen < 0) return ccf;
+
+            int newRefsLen = 4 + 2 + refTableCount * 4 + perChunkLen;
+            int sizeDiff = refsLen - newRefsLen;
+            byte[] result = new byte[ccf.Length - sizeDiff];
+
+            Buffer.BlockCopy(ccf, 0, result, 0, refsLenFieldPos);
+            BitConverter.TryWriteBytes(result.AsSpan(refsLenFieldPos), newRefsLen);
+            Buffer.BlockCopy(ccf, refsLenFieldPos + 4, result, refsLenFieldPos + 4,
+                refsDataStart - refsLenFieldPos - 4);
+
+            int wPos = refsDataStart;
+            BitConverter.TryWriteBytes(result.AsSpan(wPos), chunkCount); wPos += 4;
+            BitConverter.TryWriteBytes(result.AsSpan(wPos), refTableCount); wPos += 2;
+
+            for (int i = 0; i < refTableCount; i++)
+            {
+                ulong bucketId = BitConverter.ToUInt64(ccf, rPos + i * 16);
+                ulong bucketKey = BitConverter.ToUInt64(ccf, rPos + i * 16 + 8);
+                if (!catalog.TryGetValue((bucketId, bucketKey), out int catIdx)) return ccf;
+                BitConverter.TryWriteBytes(result.AsSpan(wPos), catIdx); wPos += 4;
+            }
+
+            if (perChunkLen > 0)
+                Buffer.BlockCopy(ccf, refTableEnd, result, wPos, perChunkLen);
+            wPos += perChunkLen;
+
+            int afterRefsLen = ccf.Length - afterRefs;
+            if (afterRefsLen > 0)
+                Buffer.BlockCopy(ccf, afterRefs, result, wPos, afterRefsLen);
+
+            return result;
+        }
+        catch { return ccf; }
+    }
+
+    internal static byte[] ExpandCcfRefs(byte[] compactCcf, List<(ulong BucketId, ulong BucketKey)> catalog)
+    {
+        if (compactCcf.Length < 12) return compactCcf;
+        try
+        {
+            int pos = 0;
+            int versionLen = BitConverter.ToInt32(compactCcf, pos); pos += 4;
+            if (versionLen <= 0 || versionLen > 20 || pos + versionLen > compactCcf.Length)
+                return compactCcf;
+            string version = Encoding.UTF8.GetString(compactCcf, pos, versionLen); pos += versionLen;
+
+            int refsLenFieldPos = pos;
+            int compactRefsLen = BitConverter.ToInt32(compactCcf, pos); pos += 4;
+
+            bool hasOrigLen = version is "v3.1.0" or "v5.0.0" or "v5.1.0" or "v5.2.0"
+                or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0";
+            pos += 4;
+            if (hasOrigLen) pos += 4;
+
+            bool hasTrim = version is "v2.1.0" or "v3.0.0" or "v3.1.0" or "v5.0.0"
+                or "v5.1.0" or "v5.2.0" or "v5.3.0" or "v5.4.0" or "v5.5.0" or "v5.6.0" or "v6.0.0";
+            if (hasTrim) pos += 4;
+
+            int refsDataStart = pos;
+            int afterCompactRefs = refsDataStart + compactRefsLen;
+            if (afterCompactRefs > compactCcf.Length || compactRefsLen < 6) return compactCcf;
+
+            int rPos = refsDataStart;
+            int chunkCount = BitConverter.ToInt32(compactCcf, rPos); rPos += 4;
+            ushort refTableCount = BitConverter.ToUInt16(compactCcf, rPos); rPos += 2;
+            int compactTableEnd = rPos + refTableCount * 4;
+            int perChunkLen = afterCompactRefs - compactTableEnd;
+            if (compactTableEnd > compactCcf.Length || perChunkLen < 0) return compactCcf;
+
+            int newRefsLen = 4 + 2 + refTableCount * 16 + perChunkLen;
+            int sizeDiff = newRefsLen - compactRefsLen;
+            byte[] result = new byte[compactCcf.Length + sizeDiff];
+
+            Buffer.BlockCopy(compactCcf, 0, result, 0, refsLenFieldPos);
+            BitConverter.TryWriteBytes(result.AsSpan(refsLenFieldPos), newRefsLen);
+            Buffer.BlockCopy(compactCcf, refsLenFieldPos + 4, result, refsLenFieldPos + 4,
+                refsDataStart - refsLenFieldPos - 4);
+
+            int wPos = refsDataStart;
+            BitConverter.TryWriteBytes(result.AsSpan(wPos), chunkCount); wPos += 4;
+            BitConverter.TryWriteBytes(result.AsSpan(wPos), refTableCount); wPos += 2;
+
+            for (int i = 0; i < refTableCount; i++)
+            {
+                int catIdx = BitConverter.ToInt32(compactCcf, rPos + i * 4);
+                var (id, key) = catalog[catIdx];
+                BitConverter.TryWriteBytes(result.AsSpan(wPos), id); wPos += 8;
+                BitConverter.TryWriteBytes(result.AsSpan(wPos), key); wPos += 8;
+            }
+
+            if (perChunkLen > 0)
+                Buffer.BlockCopy(compactCcf, compactTableEnd, result, wPos, perChunkLen);
+            wPos += perChunkLen;
+
+            int afterLen = compactCcf.Length - afterCompactRefs;
+            if (afterLen > 0)
+                Buffer.BlockCopy(compactCcf, afterCompactRefs, result, wPos, afterLen);
+
+            return result;
+        }
+        catch { return compactCcf; }
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -1063,6 +979,36 @@ public class CcfPackOptimizerService : BackgroundService
         foreach (var entry in entries)
             totalRawBytes += entry.Ccf.Length;
 
+        // ── Phase 0: Build global ref catalog and compact CCFs ──
+        var catalogDict = new Dictionary<(ulong, ulong), int>();
+        var catalogList = new List<(ulong BucketId, ulong BucketKey)>();
+
+        foreach (var entry in entries)
+        {
+            foreach (var pair in ExtractRefTablePairs(entry.Comp.Refs))
+            {
+                if (!catalogDict.ContainsKey(pair))
+                {
+                    catalogDict[pair] = catalogList.Count;
+                    catalogList.Add(pair);
+                }
+            }
+        }
+
+        long refSavings = 0;
+        if (catalogDict.Count > 0)
+        {
+            foreach (var entry in entries)
+            {
+                int before = entry.Ccf.Length;
+                entry.Ccf = CompactCcfRefs(entry.Ccf, catalogDict);
+                refSavings += before - entry.Ccf.Length;
+            }
+        }
+
+        Console.WriteLine($"[CcfPackOptimizer] Ref catalog: {catalogList.Count} unique pairs from {entries.Count} CCFs, " +
+            $"saved {refSavings / 1024.0:F1}KB ({(totalRawBytes > 0 ? refSavings * 100.0 / totalRawBytes : 0):F1}%) from ref dedup");
+
         var valid = entries.Where(e => e.Comp.IsValid && e.Comp.RefsFingerprint.Length > 0).ToList();
 
         // Hybrid family discovery:
@@ -1118,54 +1064,48 @@ public class CcfPackOptimizerService : BackgroundService
             }, group =>
             {
                 var members = group;
-                var family = new ProcessedFamily { Base = members[0] };
-                var baseMember = members[0];
+                var baseMember = members.OrderByDescending(e => e.Ccf.Length).First();
+                var family = new ProcessedFamily { Base = baseMember };
+                int accepted = 0, rejected = 0;
+                double bestRatio = double.MaxValue;
 
-                for (int m = 1; m < members.Count; m++)
+                for (int m = 0; m < members.Count; m++)
                 {
                     var member = members[m];
+                    if (ReferenceEquals(member, baseMember)) continue;
                     var pm = new ProcessedMember { Entry = member };
 
-                    if (member.Comp.IsValid && baseMember.Comp.IsValid)
+                    try
                     {
-                        try
+                        byte[] pframePayload = BuildPFramePayload(member.Ccf, baseMember.Ccf);
+                        double ratio = member.Ccf.Length > 0 ? (double)pframePayload.Length / member.Ccf.Length : 1.0;
+                        if (ratio < bestRatio) bestRatio = ratio;
+
+                        if (pframePayload.Length < member.Ccf.Length * PframeSavingsThreshold)
                         {
-                            byte[] memberSrc = member.Comp.DeltaSource;
-                            byte[] baseSrc = baseMember.Comp.DeltaSource;
-                            byte[] delta = new byte[memberSrc.Length];
-                            int limit = Math.Min(memberSrc.Length, baseSrc.Length);
-                            for (int i = 0; i < limit; i++)
-                                delta[i] = (byte)((memberSrc[i] - baseSrc[i]) & 0xFF);
-                            for (int i = limit; i < memberSrc.Length; i++)
-                                delta[i] = memberSrc[i];
-
-                            using var zc = new Compressor(19);
-                            byte[] compDelta = zc.Wrap(delta).ToArray();
-                            byte[] pframePayload = BuildPFramePayload(member.Comp, compDelta);
-
-                            if (pframePayload.Length < member.Ccf.Length * PframeSavingsThreshold)
+                            byte[]? reconstructed = ReconstructCcfFromPFrame(pframePayload, baseMember.Ccf);
+                            if (reconstructed != null &&
+                                reconstructed.AsSpan().SequenceEqual(member.Ccf))
                             {
-                                byte[]? reconstructed = ReconstructCcfFromPFrame(pframePayload, baseMember.Ccf);
-                                if (reconstructed != null)
-                                {
-                                    var reconComp = ParseCcfComponents(reconstructed);
-                                    if (reconComp.IsValid &&
-                                        reconComp.DeltaSource.Length == memberSrc.Length &&
-                                        reconComp.DeltaSource.AsSpan().SequenceEqual(memberSrc))
-                                    {
-                                        pm.PframePayload = pframePayload;
-                                    }
-                                }
+                                pm.PframePayload = pframePayload;
+                                accepted++;
                             }
+                            else { rejected++; }
                         }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"[CcfPackOptimizer] P-frame failed for {member.FileId}: {ex.Message}");
-                        }
+                        else { rejected++; }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[CcfPackOptimizer] P-frame failed for {member.FileId}: {ex.Message}");
+                        rejected++;
                     }
 
                     family.Members.Add(pm);
                 }
+
+                if (accepted > 0 || bestRatio < 1.5)
+                    Console.WriteLine($"[CcfPackOptimizer] Family ({members.Count} members, base={baseMember.Ccf.Length}B): " +
+                        $"{accepted} P-frames accepted, {rejected} rejected, bestRatio={bestRatio:F3}");
 
                 familyResults.Add(family);
             });
@@ -1180,6 +1120,15 @@ public class CcfPackOptimizerService : BackgroundService
         WriteInt32(innerMs, entries.Count);
         WriteInt32(innerMs, currentDict?.Length ?? 0);
         if (currentDict != null) innerMs.Write(currentDict);
+
+        WriteInt32(innerMs, catalogList.Count);
+        byte[] catBuf = new byte[16];
+        foreach (var (id, key) in catalogList)
+        {
+            BitConverter.TryWriteBytes(catBuf.AsSpan(0), id);
+            BitConverter.TryWriteBytes(catBuf.AsSpan(8), key);
+            innerMs.Write(catBuf);
+        }
 
         WriteInt32(idxMs, entries.Count);
         int entryIndex = 0;
@@ -1230,7 +1179,11 @@ public class CcfPackOptimizerService : BackgroundService
             }
         }
 
-        foreach (var entry in ungrouped)
+        var sortedUngrouped = ungrouped
+            .OrderBy(e => e.Comp.FamilyKey)
+            .ThenBy(e => e.Comp.RefsFingerprint)
+            .ToList();
+        foreach (var entry in sortedUngrouped)
             WriteIFrame(entry.FileId, entry.Ccf);
 
         byte[] innerPayload = innerMs.ToArray();
