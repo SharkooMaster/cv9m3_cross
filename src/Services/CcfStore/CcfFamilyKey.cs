@@ -7,30 +7,21 @@ internal static class CcfFamilyKey
 {
     public static string Build(string version, byte[] refs)
     {
-        // Prefer overlap-aware key for v5 compact refs; fallback to exact hash for older versions.
-        if (version.StartsWith("v5.", StringComparison.Ordinal) &&
+        // Overlap-aware key for v5/v6 compact refs using single MinHash band.
+        // Single MinHash gives match probability = Jaccard similarity (J).
+        // J=0.3 → 30% chance two CCFs land in same family — much higher recall
+        // than the previous 3-hash approach (J^3 = 2.7% for J=0.3).
+        // False positives are harmless: P-frame savings threshold (0.85) filters them.
+        if ((version.StartsWith("v5.", StringComparison.Ordinal) ||
+             version.StartsWith("v6.", StringComparison.Ordinal)) &&
             TryExtractV5RefBucketIds(refs, out var buckets) &&
             buckets.Length > 0)
         {
             ulong m0 = MinHash(buckets, 0x9E3779B185EBCA87UL);
-            ulong m1 = MinHash(buckets, 0xC2B2AE3D27D4EB4FUL);
-            ulong m2 = MinHash(buckets, 0x165667B19E3779F9UL);
-            int countBin = CountBin(buckets.Length);
-            return $"v5ov:{countBin}:{m0:x16}:{m1:x16}:{m2:x16}";
+            return $"ov:{m0:x16}";
         }
 
         return $"exact:{Convert.ToHexString(SHA256.HashData(refs)).ToLowerInvariant()}";
-    }
-
-    private static int CountBin(int count)
-    {
-        if (count <= 8) return 8;
-        if (count <= 16) return 16;
-        if (count <= 32) return 32;
-        if (count <= 64) return 64;
-        if (count <= 128) return 128;
-        if (count <= 256) return 256;
-        return 512;
     }
 
     private static ulong MinHash(ulong[] values, ulong seed)

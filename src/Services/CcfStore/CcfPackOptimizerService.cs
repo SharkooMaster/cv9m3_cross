@@ -132,7 +132,16 @@ public class CcfPackOptimizerService : BackgroundService
         public string RefsFingerprint = "";
         public string FamilyKey = "";
         public int OriginalCcfLength;
-        public byte[] DeltaSource => (IsFourStream || IsDirectPatch) ? RawValues : IsSplitStream ? RawValues : RawError;
+        public bool IsV6Program;
+        public byte[] V6RawProgram = Array.Empty<byte>();
+        public byte[] V6RawResidual = Array.Empty<byte>();
+        public ushort V6ChunkSize;
+        public int V6PatchCount;
+        public int V6TotalBytes;
+        public int V6ChunkCount;
+        public byte[] DeltaSource => IsV6Program ? V6RawResidual
+            : (IsFourStream || IsDirectPatch) ? RawValues
+            : IsSplitStream ? RawValues : RawError;
     }
 
     internal static CcfComponents ParseCcfComponents(byte[] file)
@@ -187,7 +196,43 @@ public class CcfPackOptimizerService : BackgroundService
             byte[] errorPayload = new byte[errorCompLen];
             if (errorCompLen > 0) Buffer.BlockCopy(file, errorOffset, errorPayload, 0, errorCompLen);
 
-            if ((comp.Version == "v5.6.0" || comp.Version == "v6.0.0") && errorCompLen >= 24)
+            if (comp.Version == "v6.0.0" && errorCompLen >= 22)
+            {
+                // v6.0.0: patchCount(4)+totalBytes(4)+chunkCount(4)+chunkSize(u16)+progBlobLen(4)+resBlobLen(4)
+                comp.IsV6Program = true;
+                comp.IsDirectPatch = true;
+                comp.V6PatchCount = BitConverter.ToInt32(errorPayload, 0);
+                comp.PatchCount = comp.V6PatchCount;
+                comp.V6TotalBytes = BitConverter.ToInt32(errorPayload, 4);
+                comp.OriginalSize = comp.V6TotalBytes;
+                comp.V6ChunkCount = BitConverter.ToInt32(errorPayload, 8);
+                comp.FourStreamChunkCount = comp.V6ChunkCount;
+                comp.V6ChunkSize = BitConverter.ToUInt16(errorPayload, 12);
+                int progBlobLen = BitConverter.ToInt32(errorPayload, 14);
+                int resBlobLen = BitConverter.ToInt32(errorPayload, 18);
+
+                int headerSize = 22;
+                if (headerSize + progBlobLen + resBlobLen <= errorCompLen)
+                {
+                    var dict = _liveDict;
+                    try
+                    {
+                        using var d = new Decompressor();
+                        if (dict != null) d.LoadDictionary(dict);
+                        comp.V6RawProgram = d.Unwrap(errorPayload.AsSpan(headerSize, progBlobLen)).ToArray();
+                        comp.V6RawResidual = d.Unwrap(errorPayload.AsSpan(headerSize + progBlobLen, resBlobLen)).ToArray();
+                    }
+                    catch
+                    {
+                        using var d2 = new Decompressor();
+                        comp.V6RawProgram = d2.Unwrap(errorPayload.AsSpan(headerSize, progBlobLen)).ToArray();
+                        comp.V6RawResidual = d2.Unwrap(errorPayload.AsSpan(headerSize + progBlobLen, resBlobLen)).ToArray();
+                    }
+                    comp.RawValues = comp.V6RawResidual;
+                    comp.IsValid = true;
+                }
+            }
+            else if (comp.Version == "v5.6.0" && errorCompLen >= 24)
             {
                 comp.IsDirectPatch = true;
                 comp.PatchCount = BitConverter.ToInt32(errorPayload, 0);
@@ -371,13 +416,25 @@ public class CcfPackOptimizerService : BackgroundService
         using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
 
         bw.Write(comp.OriginalCcfLength);
-        bool isBitmaskOnly = comp.IsDirectPatch && comp.Version is "v5.6.0" or "v6.0.0";
-        byte errorFormat = isBitmaskOnly ? (byte)4 : comp.IsDirectPatch ? (byte)3 : comp.IsFourStream ? (byte)2 : comp.IsSplitStream ? (byte)0 : (byte)1;
+        bool isV6 = comp.IsV6Program;
+        bool isBitmaskOnly = !isV6 && comp.IsDirectPatch && comp.Version == "v5.6.0";
+        byte errorFormat = isV6 ? (byte)5 : isBitmaskOnly ? (byte)4
+            : comp.IsDirectPatch ? (byte)3 : comp.IsFourStream ? (byte)2
+            : comp.IsSplitStream ? (byte)0 : (byte)1;
         bw.Write(errorFormat);
         bw.Write(comp.PatchCount);
         bw.Write(comp.OriginalSize);
 
-        if (isBitmaskOnly)
+        if (isV6)
+        {
+            bw.Write(comp.FourStreamChunkCount);
+            bw.Write(comp.V6ChunkSize);
+            using var c = new Compressor(19);
+            byte[] portableProg = c.Wrap(comp.V6RawProgram).ToArray();
+            bw.Write(portableProg.Length);
+            bw.Write(portableProg);
+        }
+        else if (isBitmaskOnly)
         {
             bw.Write(comp.FourStreamChunkCount);
             using var c = new Compressor(19);
@@ -452,7 +509,17 @@ public class CcfPackOptimizerService : BackgroundService
             byte[] compSkip = Array.Empty<byte>();
             byte[] compBitmask = Array.Empty<byte>();
 
-            if (errorFormat == 4) // v5.6.0 bitmask-only
+            int v6ChunkSize = 0;
+            byte[] v6CompProg = Array.Empty<byte>();
+
+            if (errorFormat == 5) // v6.0.0 transform program
+            {
+                fourStreamChunkCount = br.ReadInt32();
+                v6ChunkSize = br.ReadUInt16();
+                int compProgLen = br.ReadInt32();
+                v6CompProg = compProgLen > 0 ? br.ReadBytes(compProgLen) : Array.Empty<byte>();
+            }
+            else if (errorFormat == 4) // v5.6.0 bitmask-only
             {
                 fourStreamChunkCount = br.ReadInt32();
                 int compModeLen = br.ReadInt32();
@@ -510,7 +577,33 @@ public class CcfPackOptimizerService : BackgroundService
             byte[] errorPayload;
             int errorOriginalLength;
 
-            if (errorFormat == 4) // v5.6.0 bitmask-only
+            if (errorFormat == 5) // v6.0.0 transform program
+            {
+                // originalData = reconstructed V6RawResidual
+                // v6CompProg = zstd-compressed program (carried in full)
+                using var dProg = new Decompressor();
+                byte[] rawProg = v6CompProg.Length > 0 ? dProg.Unwrap(v6CompProg).ToArray() : Array.Empty<byte>();
+
+                // Re-compress program and residual into v6.0.0 error payload format
+                using var c = new Compressor(19);
+                byte[] zProg = c.Wrap(rawProg).ToArray();
+                byte[] zRes = c.Wrap(originalData).ToArray();
+
+                using var errMs = new MemoryStream();
+                using var errBw = new BinaryWriter(errMs, Encoding.UTF8, leaveOpen: true);
+                errBw.Write(patchCount);
+                errBw.Write(originalSize);
+                errBw.Write(fourStreamChunkCount);
+                errBw.Write((ushort)v6ChunkSize);
+                errBw.Write(zProg.Length);
+                errBw.Write(zRes.Length);
+                errBw.Write(zProg);
+                errBw.Write(zRes);
+                errBw.Flush();
+                errorPayload = errMs.ToArray();
+                errorOriginalLength = errorPayload.Length;
+            }
+            else if (errorFormat == 4) // v5.6.0 bitmask-only
             {
                 using var dMode = new Decompressor();
                 byte[] rawMode = compMode.Length > 0 ? dMode.Unwrap(compMode).ToArray() : Array.Empty<byte>();
@@ -1000,10 +1093,13 @@ public class CcfPackOptimizerService : BackgroundService
             StringComparer.OrdinalIgnoreCase);
         var ungrouped = entries.Where(e => !allGroupedIds.Contains(e.FileId)).ToList();
 
-        if (overlapMulti.Count > 0)
-        {
-            Console.WriteLine($"[CcfPackOptimizer] Family discovery: exact={exactMulti.Count}, overlap={overlapMulti.Count}");
-        }
+        int invalidCount = entries.Count - entries.Count(e => e.Comp.IsValid);
+        int noFpCount = entries.Count(e => e.Comp.IsValid && e.Comp.RefsFingerprint.Length == 0);
+        Console.WriteLine($"[CcfPackOptimizer] Family discovery: {entries.Count} entries, " +
+            $"{valid.Count} valid ({invalidCount} invalid, {noFpCount} no fingerprint), " +
+            $"exact groups={exactMulti.Count} (entries={exactMulti.Sum(g => g.Count)}), " +
+            $"overlap groups={overlapMulti.Count} (entries={overlapMulti.Sum(g => g.Count)}), " +
+            $"ungrouped={ungrouped.Count}");
 
         // ── Phase 1: Parallel P-frame delta computation per family ──
         int parallelism = Globals.CcfOptimizerParallelism > 0
@@ -1345,7 +1441,18 @@ public class CcfPackOptimizerService : BackgroundService
             byte[] errorPayload = new byte[errorCompLen];
             Buffer.BlockCopy(file, errorOffset, errorPayload, 0, errorCompLen);
 
-            if ((version == "v5.6.0" || version == "v6.0.0") && errorCompLen >= 24)
+            if (version == "v6.0.0" && errorCompLen >= 22)
+            {
+                int progBlobLen = BitConverter.ToInt32(errorPayload, 14);
+                int resBlobLen = BitConverter.ToInt32(errorPayload, 18);
+                int resOffset = 22 + progBlobLen;
+                if (resOffset + resBlobLen <= errorCompLen)
+                {
+                    using var decomp = new Decompressor();
+                    return decomp.Unwrap(errorPayload.AsSpan(resOffset, resBlobLen)).ToArray();
+                }
+            }
+            else if (version == "v5.6.0" && errorCompLen >= 24)
             {
                 int compModeLen = BitConverter.ToInt32(errorPayload, 12);
                 int compBitmaskLen = BitConverter.ToInt32(errorPayload, 16);
