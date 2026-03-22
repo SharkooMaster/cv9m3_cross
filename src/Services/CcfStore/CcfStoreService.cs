@@ -439,7 +439,7 @@ public class CcfStoreService
             byte[] baseCcf = new byte[baseDataLen];
             Buffer.BlockCopy(innerPayload, (int)baseDataStart, baseCcf, 0, baseDataLen);
 
-            byte[]? reconstructed = CcfPackOptimizerService.ReconstructCcfFromPFrame(pframePayload, baseCcf);
+            byte[]? reconstructed = CcfPackOptimizerService.ReconstructCcfFromPFrame(pframePayload, baseCcf, CcfPackOptimizerService.LiveDictionary);
             if (reconstructed == null)
             {
                 Console.WriteLine($"[CcfStore] P-frame reconstruction failed for {fileId}");

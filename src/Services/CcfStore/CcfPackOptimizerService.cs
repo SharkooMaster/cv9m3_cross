@@ -450,12 +450,19 @@ public class CcfPackOptimizerService : BackgroundService
 
     /// <summary>
     /// Reconstruct the original CCF from a P-frame payload and the base I-frame CCF bytes.
-    /// V2 format: full-CCF byte-level delta. Returns null on failure.
+    /// Detects V1 (full-CCF byte-level delta) vs V2 (semantic error-value delta) automatically.
+    /// V2 P-frames have magic = -2 as the first int32.
     /// </summary>
-    internal static byte[]? ReconstructCcfFromPFrame(byte[] pframeData, byte[] baseCcf)
+    internal static byte[]? ReconstructCcfFromPFrame(byte[] pframeData, byte[] baseCcf, byte[]? dict = null)
     {
         try
         {
+            if (pframeData.Length < 4) return null;
+
+            int firstInt = BitConverter.ToInt32(pframeData, 0);
+            if (firstInt == -2)
+                return ReconstructSemanticPFrame(pframeData, baseCcf, dict);
+
             using var ms = new MemoryStream(pframeData);
             using var br = new BinaryReader(ms, Encoding.UTF8);
 
@@ -482,6 +489,210 @@ public class CcfPackOptimizerService : BackgroundService
             Console.WriteLine($"[CcfPackOptimizer] P-frame reconstruction failed: {ex.Message}");
             return null;
         }
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    //  Semantic P-frame: delta of raw (decompressed) error values
+    //
+    //  Instead of delta-ing full compressed CCF bytes (where the zstd-compressed
+    //  error payloads appear as incompressible noise), we delta the RAW decompressed
+    //  error streams (mode + bitmask + values + trim + hash). Within a family
+    //  (same refs fingerprint), these raw streams are highly correlated — their
+    //  deltas are near-zero and compress dramatically under zstd.
+    //
+    //  V2 P-frame format:
+    //    [4B] magic = -2
+    //    [4B] versionLen  [versionLen B] version string
+    //    [4B] patchCount  [4B] originalSize  [4B] chunkCount
+    //    [4B] modeLen  [4B] bitmaskLen  [4B] valuesLen  [4B] trimLen  [4B] hashLen
+    //    [4B] inflatedLen  [4B] compDeltaLen
+    //    [compDeltaLen B] zstd-19 compressed delta of inflated streams
+    // ───────────────────────────────────────────────────────────────────
+
+    internal static byte[] BuildInflatedStream(CcfComponents comp)
+    {
+        int totalLen = comp.ModeBitfield.Length + comp.RawBitmask.Length +
+                       comp.RawValues.Length + comp.Trim.Length + comp.Hash.Length;
+        byte[] result = new byte[totalLen];
+        int pos = 0;
+        if (comp.ModeBitfield.Length > 0)
+        { Buffer.BlockCopy(comp.ModeBitfield, 0, result, pos, comp.ModeBitfield.Length); pos += comp.ModeBitfield.Length; }
+        if (comp.RawBitmask.Length > 0)
+        { Buffer.BlockCopy(comp.RawBitmask, 0, result, pos, comp.RawBitmask.Length); pos += comp.RawBitmask.Length; }
+        if (comp.RawValues.Length > 0)
+        { Buffer.BlockCopy(comp.RawValues, 0, result, pos, comp.RawValues.Length); pos += comp.RawValues.Length; }
+        if (comp.Trim.Length > 0)
+        { Buffer.BlockCopy(comp.Trim, 0, result, pos, comp.Trim.Length); pos += comp.Trim.Length; }
+        if (comp.Hash.Length > 0)
+        { Buffer.BlockCopy(comp.Hash, 0, result, pos, comp.Hash.Length); pos += comp.Hash.Length; }
+        return result;
+    }
+
+    internal static byte[]? BuildSemanticPFrame(CcfComponents memberComp, CcfComponents baseComp)
+    {
+        if (!memberComp.IsValid || !baseComp.IsValid) return null;
+        if (memberComp.Version != baseComp.Version) return null;
+        if (memberComp.Version != "v5.6.0") return null;
+
+        byte[] memberInflated = BuildInflatedStream(memberComp);
+        byte[] baseInflated = BuildInflatedStream(baseComp);
+
+        int memberLen = memberInflated.Length;
+        int baseLen = baseInflated.Length;
+        int overlap = Math.Min(memberLen, baseLen);
+        byte[] delta = new byte[memberLen];
+        for (int i = 0; i < overlap; i++)
+            delta[i] = (byte)((memberInflated[i] - baseInflated[i]) & 0xFF);
+        if (memberLen > overlap)
+            Buffer.BlockCopy(memberInflated, overlap, delta, overlap, memberLen - overlap);
+
+        using var zc = new Compressor(19);
+        byte[] compDelta = zc.Wrap(delta).ToArray();
+
+        var vBytes = Encoding.UTF8.GetBytes(memberComp.Version);
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+        bw.Write(-2); // V2 semantic marker
+        bw.Write(vBytes.Length);
+        bw.Write(vBytes);
+        bw.Write(memberComp.PatchCount);
+        bw.Write(memberComp.OriginalSize);
+        bw.Write(memberComp.FourStreamChunkCount);
+        bw.Write(memberComp.ModeBitfield.Length);
+        bw.Write(memberComp.RawBitmask.Length);
+        bw.Write(memberComp.RawValues.Length);
+        bw.Write(memberComp.Trim.Length);
+        bw.Write(memberComp.Hash.Length);
+        bw.Write(memberLen);
+        bw.Write(compDelta.Length);
+        bw.Write(compDelta);
+        bw.Flush();
+        return ms.ToArray();
+    }
+
+    internal static byte[]? ReconstructSemanticPFrame(byte[] pframeData, byte[] baseCcf, byte[]? dict)
+    {
+        try
+        {
+            using var ms = new MemoryStream(pframeData);
+            using var br = new BinaryReader(ms, Encoding.UTF8);
+
+            int magic = br.ReadInt32();
+            if (magic != -2) return null;
+
+            int versionLen = br.ReadInt32();
+            string version = Encoding.UTF8.GetString(br.ReadBytes(versionLen));
+            int patchCount = br.ReadInt32();
+            int originalSize = br.ReadInt32();
+            int chunkCount = br.ReadInt32();
+            int modeLen = br.ReadInt32();
+            int bitmaskLen = br.ReadInt32();
+            int valuesLen = br.ReadInt32();
+            int trimLen = br.ReadInt32();
+            int hashLen = br.ReadInt32();
+            int inflatedLen = br.ReadInt32();
+            int compDeltaLen = br.ReadInt32();
+            byte[] compDelta = br.ReadBytes(compDeltaLen);
+
+            var baseComp = ParseCcfComponents(baseCcf);
+            if (!baseComp.IsValid) return null;
+            byte[] baseInflated = BuildInflatedStream(baseComp);
+
+            using var decomp = new Decompressor();
+            byte[] delta = decomp.Unwrap(compDelta).ToArray();
+            if (delta.Length != inflatedLen) return null;
+
+            int overlap = Math.Min(inflatedLen, baseInflated.Length);
+            byte[] memberInflated = new byte[inflatedLen];
+            for (int i = 0; i < overlap; i++)
+                memberInflated[i] = (byte)((delta[i] + baseInflated[i]) & 0xFF);
+            if (inflatedLen > overlap)
+                Buffer.BlockCopy(delta, overlap, memberInflated, overlap, inflatedLen - overlap);
+
+            int pos = 0;
+            byte[] mode = new byte[modeLen];
+            if (modeLen > 0) { Buffer.BlockCopy(memberInflated, pos, mode, 0, modeLen); pos += modeLen; }
+            byte[] bitmask = new byte[bitmaskLen];
+            if (bitmaskLen > 0) { Buffer.BlockCopy(memberInflated, pos, bitmask, 0, bitmaskLen); pos += bitmaskLen; }
+            byte[] values = new byte[valuesLen];
+            if (valuesLen > 0) { Buffer.BlockCopy(memberInflated, pos, values, 0, valuesLen); pos += valuesLen; }
+            byte[] trim = new byte[trimLen];
+            if (trimLen > 0) { Buffer.BlockCopy(memberInflated, pos, trim, 0, trimLen); pos += trimLen; }
+            byte[] hash = new byte[hashLen];
+            if (hashLen > 0) { Buffer.BlockCopy(memberInflated, pos, hash, 0, hashLen); pos += hashLen; }
+
+            byte[] compMode, compBitmask, compValues;
+            using (var c = new Compressor(3))
+            {
+                if (dict != null) c.LoadDictionary(dict);
+                compMode = c.Wrap(mode).ToArray();
+            }
+            using (var c = new Compressor(3))
+            {
+                if (dict != null) c.LoadDictionary(dict);
+                compBitmask = c.Wrap(bitmask).ToArray();
+            }
+            using (var c = new Compressor(3))
+            {
+                if (dict != null) c.LoadDictionary(dict);
+                compValues = c.Wrap(values).ToArray();
+            }
+
+            using var epMs = new MemoryStream();
+            using var epBw = new BinaryWriter(epMs, Encoding.UTF8, leaveOpen: true);
+            epBw.Write(patchCount);
+            epBw.Write(originalSize);
+            epBw.Write(chunkCount);
+            epBw.Write(compMode.Length);
+            epBw.Write(compBitmask.Length);
+            epBw.Write(compValues.Length);
+            epBw.Write(compMode);
+            epBw.Write(compBitmask);
+            epBw.Write(compValues);
+            epBw.Flush();
+            byte[] errorPayload = epMs.ToArray();
+
+            return ReassembleCcf(version, baseComp.Refs, errorPayload, errorPayload.Length, trim, hash);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CcfPackOptimizer] Semantic P-frame reconstruction failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    internal static bool ValidateSemanticPFrame(byte[] pframeData, CcfComponents memberComp, CcfComponents baseComp)
+    {
+        try
+        {
+            using var ms = new MemoryStream(pframeData);
+            using var br = new BinaryReader(ms, Encoding.UTF8);
+
+            br.ReadInt32(); // magic
+            int vLen = br.ReadInt32();
+            br.ReadBytes(vLen);
+            br.ReadInt32(); br.ReadInt32(); br.ReadInt32(); // patchCount, origSize, chunkCount
+            br.ReadInt32(); br.ReadInt32(); br.ReadInt32(); br.ReadInt32(); br.ReadInt32(); // component lengths
+            int inflatedLen = br.ReadInt32();
+            int compDeltaLen = br.ReadInt32();
+            byte[] compDelta = br.ReadBytes(compDeltaLen);
+
+            using var decomp = new Decompressor();
+            byte[] delta = decomp.Unwrap(compDelta).ToArray();
+            if (delta.Length != inflatedLen) return false;
+
+            byte[] baseInflated = BuildInflatedStream(baseComp);
+            int overlap = Math.Min(inflatedLen, baseInflated.Length);
+            byte[] memberRecon = new byte[inflatedLen];
+            for (int i = 0; i < overlap; i++)
+                memberRecon[i] = (byte)((delta[i] + baseInflated[i]) & 0xFF);
+            if (inflatedLen > overlap)
+                Buffer.BlockCopy(delta, overlap, memberRecon, overlap, inflatedLen - overlap);
+
+            byte[] memberInflated = BuildInflatedStream(memberComp);
+            return memberRecon.AsSpan().SequenceEqual(memberInflated);
+        }
+        catch { return false; }
     }
 
     internal static byte[] ReassembleCcf(
@@ -1118,7 +1329,7 @@ public class CcfPackOptimizerService : BackgroundService
                 var members = group;
                 var baseMember = members.OrderByDescending(e => e.Ccf.Length).First();
                 var family = new ProcessedFamily { Base = baseMember };
-                int accepted = 0, rejected = 0;
+                int accepted = 0, rejected = 0, semanticCount = 0;
                 double bestRatio = double.MaxValue;
 
                 for (int m = 0; m < members.Count; m++)
@@ -1129,18 +1340,44 @@ public class CcfPackOptimizerService : BackgroundService
 
                     try
                     {
-                        byte[] pframePayload = BuildPFramePayload(member.Ccf, baseMember.Ccf);
+                        byte[]? pframePayload = null;
+                        bool isSemantic = false;
+
+                        if (member.Comp.IsValid && baseMember.Comp.IsValid
+                            && member.Comp.Version == baseMember.Comp.Version
+                            && member.Comp.Version == "v5.6.0")
+                        {
+                            byte[]? sp = BuildSemanticPFrame(member.Comp, baseMember.Comp);
+                            if (sp != null && sp.Length < member.Ccf.Length * PframeSavingsThreshold)
+                            {
+                                pframePayload = sp;
+                                isSemantic = true;
+                            }
+                        }
+
+                        pframePayload ??= BuildPFramePayload(member.Ccf, baseMember.Ccf);
+
                         double ratio = member.Ccf.Length > 0 ? (double)pframePayload.Length / member.Ccf.Length : 1.0;
                         if (ratio < bestRatio) bestRatio = ratio;
 
                         if (pframePayload.Length < member.Ccf.Length * PframeSavingsThreshold)
                         {
-                            byte[]? reconstructed = ReconstructCcfFromPFrame(pframePayload, baseMember.Ccf);
-                            if (reconstructed != null &&
-                                reconstructed.AsSpan().SequenceEqual(member.Ccf))
+                            bool valid;
+                            if (isSemantic)
+                            {
+                                valid = ValidateSemanticPFrame(pframePayload, member.Comp, baseMember.Comp);
+                            }
+                            else
+                            {
+                                byte[]? reconstructed = ReconstructCcfFromPFrame(pframePayload, baseMember.Ccf);
+                                valid = reconstructed != null && reconstructed.AsSpan().SequenceEqual(member.Ccf);
+                            }
+
+                            if (valid)
                             {
                                 pm.PframePayload = pframePayload;
                                 accepted++;
+                                if (isSemantic) semanticCount++;
                             }
                             else { rejected++; }
                         }
@@ -1157,7 +1394,7 @@ public class CcfPackOptimizerService : BackgroundService
 
                 if (accepted > 0 || bestRatio < 1.5)
                     Console.WriteLine($"[CcfPackOptimizer] Family ({members.Count} members, base={baseMember.Ccf.Length}B): " +
-                        $"{accepted} P-frames accepted, {rejected} rejected, bestRatio={bestRatio:F3}");
+                        $"{accepted} P-frames accepted ({semanticCount} semantic), {rejected} rejected, bestRatio={bestRatio:F3}");
 
                 familyResults.Add(family);
             });
