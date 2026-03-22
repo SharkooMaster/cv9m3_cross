@@ -339,8 +339,8 @@ public class CcfStoreService
 
     private static readonly byte[] PackMagic = "CCP\0"u8.ToArray();
 
-    // Cache: decompressed inner payload + pack version + ref catalog
-    private readonly Dictionary<string, (byte[] Data, int Version, List<(ulong, ulong)>? Catalog, DateTime LastAccess)> _packCache = new();
+    // Cache: decompressed inner payload + pack version + ref catalog + neural models
+    private readonly Dictionary<string, (byte[] Data, int Version, List<(ulong, ulong)>? Catalog, Dictionary<int, NeuralErrorCompressor.CompressResult>? NeuralModels, DateTime LastAccess)> _packCache = new();
     private readonly object _cacheLock = new();
     private const int MaxCachedPacks = 8;
 
@@ -361,7 +361,7 @@ public class CcfStoreService
             string packFile = Path.ChangeExtension(idxFile, ".pack");
             if (!File.Exists(packFile)) continue;
 
-            var (innerPayload, packVersion, catalog) = await GetInnerPayload(packFile, ct);
+            var (innerPayload, packVersion, catalog, neuralModels) = await GetInnerPayload(packFile, ct);
             if (innerPayload.Length == 0) continue;
 
             long offset = entry.Value.Offset;
@@ -390,6 +390,12 @@ public class CcfStoreService
             {
                 byte[] data = new byte[dataLength];
                 Buffer.BlockCopy(innerPayload, (int)dataStart3, data, 0, dataLength);
+                if (neuralModels != null && entry.Value.Index >= 0 &&
+                    neuralModels.TryGetValue(entry.Value.Index, out var neuralModel))
+                {
+                    try { data = NeuralErrorCompressor.RestoreCcf(data, neuralModel, CcfPackOptimizerService.LiveDictionary); }
+                    catch (Exception ex) { Console.WriteLine($"[CcfStore] Neural restore failed for {fileId}: {ex.Message}"); }
+                }
                 if (catalog != null)
                     data = CcfPackOptimizerService.ExpandCcfRefs(data, catalog);
                 return data;
@@ -440,6 +446,13 @@ public class CcfStoreService
                 continue;
             }
 
+            if (neuralModels != null && entry.Value.Index >= 0 &&
+                neuralModels.TryGetValue(entry.Value.Index, out var neuralModelPf))
+            {
+                try { reconstructed = NeuralErrorCompressor.RestoreCcf(reconstructed, neuralModelPf, CcfPackOptimizerService.LiveDictionary); }
+                catch (Exception ex) { Console.WriteLine($"[CcfStore] Neural restore (P-frame) failed for {fileId}: {ex.Message}"); }
+            }
+
             if (catalog != null)
                 reconstructed = CcfPackOptimizerService.ExpandCcfRefs(reconstructed, catalog);
 
@@ -459,19 +472,19 @@ public class CcfStoreService
         return null;
     }
 
-    private async Task<(byte[] Inner, int Version, List<(ulong, ulong)>? Catalog)> GetInnerPayload(string packFile, CancellationToken ct)
+    private async Task<(byte[] Inner, int Version, List<(ulong, ulong)>? Catalog, Dictionary<int, NeuralErrorCompressor.CompressResult>? NeuralModels)> GetInnerPayload(string packFile, CancellationToken ct)
     {
         lock (_cacheLock)
         {
             if (_packCache.TryGetValue(packFile, out var cached))
             {
-                _packCache[packFile] = (cached.Data, cached.Version, cached.Catalog, DateTime.UtcNow);
-                return (cached.Data, cached.Version, cached.Catalog);
+                _packCache[packFile] = (cached.Data, cached.Version, cached.Catalog, cached.NeuralModels, DateTime.UtcNow);
+                return (cached.Data, cached.Version, cached.Catalog, cached.NeuralModels);
             }
         }
 
         byte[] fileData = await File.ReadAllBytesAsync(packFile, ct);
-        if (fileData.Length < 12) return (fileData, 1, null);
+        if (fileData.Length < 12) return (fileData, 1, null, null);
 
         bool isMagic = fileData[0] == PackMagic[0] && fileData[1] == PackMagic[1]
                     && fileData[2] == PackMagic[2] && fileData[3] == PackMagic[3];
@@ -497,6 +510,8 @@ public class CcfStoreService
         }
 
         List<(ulong, ulong)>? catalog = null;
+        Dictionary<int, NeuralErrorCompressor.CompressResult>? neuralModels = null;
+
         if (version >= 4 && inner.Length >= 8)
         {
             try
@@ -517,13 +532,33 @@ public class CcfStoreService
                         cPos += 16;
                     }
                 }
+
+                if (version >= 5 && cPos + 4 <= inner.Length)
+                {
+                    int neuralCount = BitConverter.ToInt32(inner, cPos); cPos += 4;
+                    if (neuralCount > 0)
+                    {
+                        neuralModels = new Dictionary<int, NeuralErrorCompressor.CompressResult>(neuralCount);
+                        for (int i = 0; i < neuralCount && cPos + 8 <= inner.Length; i++)
+                        {
+                            int entryIdx = BitConverter.ToInt32(inner, cPos); cPos += 4;
+                            int serializedLen = BitConverter.ToInt32(inner, cPos); cPos += 4;
+                            if (cPos + serializedLen > inner.Length) break;
+                            byte[] modelBuf = new byte[serializedLen];
+                            Buffer.BlockCopy(inner, cPos, modelBuf, 0, serializedLen);
+                            cPos += serializedLen;
+                            var model = NeuralErrorCompressor.DeserializeModel(modelBuf);
+                            if (model != null) neuralModels[entryIdx] = model;
+                        }
+                    }
+                }
             }
-            catch { catalog = null; }
+            catch { catalog = null; neuralModels = null; }
         }
 
         lock (_cacheLock)
         {
-            _packCache[packFile] = (inner, version, catalog, DateTime.UtcNow);
+            _packCache[packFile] = (inner, version, catalog, neuralModels, DateTime.UtcNow);
             if (_packCache.Count > MaxCachedPacks)
             {
                 var oldest = _packCache.OrderBy(kv => kv.Value.LastAccess).First().Key;
@@ -531,7 +566,7 @@ public class CcfStoreService
             }
         }
 
-        return (inner, version, catalog);
+        return (inner, version, catalog, neuralModels);
     }
 
     private bool PackIndexContains(string fileId)
@@ -544,7 +579,7 @@ public class CcfStoreService
         return false;
     }
 
-    private static (long Offset, int Length)? FindInPackIndex(string idxPath, string fileId)
+    private static (long Offset, int Length, int Index)? FindInPackIndex(string idxPath, string fileId)
     {
         try
         {
@@ -561,7 +596,7 @@ public class CcfStoreService
 
                 string entryId = System.Text.Encoding.UTF8.GetString(idBytes).TrimEnd('\0');
                 if (string.Equals(entryId, fileId, StringComparison.OrdinalIgnoreCase))
-                    return (offset, length);
+                    return (offset, length, i);
             }
         }
         catch { }

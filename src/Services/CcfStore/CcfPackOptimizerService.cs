@@ -12,9 +12,9 @@ namespace Cross.Services.CcfStore;
 /// with P-frame cross-file delta compression, trains a shared zstd dictionary,
 /// and removes individual CCFs after packing.
 ///
-/// Pack format v4 (ref catalog + full-CCF P-frame delta):
+/// Pack format v5 (ref catalog + P-frame delta + neural error compression):
 ///   [4B] magic "CCP\0"
-///   [4B] version = 4
+///   [4B] version = 5
 ///   [4B] decompressedSize
 ///   [remainder] zstd-19 compressed inner payload
 ///
@@ -24,13 +24,18 @@ namespace Cross.Services.CcfStore;
 ///     [dictSize B] dictionary
 ///     [4B] catalogCount
 ///     [catalogCount * 16B] global ref catalog: (bucketId:u64, bucketKey:u64)
+///     [4B] neuralModelCount
+///     Per neural model:
+///       [4B] entryIndex
+///       [4B] serializedLen
+///       [serializedLen B] model (hidden:u8, scale:f32, errorCount:i32, int8 weights)
 ///     Per entry:
-///       [1B] frameType: 0 = I-frame, 1 = P-frame (full-CCF subtraction delta)
+///       [1B] frameType: 0 = I-frame, 1 = P-frame
 ///       [4B] baseIndex: -1 for I-frame, positional index for P-frame
 ///       [4B] dataLength
 ///       [dataLength B] data (I-frame: compact CCF, P-frame: PFramePayload)
-///     Compact CCF: ref table entries are 4-byte catalog indices instead of 16-byte pairs.
-///     On extraction, ExpandCcfRefs restores the original CCF format.
+///     Neural-transformed CCFs have error values replaced with residuals.
+///     On extraction, the neural model restores original values before ExpandCcfRefs.
 ///
 /// Pack format v2 (legacy, zstd-compressed):
 ///   [4B] magic "CCP\0"  [4B] version = 2  [4B] decompressedSize
@@ -46,7 +51,7 @@ namespace Cross.Services.CcfStore;
 public class CcfPackOptimizerService : BackgroundService
 {
     private static readonly byte[] PackMagic = "CCP\0"u8.ToArray();
-    private const int PackVersion = 4;
+    private const int PackVersion = 5;
     public static long TotalPackRawBytes;
     public static long TotalPackCompressedBytes;
 
@@ -60,6 +65,9 @@ public class CcfPackOptimizerService : BackgroundService
     public static int PframeGroupsFound;
     public static int PframeDeltaCount;
     public static long PframeSavedBytes;
+
+    public static int NeuralAppliedCount;
+    public static long NeuralSavedBytes;
 
     private const int DictTrainThreshold = 50;
     private static volatile byte[]? _liveDict;
@@ -76,6 +84,8 @@ public class CcfPackOptimizerService : BackgroundService
         PframeGroupsFound = 0;
         PframeDeltaCount = 0;
         PframeSavedBytes = 0;
+        NeuralAppliedCount = 0;
+        NeuralSavedBytes = 0;
         LastRunUtc = null;
         lock (_dictLock) { _liveDict = null; }
         Console.WriteLine("[CcfPackOptimizer] Stats and dictionary reset");
@@ -1009,6 +1019,48 @@ public class CcfPackOptimizerService : BackgroundService
         Console.WriteLine($"[CcfPackOptimizer] Ref catalog: {catalogList.Count} unique pairs from {entries.Count} CCFs, " +
             $"saved {refSavings / 1024.0:F1}KB ({(totalRawBytes > 0 ? refSavings * 100.0 / totalRawBytes : 0):F1}%) from ref dedup");
 
+        // ── Phase 0.5: Neural error compression ──
+        var neuralModels = new Dictionary<int, NeuralErrorCompressor.CompressResult>();
+
+        if (Globals.CcfNeuralErrorCompression && entries.Count > 0)
+        {
+            int neuralAttempted = 0, neuralApplied = 0;
+            long neuralSaved = 0;
+            byte[]? dict = LiveDictionary;
+
+            Parallel.For(0, entries.Count, new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                CancellationToken = ct
+            }, i =>
+            {
+                var entry = entries[i];
+                if (entry.Comp.Version != "v5.6.0" || entry.Comp.RawValues.Length < NeuralErrorCompressor.MinErrorValues)
+                    return;
+
+                Interlocked.Increment(ref neuralAttempted);
+
+                var result = NeuralErrorCompressor.TransformCcf(entry.Ccf, dict);
+                if (result == null) return;
+
+                int saved = entry.Ccf.Length - result.Value.NewCcf.Length;
+                if (saved <= 0) return;
+
+                lock (neuralModels) { neuralModels[i] = result.Value.Model; }
+                entry.Ccf = result.Value.NewCcf;
+                Interlocked.Increment(ref neuralApplied);
+                Interlocked.Add(ref neuralSaved, saved);
+            });
+
+            NeuralAppliedCount += neuralApplied;
+            NeuralSavedBytes += neuralSaved;
+
+            if (neuralAttempted > 0)
+                Console.WriteLine($"[CcfPackOptimizer] Neural error compression: " +
+                    $"attempted={neuralAttempted}, applied={neuralApplied}, " +
+                    $"saved={neuralSaved / 1024.0:F1}KB");
+        }
+
         var valid = entries.Where(e => e.Comp.IsValid && e.Comp.RefsFingerprint.Length > 0).ToList();
 
         // Hybrid family discovery:
@@ -1128,6 +1180,16 @@ public class CcfPackOptimizerService : BackgroundService
             BitConverter.TryWriteBytes(catBuf.AsSpan(0), id);
             BitConverter.TryWriteBytes(catBuf.AsSpan(8), key);
             innerMs.Write(catBuf);
+        }
+
+        // Neural models section (v5): count + per-model data
+        WriteInt32(innerMs, neuralModels.Count);
+        foreach (var (entryIdx, model) in neuralModels)
+        {
+            WriteInt32(innerMs, entryIdx);
+            byte[] serialized = NeuralErrorCompressor.SerializeModel(model);
+            WriteInt32(innerMs, serialized.Length);
+            innerMs.Write(serialized);
         }
 
         WriteInt32(idxMs, entries.Count);

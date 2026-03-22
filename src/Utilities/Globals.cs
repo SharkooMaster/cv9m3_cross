@@ -133,6 +133,10 @@ public static class Globals
         string.Equals(Environment.GetEnvironmentVariable("CCF_ENCODING_V6"), "true",
             StringComparison.OrdinalIgnoreCase);
 
+    public static bool CcfNeuralErrorCompression =
+        !string.Equals(Environment.GetEnvironmentVariable("CCF_NEURAL_ERROR_DISABLED"), "true",
+            StringComparison.OrdinalIgnoreCase);
+
     internal static readonly SemaphoreSlim CcfOptimizationLock = new(1, 1);
 
     /// <summary>
