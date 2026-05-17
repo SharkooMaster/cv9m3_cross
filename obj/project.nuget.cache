@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "dgSpecHash": "l7NiqQ9TMzCKKkoI3n3N9CAfPy/MMJz5+/C2rRwjiKaDF+Pnv6Y8oVcIPH6Q2uBfIhrxJ7DkwSHLwYSJDSynyA==",
+  "dgSpecHash": "Sh0pcTkag24kcNQ6yqaMjmmr1V9SbC+Njcum279u1dS6fAaQPRClB137zzluXrzD+PIKLGHZdToA3r7227z6tQ==",
   "success": true,
   "projectFilePath": "/home/sharku/Documents/Projects/CrossV9/cross/cross.csproj",
   "expectedPackageFiles": [
@@ -41,5 +41,16 @@
     "/home/sharku/.nuget/packages/system.diagnostics.diagnosticsource/8.0.0/system.diagnostics.diagnosticsource.8.0.0.nupkg.sha512",
     "/home/sharku/.nuget/packages/zstdsharp.port/0.8.7/zstdsharp.port.0.8.7.nupkg.sha512"
   ],
-  "logs": []
+  "logs": [
+    {
+      "code": "NU1902",
+      "level": "Warning",
+      "warningLevel": 1,
+      "message": "Package 'OpenTelemetry.Exporter.OpenTelemetryProtocol' 1.9.0 has a known moderate severity vulnerability, https://github.com/advisories/GHSA-4625-4j76-fww9",
+      "libraryId": "OpenTelemetry.Exporter.OpenTelemetryProtocol",
+      "targetGraphs": [
+        "net8.0"
+      ]
+    }
+  ]
 }
