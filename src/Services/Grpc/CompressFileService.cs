@@ -352,6 +352,16 @@ public class CompressFileService : FileService.FileServiceBase
         // Temp file only used for monolithic path
         string tempPath = Path.Combine(Path.GetTempPath(), $"cross-upload-{Guid.NewGuid():N}.bin");
 
+        // Job telemetry: server-issued correlation id for the dashboard. Created here
+        // (not later) so failures during metadata parsing also have an id we can
+        // attribute the FAILED event to. The JobScope is opened after we know the mode
+        // (monolithic vs windowed) so STAGE_DONE events tag themselves correctly.
+        string jobId = Guid.NewGuid().ToString("N");
+        var jobWallSw = System.Diagnostics.Stopwatch.StartNew();
+        Cross.Services.JobEvents.JobEventBus.JobScope? jobScope = null;
+        bool jobCompleted = false;
+        string? errorStage = null;
+
         try
         {
             // ── Read metadata from first message ──
@@ -378,7 +388,15 @@ public class CompressFileService : FileService.FileServiceBase
                 throw new RpcException(new Status(StatusCode.InvalidArgument,
                     $"File too large. Declared {declaredSize} bytes, max allowed {effectiveLimit}."));
 
-            Console.WriteLine($"[ProcessFileStream] metadata: file={fileName}, size={declaredSize}, windowed={willUseWindowed}, concurrency={MaxConcurrentCompressions - _compressionGate.CurrentCount}/{MaxConcurrentCompressions}");
+            // Open the job scope now that we know the mode. AsyncLocal flows into the
+            // pipeline tasks so STAGE_DONE events automatically carry this jobId.
+            var mode = willUseWindowed
+                ? Crossv9.Jobevents.JobMode.Windowed
+                : Crossv9.Jobevents.JobMode.Monolithic;
+            jobScope = Cross.Services.JobEvents.JobEventBus.BeginScope(jobId, mode);
+            Cross.Services.JobEvents.JobEventBus.EmitStarted(jobId, mode, fileName ?? string.Empty, declaredSize);
+
+            Console.WriteLine($"[ProcessFileStream] metadata: file={fileName}, size={declaredSize}, windowed={willUseWindowed}, concurrency={MaxConcurrentCompressions - _compressionGate.CurrentCount}/{MaxConcurrentCompressions}, jobId={jobId}");
 
             // ── Agent readiness gate: wait until at least one agent is available ──
             try
@@ -398,41 +416,57 @@ public class CompressFileService : FileService.FileServiceBase
                 if (willUseWindowed)
                 {
                     await HandleWindowedPipeline(requestStream, responseStream, context,
-                        (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate, storeOnCluster, preferredEncoding);
+                        jobId, jobWallSw, (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate, storeOnCluster, preferredEncoding);
                 }
                 else
                 {
                     await HandleMonolithicCompression(requestStream, responseStream, context,
-                        tempPath, (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate, storeOnCluster, preferredEncoding);
+                        jobId, jobWallSw, tempPath, (long)declaredSize, declaredSha256, effectiveLimit, maxErrorRate, storeOnCluster, preferredEncoding);
                 }
+
+                jobCompleted = true;
             }
             finally
             {
                 _compressionGate.Release();
             }
         }
-        catch (RpcException) { throw; }
+        catch (RpcException rex)
+        {
+            if (!jobCompleted)
+                Cross.Services.JobEvents.JobEventBus.EmitFailed(jobId, "RpcException", rex.Status.Detail, errorStage);
+            throw;
+        }
         catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
         {
             Console.WriteLine($"[ProcessFileStream] Client disconnected (file={fileName ?? "?"}). Cleaning up.");
+            if (!jobCompleted)
+                Cross.Services.JobEvents.JobEventBus.EmitFailed(jobId, "ClientDisconnected", null, errorStage);
         }
         catch (IOException ex) when (ex.Message.Contains("reset", StringComparison.OrdinalIgnoreCase)
                                   || ex.Message.Contains("aborted", StringComparison.OrdinalIgnoreCase))
         {
             Console.WriteLine($"[ProcessFileStream] Client reset stream (file={fileName ?? "?"}): {ex.Message}");
+            if (!jobCompleted)
+                Cross.Services.JobEvents.JobEventBus.EmitFailed(jobId, "ClientReset", ex.Message, errorStage);
         }
         catch (InvalidOperationException ex) when (ex.Message.Contains("request is complete", StringComparison.OrdinalIgnoreCase)
                                                  || ex.Message.Contains("Can't write", StringComparison.OrdinalIgnoreCase))
         {
             Console.WriteLine($"[ProcessFileStream] Client closed before response finished (file={fileName ?? "?"}): {ex.Message}");
+            if (!jobCompleted)
+                Cross.Services.JobEvents.JobEventBus.EmitFailed(jobId, "ClientClosed", ex.Message, errorStage);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[ProcessFileStream] FAILED (file={fileName ?? "?"}): {ex.GetType().Name}: {ex.Message}");
+            if (!jobCompleted)
+                Cross.Services.JobEvents.JobEventBus.EmitFailed(jobId, ex.GetType().Name, ex.Message, errorStage);
             throw new RpcException(new Status(StatusCode.Internal, $"Compression stream failed: {ex.Message}"));
         }
         finally
         {
+            jobScope?.Dispose();
             try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
         }
     }
@@ -446,6 +480,8 @@ public class CompressFileService : FileService.FileServiceBase
         IAsyncStreamReader<FileUploadRequest> requestStream,
         IServerStreamWriter<FileUploadResponse> responseStream,
         ServerCallContext context,
+        string jobId,
+        System.Diagnostics.Stopwatch jobWallSw,
         long declaredSize,
         ByteString? declaredSha256,
         long effectiveLimit,
@@ -624,6 +660,19 @@ public class CompressFileService : FileService.FileServiceBase
         }
 
         Console.WriteLine($"[Pipeline] COMPLETE: {receivedBytes} → {compressedSize} bytes, {blockCount} blocks, refs={refsFound}");
+
+        jobWallSw.Stop();
+        Cross.Services.JobEvents.JobEventBus.EmitCompleted(
+            jobId,
+            (ulong)Math.Max(0, compressedSize),
+            Math.Max(0, refsFound),
+            Math.Max(0, totalChunks),
+            Math.Max(0, dcBytesStored),
+            serverProcessingMs,
+            jobWallSw.Elapsed.TotalMilliseconds,
+            avgErrorRate,
+            Math.Max(0, errorPayloadBytes),
+            fileIdHex);
     }
 
     /// <summary>
@@ -663,6 +712,10 @@ public class CompressFileService : FileService.FileServiceBase
         var blockReady = new SemaphoreSlim(0);
 
         // ── N compression workers ──
+        // Capture parent jobId from AsyncLocal so per-block events attribute correctly.
+        // Task.Run captures ExecutionContext, which carries the AsyncLocal value into the
+        // worker continuation, but we read it once here to skip per-block lookups.
+        string? parentJobId = Cross.Services.JobEvents.JobEventBus.CurrentJobId;
         var workers = new Task[parallelism];
         for (int w = 0; w < parallelism; w++)
         {
@@ -686,6 +739,14 @@ public class CompressFileService : FileService.FileServiceBase
                         Interlocked.Add(ref totalDatacenterBytes, dcBytes);
                         Interlocked.Add(ref totalCompressionTicks, sw.ElapsedTicks);
                         Interlocked.Add(ref totalErrorPayloadBytes, blockErrPayload);
+
+                        if (!string.IsNullOrEmpty(parentJobId))
+                        {
+                            Cross.Services.JobEvents.JobEventBus.EmitBlockDone(
+                                parentJobId, blockIndex, blockCount,
+                                dataLen, compressed.Length, refs, chunks, dcBytes,
+                                sw.Elapsed.TotalMilliseconds);
+                        }
                         if (blockAvgErr > 0 && refs > 0)
                         {
                             long blockWeight = (long)refs;
@@ -734,6 +795,8 @@ public class CompressFileService : FileService.FileServiceBase
         IAsyncStreamReader<FileUploadRequest> requestStream,
         IServerStreamWriter<FileUploadResponse> responseStream,
         ServerCallContext context,
+        string jobId,
+        System.Diagnostics.Stopwatch jobWallSw,
         string tempPath,
         long declaredSize,
         ByteString? declaredSha256,
@@ -870,6 +933,20 @@ public class CompressFileService : FileService.FileServiceBase
         }
 
         Console.WriteLine($"[ProcessFileStream] Monolithic DONE: {receivedBytes} → {compressedBytes.Length}");
+
+        jobWallSw.Stop();
+        Cross.Services.JobEvents.JobEventBus.EmitCompleted(
+            jobId,
+            (ulong)compressedBytes.Length,
+            Math.Max(0, referencesFound),
+            Math.Max(0, totalChunks),
+            Math.Max(0, dcBytesStored),
+            compressSw.Elapsed.TotalMilliseconds,
+            jobWallSw.Elapsed.TotalMilliseconds,
+            avgErrorRate,
+            Math.Max(0, errorPayloadBytes),
+            fileIdHex);
+
         compressedBytes = null!;
         GC.Collect(2, GCCollectionMode.Optimized, false);
     }

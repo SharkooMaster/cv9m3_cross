@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package crossv9.jobevents;
+
+// Single, narrow gRPC contract for streaming compression telemetry from cross
+// pods to the control-center pod.
+//
+// Hot-path safety contract:
+//   - Cross pods stream events fire-and-forget. The control center never
+//     responds to individual events; it sends a single ack at the end of the
+//     stream so cross can detect a full disconnect, but cross never blocks
+//     on per-event acks.
+//   - Cross's local bounded channel (capacity 10k) drops new events when full.
+//     Compression NEVER waits for a JobEvent emit.
+//   - Control center is single-pod; if it is unreachable, the cross-side
+//     forwarder reconnects with backoff. Events that didn't fit in the bounded
+//     channel during the outage are lost on purpose (telemetry is "best effort").
+service JobEventService {
+  rpc Push(stream JobEvent) returns (PushAck);
+}
+
+enum JobPhase {
+  PHASE_UNKNOWN = 0;
+  STARTED = 1;       // job has been admitted; first emit
+  STAGE_DONE = 2;    // a named pipeline stage finished (SearchBuckets, DiffEncode, ...)
+  BLOCK_DONE = 3;    // for windowed compressions: one block finished
+  COMPLETED = 4;     // job completed successfully; final stats attached
+  FAILED = 5;        // job aborted; error_class + error_message attached
+}
+
+enum JobMode {
+  MODE_UNKNOWN = 0;
+  MONOLITHIC = 1;
+  WINDOWED = 2;
+}
+
+message JobEvent {
+  // Identity
+  string job_id = 1;          // server-issued uuid (cross pod issues on JOB_STARTED)
+  string parent_job_id = 2;   // for windowed compression child events; empty for monolithic
+  string cross_pod = 3;       // emitting cross pod (k8s pod name)
+  string cross_node = 4;
+  fixed64 ts_unix_ns = 5;     // event timestamp (UTC, nanoseconds since epoch)
+
+  // Common fields
+  JobPhase phase = 6;
+  JobMode mode = 7;
+  string file_name = 8;
+  uint64 original_size = 9;
+
+  // STAGE_DONE
+  string stage = 20;
+  double stage_ms = 21;
+  uint32 stage_attr_chunk_count = 22;     // optional; many existing stages tag this
+  uint32 stage_attr_bucket_count = 23;
+  uint64 stage_attr_bytes = 24;
+
+  // BLOCK_DONE
+  uint32 block_index = 40;
+  uint32 block_count = 41;
+  uint64 block_bytes_in = 42;
+  uint64 block_bytes_out = 43;
+  uint32 block_refs_found = 44;
+  uint32 block_chunks = 45;
+  uint64 block_dc_bytes = 46;
+  double block_ms = 47;
+
+  // COMPLETED — mirrors crossService.CompressionStats
+  uint64 final_compressed_size = 60;
+  uint32 final_refs_found = 61;
+  uint32 final_chunks = 62;
+  uint64 final_dc_bytes = 63;
+  double final_server_ms = 64;
+  double final_wall_ms = 65;
+  float  final_avg_error_rate = 66;
+  uint64 final_error_payload_bytes = 67;
+  string final_file_id = 68;
+
+  // FAILED
+  string error_class = 80;
+  string error_message = 81;  // pre-truncated to ≤ 200 chars
+  string error_stage = 82;    // best-effort: which named stage was active
+}
+
+message PushAck {
+  uint64 events_received = 1;
+  uint64 events_persisted = 2;
+}

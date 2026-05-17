@@ -29,11 +29,25 @@ public static class Observability
             { "k8s.pod.name", Environment.GetEnvironmentVariable("MY_POD_NAME") ?? "unknown" },
             { "k8s.node.name", Environment.GetEnvironmentVariable("MY_NODE_NAME") ?? "unknown" }
         };
+        int? chunkCount = null;
+        int? bucketCount = null;
+        ulong? bytes = null;
         foreach (var (key, value) in tags)
         {
             tagList.Add(key, value);
+            // Best-effort attribution to the JobEvent fields. Done here (vs. at every
+            // call site) so the existing RecordStage callers automatically participate
+            // in the dashboard with no further changes.
+            switch (key)
+            {
+                case "chunk_count" when value is int ic: chunkCount = ic; break;
+                case "bucket_count" when value is int ib: bucketCount = ib; break;
+                case "output_bytes" when value is int ob: bytes = (ulong)ob; break;
+                case "output_bytes" when value is long olb: bytes = (ulong)olb; break;
+            }
         }
         StageDurationMs.Record(durationMs, tagList);
+        Cross.Services.JobEvents.JobEventBus.EmitStageDone(stageName, durationMs, chunkCount, bucketCount, bytes);
     }
 
     public static ResourceBuilder CreateResourceBuilder() =>

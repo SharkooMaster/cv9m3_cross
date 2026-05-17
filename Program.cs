@@ -38,6 +38,7 @@ builder.Services.AddOpenTelemetry()
     });
 
 builder.Services.AddHostedService<AgentHealthWatcher>();
+builder.Services.AddHostedService<Cross.Services.JobEvents.JobEventForwarderService>();
 if (Globals.EnableCcfBackgroundServices)
 {
     builder.Services.AddHostedService<Cross.Services.CcfStore.CcfPackOptimizerService>();
@@ -72,6 +73,11 @@ app.UseRouting();
 app.MapPrometheusScrapingEndpoint("/metrics");
 
 app.MapGrpcService<CompressFileService>();
+
+// Tiny pod-self-reporting endpoint pulled by the control-center every ~30 s.
+// Lives on the existing HTTP/1 port (5001), allocation-bounded, never touches
+// the compression hot path.
+Cross.Utilities.RuntimeStatsEndpoint.Map(app, "cross");
 
 app.MapGet("/", () => "Hello World!");
 

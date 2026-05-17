@@ -26,6 +26,9 @@
   <ItemGroup>
     <Protobuf Include="Protos\CompressFile.proto" GrpcServices="Server" />
 
+    <!-- Job-event telemetry: cross is the CLIENT (it pushes events to the control center). -->
+    <Protobuf Include="Protos\JobEvents.proto" GrpcServices="Client" />
+
     <Protobuf Include="Protos\Gateway\SearchAll.proto" GrpcServices="Client" />
     <Protobuf Include="Protos\Agent\GetChunkByReference.proto" GrpcServices="Client" />
     <Protobuf Include="Protos\Agent\StoreVector.proto" GrpcServices="Client" />
