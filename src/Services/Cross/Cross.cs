@@ -983,29 +983,44 @@ public class CrossService : ICross
                                 indexMap.Add(chunkIdx);
                             }
 
+                            // No application-level deadline: a heavily loaded but alive
+                            // agent can take as long as it needs to finish its LSH search
+                            // work; cross→agent fan-out is throttled per-agent (see
+                            // AgentRpcThrottle) so we don't pile on more pressure while
+                            // we wait. Channel keepalive (~40 s) catches truly-dead TCP.
                             BatchSearchVector_Result? batchRes = null;
                             var currentAgent = agent;
+                            int attempt = 0;
                             while (batchRes == null)
                             {
                                 try
                                 {
-                                    var searchClient = GrpcChannelFactory.GetClient(
-                                        target: currentAgent,
-                                        ctor: chan => new SearchVector.SearchVectorClient(chan),
-                                        roundRobin: false, port: 5000);
-                                    batchRes = await searchClient.BatchGetAsync(batchReq,
-                                        deadline: DateTime.UtcNow.AddSeconds(30));
+                                    batchRes = await AgentRpcThrottle.RunAsync(currentAgent, async () =>
+                                    {
+                                        var searchClient = GrpcChannelFactory.GetClient(
+                                            target: currentAgent,
+                                            ctor: chan => new SearchVector.SearchVectorClient(chan),
+                                            roundRobin: false, port: 5000);
+                                        return await searchClient.BatchGetAsync(batchReq);
+                                    });
                                 }
                                 catch (Exception searchEx)
                                 {
-                                    Console.WriteLine($"[Compress] BatchGet to {currentAgent} failed: {searchEx.Message}, waiting for recovery...");
+                                    attempt++;
+                                    if (attempt >= AgentRpcThrottle.MaxAttempts)
+                                    {
+                                        Console.WriteLine($"[Compress] BatchGet to {currentAgent} failed after {attempt} attempts ({searchEx.Message}); giving up");
+                                        return;
+                                    }
+                                    var backoff = AgentRpcThrottle.BackoffFor(attempt - 1);
+                                    Console.WriteLine($"[Compress] BatchGet to {currentAgent} failed (attempt {attempt}/{AgentRpcThrottle.MaxAttempts}): {searchEx.Message}; backoff {backoff.TotalSeconds}s then retry");
                                     try
                                     {
                                         await AgentHealthWatcher.Instance.WaitForAgentAsync(currentAgent, CancellationToken.None);
+                                        await Task.Delay(backoff);
                                     }
                                     catch (OperationCanceledException) { return; }
                                     currentAgent = RendezvousRouter.ResolveAgentIp(currentAgent);
-                                    Console.WriteLine($"[Compress] Agent recovered (now {currentAgent}), retrying BatchGet...");
                                 }
                             }
 
@@ -1463,27 +1478,29 @@ public class CrossService : ICross
                     {
                         try
                         {
-                            var client = GrpcChannelFactory.GetClient(
-                                target: agentIp,
-                                ctor: chan => new SearchLanes.SearchLanesClient(chan),
-                                roundRobin: false, port: 5000);
-
-                            var req = new BatchSearchLanesReq();
-                            req.Queries.AddRange(allLaneQueries);
-
-                            var res = await client.BatchSearchAsync(req,
-                                deadline: DateTime.UtcNow.AddSeconds(30));
-
-                            foreach (var qr in res.Results)
+                            await AgentRpcThrottle.RunAsync(agentIp, async () =>
                             {
-                                if (qr == null || qr.Matches.Count == 0) continue;
-                                int qi = qr.QueryIndex;
-                                if (qi < 0 || qi >= queryToChunk.Count) continue;
-                                var (chunkIdx, laneIdx) = queryToChunk[qi];
+                                var client = GrpcChannelFactory.GetClient(
+                                    target: agentIp,
+                                    ctor: chan => new SearchLanes.SearchLanesClient(chan),
+                                    roundRobin: false, port: 5000);
 
-                                foreach (var m in qr.Matches)
-                                    allMatches.Add((chunkIdx, laneIdx, m));
-                            }
+                                var req = new BatchSearchLanesReq();
+                                req.Queries.AddRange(allLaneQueries);
+
+                                var res = await client.BatchSearchAsync(req);
+
+                                foreach (var qr in res.Results)
+                                {
+                                    if (qr == null || qr.Matches.Count == 0) continue;
+                                    int qi = qr.QueryIndex;
+                                    if (qi < 0 || qi >= queryToChunk.Count) continue;
+                                    var (chunkIdx, laneIdx) = queryToChunk[qi];
+
+                                    foreach (var m in qr.Matches)
+                                        allMatches.Add((chunkIdx, laneIdx, m));
+                                }
+                            });
                         }
                         catch (Exception ex)
                         {
@@ -1647,19 +1664,23 @@ public class CrossService : ICross
                                 batchReq.Items.Add(req);
                             }
 
+                            // Same contract as BatchGet above: no app deadline,
+                            // throttled per-agent, bounded retries with backoff.
                             var storeAgent = agent;
                             bool stored = false;
+                            int storeAttempt = 0;
                             while (!stored)
                             {
                                 try
                                 {
-                                    var storeClient = GrpcChannelFactory.GetClient(
-                                        target: storeAgent,
-                                        ctor: chan => new StoreVector.StoreVectorClient(chan),
-                                        roundRobin: false, port: 5000);
-
-                                    var batchRes = await storeClient.BatchStoreAsync(batchReq,
-                                        deadline: DateTime.UtcNow.AddSeconds(30));
+                                    var batchRes = await AgentRpcThrottle.RunAsync(storeAgent, async () =>
+                                    {
+                                        var storeClient = GrpcChannelFactory.GetClient(
+                                            target: storeAgent,
+                                            ctor: chan => new StoreVector.StoreVectorClient(chan),
+                                            roundRobin: false, port: 5000);
+                                        return await storeClient.BatchStoreAsync(batchReq);
+                                    });
 
                                     int freshlyStored = 0;
                                     int dedupedAtStore = 0;
@@ -1691,14 +1712,21 @@ public class CrossService : ICross
                                 }
                                 catch (Exception storeEx)
                                 {
-                                    Console.WriteLine($"[Compress] BatchStore to {storeAgent} failed: {storeEx.Message}, waiting for recovery...");
+                                    storeAttempt++;
+                                    if (storeAttempt >= AgentRpcThrottle.MaxAttempts)
+                                    {
+                                        Console.WriteLine($"[Compress] BatchStore to {storeAgent} failed after {storeAttempt} attempts ({storeEx.Message}); giving up");
+                                        return;
+                                    }
+                                    var backoff = AgentRpcThrottle.BackoffFor(storeAttempt - 1);
+                                    Console.WriteLine($"[Compress] BatchStore to {storeAgent} failed (attempt {storeAttempt}/{AgentRpcThrottle.MaxAttempts}): {storeEx.Message}; backoff {backoff.TotalSeconds}s then retry");
                                     try
                                     {
                                         await AgentHealthWatcher.Instance.WaitForAgentAsync(storeAgent, CancellationToken.None);
+                                        await Task.Delay(backoff);
                                     }
                                     catch (OperationCanceledException) { return; }
                                     storeAgent = RendezvousRouter.ResolveAgentIp(storeAgent);
-                                    Console.WriteLine($"[Compress] Agent recovered (now {storeAgent}), retrying BatchStore...");
                                 }
                             }
                         }));
@@ -1861,24 +1889,27 @@ public class CrossService : ICross
                     {
                         try
                         {
-                            var client = GrpcChannelFactory.GetClient(
-                                target: item.agent,
-                                ctor: chan => new StoreVector.StoreVectorClient(chan),
-                                roundRobin: false, port: 5000);
-                            var storeReq = new StoreVector_Req
+                            await AgentRpcThrottle.RunAsync(item.agent, async () =>
                             {
-                                TargetIp = item.agent,
-                                Bitstring = item.bucket,
-                                HeadRouteID = ""
-                            };
-                            storeReq.Vector.AddRange(item.vector);
-                            storeReq.Chunk = ByteString.CopyFrom(item.chunk);
-                            var storeRes = await client.StoreAsync(storeReq, new CallOptions(deadline: DateTime.UtcNow.AddSeconds(30)));
-                            item.resp.BucketId = storeRes.Id;
-                            item.resp.BucketKey = storeRes.Index;
-                            item.resp.StorageGuid = storeRes.StorageGuid ?? "";
-                            item.resp.NeedToStore = true;
-                            item.resp.Similarity = 1.0f; // base == original → empty diff
+                                var client = GrpcChannelFactory.GetClient(
+                                    target: item.agent,
+                                    ctor: chan => new StoreVector.StoreVectorClient(chan),
+                                    roundRobin: false, port: 5000);
+                                var storeReq = new StoreVector_Req
+                                {
+                                    TargetIp = item.agent,
+                                    Bitstring = item.bucket,
+                                    HeadRouteID = ""
+                                };
+                                storeReq.Vector.AddRange(item.vector);
+                                storeReq.Chunk = ByteString.CopyFrom(item.chunk);
+                                var storeRes = await client.StoreAsync(storeReq);
+                                item.resp.BucketId = storeRes.Id;
+                                item.resp.BucketKey = storeRes.Index;
+                                item.resp.StorageGuid = storeRes.StorageGuid ?? "";
+                                item.resp.NeedToStore = true;
+                                item.resp.Similarity = 1.0f; // base == original → empty diff
+                            });
                         }
                         catch
                         {
@@ -2222,26 +2253,28 @@ public class CrossService : ICross
                     {
                         try
                         {
-                            var client = GrpcChannelFactory.GetClient(
-                                target: agentIp,
-                                ctor: chan => new SearchLanes.SearchLanesClient(chan),
-                                roundRobin: false, port: 5000);
-
-                            var req = new BatchSearchLanesReq();
-                            req.Queries.AddRange(allLaneQueries);
-
-                            var res = await client.BatchSearchAsync(req,
-                                deadline: DateTime.UtcNow.AddSeconds(30));
-
-                            foreach (var qr in res.Results)
+                            await AgentRpcThrottle.RunAsync(agentIp, async () =>
                             {
-                                if (qr == null || qr.Matches.Count == 0) continue;
-                                int qi = qr.QueryIndex;
-                                if (qi < 0 || qi >= queryToChunk.Count) continue;
-                                var (chunkIdx, laneIdx) = queryToChunk[qi];
-                                foreach (var m in qr.Matches)
-                                    allMatches.Add((chunkIdx, laneIdx, m));
-                            }
+                                var client = GrpcChannelFactory.GetClient(
+                                    target: agentIp,
+                                    ctor: chan => new SearchLanes.SearchLanesClient(chan),
+                                    roundRobin: false, port: 5000);
+
+                                var req = new BatchSearchLanesReq();
+                                req.Queries.AddRange(allLaneQueries);
+
+                                var res = await client.BatchSearchAsync(req);
+
+                                foreach (var qr in res.Results)
+                                {
+                                    if (qr == null || qr.Matches.Count == 0) continue;
+                                    int qi = qr.QueryIndex;
+                                    if (qi < 0 || qi >= queryToChunk.Count) continue;
+                                    var (chunkIdx, laneIdx) = queryToChunk[qi];
+                                    foreach (var m in qr.Matches)
+                                        allMatches.Add((chunkIdx, laneIdx, m));
+                                }
+                            });
                         }
                         catch (Exception ex)
                         {
@@ -2406,19 +2439,22 @@ public class CrossService : ICross
                             batchReq.Items.Add(req);
                         }
 
+                        // Same contract: throttled, no app deadline, bounded retries.
                         var reStoreAgent = agent;
                         bool reStored = false;
+                        int reStoreAttempt = 0;
                         while (!reStored)
                         {
                             try
                             {
-                                var reStoreClient = GrpcChannelFactory.GetClient(
-                                    target: reStoreAgent,
-                                    ctor: chan => new StoreVector.StoreVectorClient(chan),
-                                    roundRobin: false, port: 5000);
-
-                                var batchRes = await reStoreClient.BatchStoreAsync(batchReq,
-                                    deadline: DateTime.UtcNow.AddSeconds(30));
+                                var batchRes = await AgentRpcThrottle.RunAsync(reStoreAgent, async () =>
+                                {
+                                    var reStoreClient = GrpcChannelFactory.GetClient(
+                                        target: reStoreAgent,
+                                        ctor: chan => new StoreVector.StoreVectorClient(chan),
+                                        roundRobin: false, port: 5000);
+                                    return await reStoreClient.BatchStoreAsync(batchReq);
+                                });
 
                                 for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
                                 {
@@ -2440,14 +2476,21 @@ public class CrossService : ICross
                             }
                             catch (Exception reStoreEx)
                             {
-                                Console.WriteLine($"[Compress] Re-store to {reStoreAgent} failed: {reStoreEx.Message}, waiting for recovery...");
+                                reStoreAttempt++;
+                                if (reStoreAttempt >= AgentRpcThrottle.MaxAttempts)
+                                {
+                                    Console.WriteLine($"[Compress] Re-store to {reStoreAgent} failed after {reStoreAttempt} attempts ({reStoreEx.Message}); giving up");
+                                    return;
+                                }
+                                var backoff = AgentRpcThrottle.BackoffFor(reStoreAttempt - 1);
+                                Console.WriteLine($"[Compress] Re-store to {reStoreAgent} failed (attempt {reStoreAttempt}/{AgentRpcThrottle.MaxAttempts}): {reStoreEx.Message}; backoff {backoff.TotalSeconds}s then retry");
                                 try
                                 {
                                     await AgentHealthWatcher.Instance.WaitForAgentAsync(reStoreAgent, CancellationToken.None);
+                                    await Task.Delay(backoff);
                                 }
                                 catch (OperationCanceledException) { return; }
                                 reStoreAgent = RendezvousRouter.ResolveAgentIp(reStoreAgent);
-                                Console.WriteLine($"[Compress] Agent recovered (now {reStoreAgent}), retrying re-store...");
                             }
                         }
                     }));

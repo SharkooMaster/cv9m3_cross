@@ -141,6 +141,10 @@ public sealed class AgentHealthWatcher : BackgroundService
             _agentStatus.TryRemove(goneIp, out _);
             _failCount.TryRemove(goneIp, out _);
             GrpcChannelFactory.EvictChannel(goneIp);
+            // Drop the per-agent in-flight RPC gate alongside the channel so
+            // long-running cross pods don't accumulate semaphores for IPs that
+            // pod restarts and rendezvous re-routes have rotated away.
+            AgentRpcThrottle.EvictGate(goneIp);
             Console.WriteLine($"[AgentHealthWatcher] Agent {goneIp} removed from topology");
             NotifyRecovery(goneIp);
         }
