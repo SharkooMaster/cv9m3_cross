@@ -175,8 +175,15 @@ public class CrossService : ICross
     }
 
     private (List<byte[]>, List<byte>) SplitChunks(byte[] _bytes, int _chunkSize)
+        => SplitChunks(_bytes, _bytes?.Length ?? 0, _chunkSize);
+
+    /// <summary>
+    /// Overload with explicit logical length so pooled buffers (where
+    /// _bytes.Length may exceed the actual data) split correctly.
+    /// </summary>
+    private (List<byte[]>, List<byte>) SplitChunks(byte[] _bytes, int _bytesLen, int _chunkSize)
     {
-        List<byte[]> toRet = Misc.SplitFile(_bytes, _chunkSize);
+        List<byte[]> toRet = Misc.SplitFile(_bytes, _bytesLen, _chunkSize);
         List<byte> trimmedChunk = new List<byte>();
 
         if (toRet.Count > 0 && toRet[^1].Length < _chunkSize)
@@ -745,7 +752,19 @@ public class CrossService : ICross
     }
 
     // Local/in-process helper: returns compressed bytes plus per-file reference stats
-    public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks, long DatacenterBytesStored, float AverageErrorRate, long ErrorPayloadBytes)> CompressFileWithStats(byte[] _file, float maxErrorRate = 0f, string preferredEncoding = "")
+    public Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks, long DatacenterBytesStored, float AverageErrorRate, long ErrorPayloadBytes)> CompressFileWithStats(byte[] _file, float maxErrorRate = 0f, string preferredEncoding = "")
+        => CompressFileWithStats(_file, _file?.Length ?? 0, maxErrorRate, preferredEncoding);
+
+    /// <summary>
+    /// Compress an in-memory buffer. The overload taking an explicit
+    /// <paramref name="_fileLen"/> allows callers to pass pooled
+    /// <see cref="System.Buffers.ArrayPool{T}"/> buffers (whose
+    /// <see cref="System.Array.Length"/> is typically larger than the
+    /// requested capacity) without compressing the trailing garbage.
+    /// All file-size–derived references inside use <paramref name="_fileLen"/>,
+    /// never <c>_file.Length</c>.
+    /// </summary>
+    public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks, long DatacenterBytesStored, float AverageErrorRate, long ErrorPayloadBytes)> CompressFileWithStats(byte[] _file, int _fileLen, float maxErrorRate = 0f, string preferredEncoding = "")
     {
         string encodingVersion = GetEncodingVersion(preferredEncoding);
         float bloatThreshold = maxErrorRate > 0f && maxErrorRate <= 1f
@@ -759,9 +778,9 @@ public class CrossService : ICross
         {
             using var stage = Observability.StartStage("SplitChunks");
             var swStage = Stopwatch.StartNew();
-            (fileChunks, trimmedChunk) = SplitChunks(_file, Globals.chunkSize);
+            (fileChunks, trimmedChunk) = SplitChunks(_file, _fileLen, Globals.chunkSize);
             swStage.Stop();
-            Console.WriteLine($"[Compress] Split: {swStage.ElapsedMilliseconds}ms, {fileChunks.Count} chunks ({_file.Length} bytes)");
+            Console.WriteLine($"[Compress] Split: {swStage.ElapsedMilliseconds}ms, {fileChunks.Count} chunks ({_fileLen} bytes)");
             Observability.RecordStage("SplitChunks", swStage.Elapsed.TotalMilliseconds, ("chunk_count", fileChunks.Count));
         }
 
@@ -2715,7 +2734,7 @@ public class CrossService : ICross
             representativeSet = null!;
             groupRepresentative = null!;
 
-            byte[] fileHash = SHA256.HashData(_file);
+            byte[] fileHash = SHA256.HashData(_file.AsSpan(0, _fileLen));
             toReturn = BuildCompressedPayload(
                 encodingVersion,
                 refBytes,
@@ -2726,7 +2745,7 @@ public class CrossService : ICross
             Observability.RecordStage("Serialize", swStage.Elapsed.TotalMilliseconds, ("output_bytes", toReturn.Length));
 
             totalSw.Stop();
-            Console.WriteLine($"[Compress] DONE: {totalSw.ElapsedMilliseconds}ms total, in={_file.Length} out={toReturn.Length} ratio={toReturn.Length/(double)_file.Length:F3}, dedup={referencesFound}, lshMatches={initialMatches}, stored={storedForLog}");
+            Console.WriteLine($"[Compress] DONE: {totalSw.ElapsedMilliseconds}ms total, in={_fileLen} out={toReturn.Length} ratio={toReturn.Length/(double)Math.Max(1,_fileLen):F3}, dedup={referencesFound}, lshMatches={initialMatches}, stored={storedForLog}");
         }
 
         return (toReturn, referencesFound, totalChunks, datacenterBytesStored, averageErrorRate, errorDictionaryBytes.Length);
@@ -2787,12 +2806,20 @@ public class CrossService : ICross
         await using (var hashStream = new FileStream(inputPath, FileMode.Open, FileAccess.Read,
                          FileShare.Read, bufferSize: 1024 * 1024, useAsync: true))
         {
-            byte[] buf = new byte[1024 * 1024];
-            int read;
-            while ((read = await hashStream.ReadAsync(buf, 0, buf.Length, ct)) > 0)
-                sha.TransformBlock(buf, 0, read, null, 0);
-            sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
-            originalHash = sha.Hash!;
+            // Pool the 1 MB hashing buffer — every file compression allocates it
+            // and lets it die on the LOH. ArrayPool reuses across calls so a
+            // batch of 60 000 JPEGs no longer churns 60 000 × 1 MB through Gen2.
+            var pool = System.Buffers.ArrayPool<byte>.Shared;
+            byte[] buf = pool.Rent(1024 * 1024);
+            try
+            {
+                int read;
+                while ((read = await hashStream.ReadAsync(buf, 0, buf.Length, ct)) > 0)
+                    sha.TransformBlock(buf, 0, read, null, 0);
+                sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+                originalHash = sha.Hash!;
+            }
+            finally { pool.Return(buf); }
         }
 
         // ── 2. Determine block count ──

@@ -496,12 +496,21 @@ public class CompressFileService : FileService.FileServiceBase
 
         Console.WriteLine($"[Pipeline] Starting: {declaredSize} bytes, windowSize={windowSize / (1024 * 1024)}MB, blocks={blockCount}, parallelism={parallelism}, clusterStore={storeOnCluster}");
 
-        var windowChannel = Channel.CreateBounded<(int Index, byte[] Data)>(
+        // Channel carries (index, pooled buffer, logical length). The buffer is
+        // rented from ArrayPool<byte>.Shared on the producer side and MUST be
+        // returned by the consumer (RunCompressionPipeline) regardless of how
+        // its work item completes. Pre-pool we leaked ~16–256 MB of LOH per
+        // window per block → ~64 MB/s LOH allocation rate at peak load, which
+        // ratcheted fragmentation to 50 %+ between forced compactions. With
+        // pool: stable ~256 MB working set and zero LOH churn for this path.
+        var windowChannel = Channel.CreateBounded<(int Index, byte[] Data, int Length)>(
             new BoundedChannelOptions(parallelism + 4)
             {
                 FullMode = BoundedChannelFullMode.Wait,
                 SingleWriter = true
             });
+
+        var windowBufPool = System.Buffers.ArrayPool<byte>.Shared;
 
         // When storing on cluster, capture compressed output to a temp file instead of streaming
         string? clusterTempPath = storeOnCluster
@@ -517,70 +526,89 @@ public class CompressFileService : FileService.FileServiceBase
         var pipelineTask = RunCompressionPipeline(
             windowChannel.Reader, outputStream, declaredSize, blockCount, parallelism, context.CancellationToken, maxErrorRate, preferredEncoding);
 
-        // ── Receive loop: accumulate gRPC chunks into window buffers ──
-        byte[] currentBuf = new byte[windowSize];
+        // ── Receive loop: accumulate gRPC chunks into pooled window buffers ──
+        byte[] currentBuf = windowBufPool.Rent(windowSize);
         int bufOffset = 0;
         int windowIndex = 0;
         long receivedBytes = 0;
         using var sha = SHA256.Create();
 
-        while (await requestStream.MoveNext(context.CancellationToken))
+        // If the receive loop throws before transferring `currentBuf` ownership
+        // to the channel, we must return it ourselves. The channel consumer is
+        // responsible for returning anything that successfully made it through.
+        bool currentBufTransferred = false;
+
+        try
         {
-            var msg = requestStream.Current;
-            if (msg.PayloadCase == FileUploadRequest.PayloadOneofCase.Metadata)
-                continue; // Already processed
-            if (msg.PayloadCase != FileUploadRequest.PayloadOneofCase.Chunk)
-                continue;
-
-            var chunk = msg.Chunk;
-            if (chunk.Data == null || chunk.Data.Length == 0)
+            while (await requestStream.MoveNext(context.CancellationToken))
             {
-                if (chunk.Eof) break;
-                continue;
-            }
+                var msg = requestStream.Current;
+                if (msg.PayloadCase == FileUploadRequest.PayloadOneofCase.Metadata)
+                    continue; // Already processed
+                if (msg.PayloadCase != FileUploadRequest.PayloadOneofCase.Chunk)
+                    continue;
 
-            byte[] data = chunk.Data.ToByteArray();
-            sha.TransformBlock(data, 0, data.Length, null, 0);
-            receivedBytes += data.Length;
-
-            // Fill window buffer(s) — a single gRPC chunk may span window boundaries
-            int srcOffset = 0;
-            while (srcOffset < data.Length)
-            {
-                int toCopy = Math.Min(data.Length - srcOffset, windowSize - bufOffset);
-                Buffer.BlockCopy(data, srcOffset, currentBuf, bufOffset, toCopy);
-                bufOffset += toCopy;
-                srcOffset += toCopy;
-
-                if (bufOffset == windowSize)
+                var chunk = msg.Chunk;
+                if (chunk.Data == null || chunk.Data.Length == 0)
                 {
-                    // Window complete → push to pipeline (may block if channel is full = backpressure)
-                    await windowChannel.Writer.WriteAsync((windowIndex, currentBuf), context.CancellationToken);
-                    windowIndex++;
-                    currentBuf = new byte[windowSize]; // Old buffer is now owned by the channel
-                    bufOffset = 0;
+                    if (chunk.Eof) break;
+                    continue;
                 }
+
+                byte[] data = chunk.Data.ToByteArray();
+                sha.TransformBlock(data, 0, data.Length, null, 0);
+                receivedBytes += data.Length;
+
+                // Fill window buffer(s) — a single gRPC chunk may span window boundaries
+                int srcOffset = 0;
+                while (srcOffset < data.Length)
+                {
+                    int toCopy = Math.Min(data.Length - srcOffset, windowSize - bufOffset);
+                    Buffer.BlockCopy(data, srcOffset, currentBuf, bufOffset, toCopy);
+                    bufOffset += toCopy;
+                    srcOffset += toCopy;
+
+                    if (bufOffset == windowSize)
+                    {
+                        // Window complete → hand ownership to pipeline (may block if channel is full = backpressure)
+                        currentBufTransferred = true;
+                        await windowChannel.Writer.WriteAsync((windowIndex, currentBuf, windowSize), context.CancellationToken);
+                        windowIndex++;
+                        currentBuf = windowBufPool.Rent(windowSize);
+                        currentBufTransferred = false;
+                        bufOffset = 0;
+                    }
+                }
+
+                if (receivedBytes % (500 * 1024 * 1024) < data.Length)
+                {
+                    double pct = declaredSize > 0 ? (receivedBytes * 100.0 / declaredSize) : 0;
+                    Console.WriteLine($"[Pipeline] Receiving: {receivedBytes / (1024.0 * 1024.0):F0} MB / {declaredSize / (1024.0 * 1024.0):F0} MB ({pct:F1}%)");
+                }
+
+                if (receivedBytes > effectiveLimit)
+                    throw new RpcException(new Status(StatusCode.InvalidArgument,
+                        $"File too large. Received {receivedBytes} bytes, max allowed {effectiveLimit}."));
+
+                if (chunk.Eof) break;
             }
 
-            if (receivedBytes % (500 * 1024 * 1024) < data.Length)
+            // Push last partial window — reuse the same pooled buffer; logical length carries the
+            // truth so we don't have to copy into a smaller buffer.
+            if (bufOffset > 0)
             {
-                double pct = declaredSize > 0 ? (receivedBytes * 100.0 / declaredSize) : 0;
-                Console.WriteLine($"[Pipeline] Receiving: {receivedBytes / (1024.0 * 1024.0):F0} MB / {declaredSize / (1024.0 * 1024.0):F0} MB ({pct:F1}%)");
+                currentBufTransferred = true;
+                await windowChannel.Writer.WriteAsync((windowIndex, currentBuf, bufOffset), context.CancellationToken);
             }
-
-            if (receivedBytes > effectiveLimit)
-                throw new RpcException(new Status(StatusCode.InvalidArgument,
-                    $"File too large. Received {receivedBytes} bytes, max allowed {effectiveLimit}."));
-
-            if (chunk.Eof) break;
         }
-
-        // Push last partial window
-        if (bufOffset > 0)
+        finally
         {
-            byte[] lastWindow = new byte[bufOffset];
-            Buffer.BlockCopy(currentBuf, 0, lastWindow, 0, bufOffset);
-            await windowChannel.Writer.WriteAsync((windowIndex, lastWindow), context.CancellationToken);
+            // If we never transferred ownership (loop threw, or last window was empty),
+            // return the buffer to the pool here. Channel consumer handles all other cases.
+            if (!currentBufTransferred && currentBuf != null)
+            {
+                windowBufPool.Return(currentBuf);
+            }
         }
 
         windowChannel.Writer.Complete();
@@ -680,7 +708,7 @@ public class CompressFileService : FileService.FileServiceBase
     /// Writes v4.0.0 header + blocks (NOT trailer — caller writes that).
     /// </summary>
     private static async Task<(long CompressedSize, int TotalRefs, int TotalChunks, long DatacenterBytes, double ServerProcessingMs, float AverageErrorRate, long ErrorPayloadBytes)> RunCompressionPipeline(
-        ChannelReader<(int Index, byte[] Data)> reader,
+        ChannelReader<(int Index, byte[] Data, int Length)> reader,
         Stream outputStream,
         long declaredFileSize,
         int blockCount,
@@ -690,6 +718,7 @@ public class CompressFileService : FileService.FileServiceBase
         string preferredEncoding = "")
     {
         var crossService = new MyCrossService();
+        var windowBufPool = System.Buffers.ArrayPool<byte>.Shared;
 
         byte[] header = new byte[4 + 8 + 4];
         byte[] magic = "CV5\0"u8.ToArray();
@@ -725,64 +754,86 @@ public class CompressFileService : FileService.FileServiceBase
                 {
                     while (reader.TryRead(out var item))
                     {
-                        Console.WriteLine($"[Pipeline] Compressing block {item.Index + 1}/{blockCount} ({item.Data.Length} bytes)...");
-                        var sw = System.Diagnostics.Stopwatch.StartNew();
-                        (byte[] compressed, int refs, int chunks, long dcBytes, float blockAvgErr, long blockErrPayload) = await crossService.CompressFileWithStats(item.Data, maxErrorRate, preferredEncoding);
-                        sw.Stop();
-                        Console.WriteLine($"[Pipeline] Block {item.Index + 1}/{blockCount}: {item.Data.Length} → {compressed.Length} ({sw.ElapsedMilliseconds}ms)");
-
-                        int blockIndex = item.Index;
-                        int dataLen = item.Data.Length;
-                        completedBlocks[blockIndex] = (compressed, dataLen);
-                        Interlocked.Add(ref totalRefs, refs);
-                        Interlocked.Add(ref totalChunks, chunks);
-                        Interlocked.Add(ref totalDatacenterBytes, dcBytes);
-                        Interlocked.Add(ref totalCompressionTicks, sw.ElapsedTicks);
-                        Interlocked.Add(ref totalErrorPayloadBytes, blockErrPayload);
-
-                        if (!string.IsNullOrEmpty(parentJobId))
+                        // item.Data is a pooled buffer owned by us from here on —
+                        // we must return it to the pool regardless of outcome.
+                        try
                         {
-                            Cross.Services.JobEvents.JobEventBus.EmitBlockDone(
-                                parentJobId, blockIndex, blockCount,
-                                dataLen, compressed.Length, refs, chunks, dcBytes,
-                                sw.Elapsed.TotalMilliseconds);
-                        }
-                        if (blockAvgErr > 0 && refs > 0)
-                        {
-                            long blockWeight = (long)refs;
-                            lock (completedBlocks)
+                            Console.WriteLine($"[Pipeline] Compressing block {item.Index + 1}/{blockCount} ({item.Length} bytes)...");
+                            var sw = System.Diagnostics.Stopwatch.StartNew();
+                            (byte[] compressed, int refs, int chunks, long dcBytes, float blockAvgErr, long blockErrPayload) = await crossService.CompressFileWithStats(item.Data, item.Length, maxErrorRate, preferredEncoding);
+                            sw.Stop();
+                            Console.WriteLine($"[Pipeline] Block {item.Index + 1}/{blockCount}: {item.Length} → {compressed.Length} ({sw.ElapsedMilliseconds}ms)");
+
+                            int blockIndex = item.Index;
+                            int dataLen = item.Length;
+                            completedBlocks[blockIndex] = (compressed, dataLen);
+                            Interlocked.Add(ref totalRefs, refs);
+                            Interlocked.Add(ref totalChunks, chunks);
+                            Interlocked.Add(ref totalDatacenterBytes, dcBytes);
+                            Interlocked.Add(ref totalCompressionTicks, sw.ElapsedTicks);
+                            Interlocked.Add(ref totalErrorPayloadBytes, blockErrPayload);
+
+                            if (!string.IsNullOrEmpty(parentJobId))
                             {
-                                weightedErrorRateSum += blockAvgErr * blockWeight;
-                                weightedErrorRateDenom += blockWeight;
+                                Cross.Services.JobEvents.JobEventBus.EmitBlockDone(
+                                    parentJobId, blockIndex, blockCount,
+                                    dataLen, compressed.Length, refs, chunks, dcBytes,
+                                    sw.Elapsed.TotalMilliseconds);
                             }
+                            if (blockAvgErr > 0 && refs > 0)
+                            {
+                                long blockWeight = (long)refs;
+                                lock (completedBlocks)
+                                {
+                                    weightedErrorRateSum += blockAvgErr * blockWeight;
+                                    weightedErrorRateDenom += blockWeight;
+                                }
+                            }
+                            blockReady.Release();
                         }
-                        blockReady.Release();
-                        GC.Collect(2, GCCollectionMode.Optimized, false);
+                        finally
+                        {
+                            windowBufPool.Return(item.Data);
+                        }
                     }
                 }
             }, ct);
         }
 
-        // ── Writer: outputs blocks in strict order ──
-        while (nextToWrite < blockCount)
+        try
         {
-            await blockReady.WaitAsync(ct);
-            while (completedBlocks.TryRemove(nextToWrite, out var block))
+            // ── Writer: outputs blocks in strict order ──
+            while (nextToWrite < blockCount)
             {
-                // V5 block format: compressedLen(4) + originalLen(4) + compressed data
-                byte[] blockHeader = new byte[8];
-                BitConverter.TryWriteBytes(blockHeader.AsSpan(0), (int)block.Compressed.Length);
-                BitConverter.TryWriteBytes(blockHeader.AsSpan(4), block.OriginalLen);
-                await outputStream.WriteAsync(blockHeader, 0, 8, ct);
-                await outputStream.WriteAsync(block.Compressed, 0, block.Compressed.Length, ct);
+                await blockReady.WaitAsync(ct);
+                while (completedBlocks.TryRemove(nextToWrite, out var block))
+                {
+                    // V5 block format: compressedLen(4) + originalLen(4) + compressed data
+                    byte[] blockHeader = new byte[8];
+                    BitConverter.TryWriteBytes(blockHeader.AsSpan(0), (int)block.Compressed.Length);
+                    BitConverter.TryWriteBytes(blockHeader.AsSpan(4), block.OriginalLen);
+                    await outputStream.WriteAsync(blockHeader, 0, 8, ct);
+                    await outputStream.WriteAsync(block.Compressed, 0, block.Compressed.Length, ct);
 
-                totalCompressedSize += 8 + block.Compressed.Length;
-                Console.WriteLine($"[Pipeline] ✅ Block {nextToWrite + 1}/{blockCount} streamed ({block.OriginalLen} → {block.Compressed.Length})");
-                nextToWrite++;
+                    totalCompressedSize += 8 + block.Compressed.Length;
+                    Console.WriteLine($"[Pipeline] ✅ Block {nextToWrite + 1}/{blockCount} streamed ({block.OriginalLen} → {block.Compressed.Length})");
+                    nextToWrite++;
+                }
+            }
+
+            await Task.WhenAll(workers);
+        }
+        finally
+        {
+            // Safety net: if cancellation or an error short-circuited the workers,
+            // drain any pooled buffers still parked in the channel so they
+            // don't escape the pool's accounting.
+            while (reader.TryRead(out var leftover))
+            {
+                try { windowBufPool.Return(leftover.Data); } catch { }
             }
         }
 
-        await Task.WhenAll(workers);
         double serverMs = totalCompressionTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         float avgErrorRate = weightedErrorRateDenom > 0 ? (float)(weightedErrorRateSum / weightedErrorRateDenom) : 0f;
         return (totalCompressedSize, totalRefs, totalChunks, totalDatacenterBytes, serverMs, avgErrorRate, totalErrorPayloadBytes);

@@ -14,14 +14,24 @@ static public class Misc
     private static int _cachedComponents = 0;
 
     static public List<byte[]> SplitFile(byte[] source, int chunkSize)
+        => SplitFile(source, source?.Length ?? 0, chunkSize);
+
+    /// <summary>
+    /// Overload that takes the logical length explicitly. Required for pooled
+    /// buffers (ArrayPool<byte>.Rent can return a buffer larger than requested,
+    /// so source.Length is not the actual data length).
+    /// </summary>
+    static public List<byte[]> SplitFile(byte[] source, int sourceLen, int chunkSize)
     {
         if (source == null)
             throw new ArgumentNullException(nameof(source));
         if (chunkSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(chunkSize), "Chunk size must be greater than zero.");
+        if (sourceLen < 0 || sourceLen > source.Length)
+            throw new ArgumentOutOfRangeException(nameof(sourceLen));
 
-        int totalChunks = source.Length / chunkSize;
-        int remainingBytes = source.Length % chunkSize;
+        int totalChunks = sourceLen / chunkSize;
+        int remainingBytes = sourceLen % chunkSize;
 
         List<byte[]> chunks = new List<byte[]>(totalChunks + (remainingBytes > 0 ? 1 : 0));
 

@@ -59,6 +59,12 @@ public static class RuntimeStatsEndpoint
                 // while heap_size_bytes is flat ⇒ native bloat (RocksDB / glibc /
                 // gRPC pinned buffers).
                 native_overhead_bytes   = System.Math.Max(0, p.WorkingSet64 - gc.HeapSizeBytes),
+
+                // Per-agent circuit breaker snapshot. Open or HalfOpen entries
+                // here are the leading indicator of a wedged agent and the
+                // mechanism that yesterday's "stuck" symptom was missing.
+                // Surfaced only on cross — on other components this is empty.
+                breakers = component == "cross" ? AgentRpcThrottle.Snapshot() : null,
             });
         });
     }
