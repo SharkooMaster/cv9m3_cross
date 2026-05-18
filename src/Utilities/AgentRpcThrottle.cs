@@ -75,6 +75,24 @@ public static class AgentRpcThrottle
     public static readonly int FailureThreshold = ParseEnv("AGENT_BREAKER_FAILURE_THRESHOLD", 5, 1);
     public static readonly TimeSpan CooldownPeriod = TimeSpan.FromSeconds(ParseEnv("AGENT_BREAKER_COOLDOWN_SEC", 30, 1));
 
+    // Soft per-RPC timeout. A single cross→agent RPC that hangs past this
+    // duration is treated as a synthetic failure for breaker purposes — the
+    // caller sees SlowAgentException, the breaker increments its counter,
+    // and the gate slot is released (the orphan request keeps running in the
+    // background until it naturally completes; a continuation releases the
+    // slot then). This is intentionally NOT a gRPC deadline: it does NOT
+    // cancel the inner work, so progressing-but-slow calls still complete and
+    // their RocksDB writes / vector ingests aren't half-done.
+    //
+    // 180 s default is ~30–18 000× normal BatchGet/BatchSearch latency in
+    // healthy ops, so it never trips real work. The reason we need this at
+    // all: yesterday's deadline removal eliminated false-positive cancels
+    // but also removed the only mechanism for the breaker to learn about
+    // wedged-but-not-erroring agents. Without it, the gate fills with
+    // permanent slow calls, no exception fires, breaker never trips,
+    // cluster wedges — which is the exact symptom that came back today.
+    public static readonly TimeSpan SoftTimeout = TimeSpan.FromSeconds(ParseEnv("AGENT_RPC_SOFT_TIMEOUT_SEC", 180, 1));
+
     private static readonly ConcurrentDictionary<string, AgentEntry> _entries = new();
 
     private static int ParseEnv(string name, int defaultValue, int min)
@@ -89,31 +107,79 @@ public static class AgentRpcThrottle
 
     /// <summary>
     /// Run an RPC against the given agent under the per-agent gate + breaker.
-    /// Throws <see cref="CircuitOpenException"/> immediately if the breaker
-    /// is Open. On exception the breaker counts the failure and may trip.
-    /// On success the failure counter resets.
+    ///
+    /// Failure semantics:
+    ///   • Throws <see cref="CircuitOpenException"/> immediately if the
+    ///     breaker is already Open (no gate acquired, no work attempted).
+    ///   • Throws <see cref="SlowAgentException"/> if the inner work doesn't
+    ///     return within <see cref="SoftTimeout"/>. The inner work is NOT
+    ///     cancelled — it keeps running and a continuation releases the gate
+    ///     slot once it finishes. The breaker counts it as a failure, so a
+    ///     persistently slow agent eventually trips the breaker and stops
+    ///     absorbing more work. This is the missing piece that closed the
+    ///     "agent slow but not erroring" gap.
+    ///   • Re-throws user cancellation (<see cref="OperationCanceledException"/>
+    ///     when <paramref name="ct"/> fires) without recording a failure —
+    ///     not the agent's fault.
+    ///   • Any other exception from the inner work is recorded as a failure
+    ///     and re-thrown unchanged.
     /// </summary>
     public static async Task<T> RunAsync<T>(string agentIp, Func<Task<T>> work, CancellationToken ct = default)
     {
         var entry = GetEntry(agentIp);
         entry.AdmitOrThrow();
         await entry.Gate.WaitAsync(ct).ConfigureAwait(false);
+
+        bool gateOwnedByWorkTask = false;
+        Task<T>? workTask = null;
         try
         {
-            var result = await work().ConfigureAwait(false);
-            entry.RecordSuccess();
-            return result;
-        }
-        catch (CircuitOpenException) { throw; }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch
-        {
+            workTask = work();
+            var timeoutTask = Task.Delay(SoftTimeout, ct);
+            var winner = await Task.WhenAny(workTask, timeoutTask).ConfigureAwait(false);
+
+            if (winner == workTask)
+            {
+                // Work completed (success or failure) within the soft budget.
+                try
+                {
+                    var result = await workTask.ConfigureAwait(false);
+                    entry.RecordSuccess();
+                    return result;
+                }
+                catch (CircuitOpenException) { throw; }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                catch
+                {
+                    entry.RecordFailure();
+                    throw;
+                }
+            }
+
+            // Soft timeout fired (or user cancelled while we were waiting).
+            if (ct.IsCancellationRequested)
+            {
+                // User cancellation — not the agent's fault. Don't record
+                // failure. The orphaned work will observe ct via the gRPC
+                // call's own cancellation propagation and complete shortly;
+                // a continuation releases the gate slot when it does.
+                AttachOrphanCleanup(entry, workTask);
+                gateOwnedByWorkTask = true;
+                ct.ThrowIfCancellationRequested();
+            }
+
+            // Real soft timeout. Record failure (may trip breaker) and surface
+            // a SlowAgentException so the caller's retry loop can back off and
+            // give the agent room to recover. The orphan keeps running; its
+            // eventual completion releases the gate slot.
             entry.RecordFailure();
-            throw;
+            AttachOrphanCleanup(entry, workTask);
+            gateOwnedByWorkTask = true;
+            throw new SlowAgentException(agentIp, SoftTimeout);
         }
         finally
         {
-            entry.Gate.Release();
+            if (!gateOwnedByWorkTask) entry.Gate.Release();
         }
     }
 
@@ -122,22 +188,63 @@ public static class AgentRpcThrottle
         var entry = GetEntry(agentIp);
         entry.AdmitOrThrow();
         await entry.Gate.WaitAsync(ct).ConfigureAwait(false);
+
+        bool gateOwnedByWorkTask = false;
+        Task? workTask = null;
         try
         {
-            await work().ConfigureAwait(false);
-            entry.RecordSuccess();
-        }
-        catch (CircuitOpenException) { throw; }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch
-        {
+            workTask = work();
+            var timeoutTask = Task.Delay(SoftTimeout, ct);
+            var winner = await Task.WhenAny(workTask, timeoutTask).ConfigureAwait(false);
+
+            if (winner == workTask)
+            {
+                try
+                {
+                    await workTask.ConfigureAwait(false);
+                    entry.RecordSuccess();
+                    return;
+                }
+                catch (CircuitOpenException) { throw; }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                catch
+                {
+                    entry.RecordFailure();
+                    throw;
+                }
+            }
+
+            if (ct.IsCancellationRequested)
+            {
+                AttachOrphanCleanup(entry, workTask);
+                gateOwnedByWorkTask = true;
+                ct.ThrowIfCancellationRequested();
+            }
+
             entry.RecordFailure();
-            throw;
+            AttachOrphanCleanup(entry, workTask);
+            gateOwnedByWorkTask = true;
+            throw new SlowAgentException(agentIp, SoftTimeout);
         }
         finally
         {
-            entry.Gate.Release();
+            if (!gateOwnedByWorkTask) entry.Gate.Release();
         }
+    }
+
+    /// <summary>
+    /// Attach a fire-and-forget continuation that releases the gate slot
+    /// when the orphaned work task eventually completes. Also observes any
+    /// exception the orphan throws so it doesn't surface as an
+    /// UnobservedTaskException on the finalizer thread.
+    /// </summary>
+    private static void AttachOrphanCleanup(AgentEntry entry, Task workTask)
+    {
+        _ = workTask.ContinueWith(t =>
+        {
+            try { entry.Gate.Release(); } catch { /* gate may already be disposed via EvictGate */ }
+            if (t.IsFaulted) _ = t.Exception; // observe to suppress UnobservedTaskException
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
     /// <summary>
@@ -211,6 +318,25 @@ public static class AgentRpcThrottle
     {
         public CircuitOpenException(string agentIp, string reason)
             : base($"Circuit open for agent {agentIp}: {reason}") { }
+    }
+
+    /// <summary>
+    /// Thrown by <see cref="RunAsync{T}"/> when the inner work doesn't complete
+    /// within <see cref="SoftTimeout"/>. The inner work is NOT cancelled — it
+    /// keeps running in the background — but the caller observes a synthetic
+    /// failure so its retry loop can advance and the breaker counts it
+    /// toward a trip. This is what catches "agent slow but not erroring".
+    /// </summary>
+    public sealed class SlowAgentException : Exception
+    {
+        public string AgentIp { get; }
+        public TimeSpan Budget { get; }
+        public SlowAgentException(string agentIp, TimeSpan budget)
+            : base($"Slow agent {agentIp}: no response within {budget.TotalSeconds:F0}s soft timeout (work continues in background)")
+        {
+            AgentIp = agentIp;
+            Budget = budget;
+        }
     }
 
     // ── Per-agent state ───────────────────────────────────────────────────

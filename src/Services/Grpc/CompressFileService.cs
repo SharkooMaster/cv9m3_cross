@@ -150,6 +150,35 @@ public class CompressFileService : FileService.FileServiceBase
         int.TryParse(Environment.GetEnvironmentVariable("CROSS_MAX_CONCURRENT"), out var mc) ? mc : 4);
     private static readonly SemaphoreSlim _compressionGate = new(MaxConcurrentCompressions, MaxConcurrentCompressions);
 
+    // ── Dedicated ArrayPool for windowed compression buffers ──
+    // Why this is its own pool: ArrayPool<byte>.Shared has a hard ceiling of
+    // 1 MiB on the pooled array size. For anything larger Rent() silently
+    // falls back to `new byte[size]` (returning a non-pooled array) and
+    // Return() discards it. Our windows are 4–64 MiB, so the Shared pool
+    // gave us zero reuse — every window allocation hit the LOH, which is
+    // exactly the problem we were trying to solve. ArrayPool<byte>.Create
+    // returns a real pool with configurable size limits.
+    //
+    // Sizing:
+    //   maxArrayLength: 128 MiB    — covers CROSS_WINDOW_SIZE_MB up to 128,
+    //                                future-proofs without absurd overhead.
+    //   maxArraysPerBucket: 8      — caps pinned memory at
+    //                                ~8 × 128 MiB = 1 GiB worst case per
+    //                                cross pod. In practice, with 2 files in
+    //                                flight × parallelism 2, channel cap 6,
+    //                                we keep ~16 buffers active. At the
+    //                                benchmark's 4 MiB window size that's
+    //                                ~64 MiB resident — tiny.
+    //
+    // Buckets are powers of 2 from 16 B up to maxArrayLength, so a 4 MiB
+    // window goes to the 4 MiB bucket cleanly; a 64 MiB window goes to the
+    // 64 MiB bucket. No internal fragmentation when window size is a power
+    // of 2 (which it always is in our config).
+    private static readonly System.Buffers.ArrayPool<byte> _windowBufPool =
+        System.Buffers.ArrayPool<byte>.Create(
+            maxArrayLength: 128 * 1024 * 1024,
+            maxArraysPerBucket: 8);
+
     private static long GetMaxUploadBytes()
     {
         var raw = Environment.GetEnvironmentVariable("CROSS_MAX_UPLOAD_BYTES");
@@ -497,12 +526,13 @@ public class CompressFileService : FileService.FileServiceBase
         Console.WriteLine($"[Pipeline] Starting: {declaredSize} bytes, windowSize={windowSize / (1024 * 1024)}MB, blocks={blockCount}, parallelism={parallelism}, clusterStore={storeOnCluster}");
 
         // Channel carries (index, pooled buffer, logical length). The buffer is
-        // rented from ArrayPool<byte>.Shared on the producer side and MUST be
-        // returned by the consumer (RunCompressionPipeline) regardless of how
-        // its work item completes. Pre-pool we leaked ~16–256 MB of LOH per
-        // window per block → ~64 MB/s LOH allocation rate at peak load, which
-        // ratcheted fragmentation to 50 %+ between forced compactions. With
-        // pool: stable ~256 MB working set and zero LOH churn for this path.
+        // rented from the dedicated window-buffer pool on the producer side and
+        // MUST be returned by the consumer (RunCompressionPipeline) regardless
+        // of how its work item completes. Pre-pool every window allocation hit
+        // the LOH directly (~64 MiB/s allocation rate at peak), driving frag
+        // to 50%+ between forced compactions. With the dedicated pool below,
+        // we recycle the same ~16 buffers across all in-flight windows and
+        // LOH churn for this path drops to zero.
         var windowChannel = Channel.CreateBounded<(int Index, byte[] Data, int Length)>(
             new BoundedChannelOptions(parallelism + 4)
             {
@@ -510,7 +540,7 @@ public class CompressFileService : FileService.FileServiceBase
                 SingleWriter = true
             });
 
-        var windowBufPool = System.Buffers.ArrayPool<byte>.Shared;
+        var windowBufPool = _windowBufPool;
 
         // When storing on cluster, capture compressed output to a temp file instead of streaming
         string? clusterTempPath = storeOnCluster
@@ -718,7 +748,10 @@ public class CompressFileService : FileService.FileServiceBase
         string preferredEncoding = "")
     {
         var crossService = new MyCrossService();
-        var windowBufPool = System.Buffers.ArrayPool<byte>.Shared;
+        // Must be the same dedicated pool the producer rented from (see
+        // CompressFileService._windowBufPool) — Returning to the Shared pool
+        // would silently drop large arrays and corrupt accounting.
+        var windowBufPool = _windowBufPool;
 
         byte[] header = new byte[4 + 8 + 4];
         byte[] magic = "CV5\0"u8.ToArray();
