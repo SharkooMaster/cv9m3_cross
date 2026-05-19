@@ -1,9 +1,11 @@
 {
   "version": 2,
-  "dgSpecHash": "Sh0pcTkag24kcNQ6yqaMjmmr1V9SbC+Njcum279u1dS6fAaQPRClB137zzluXrzD+PIKLGHZdToA3r7227z6tQ==",
+  "dgSpecHash": "43QpTIvLWpPsThCqamSSKUhia86DdRWnuoOrkKlUwQzbs2p2ZdIpdflfRL7e+HQk7igakXViF/Sy19EyQ6Ceww==",
   "success": true,
   "projectFilePath": "/home/sharku/Documents/Projects/CrossV9/cross/cross.csproj",
   "expectedPackageFiles": [
+    "/home/sharku/.nuget/packages/dotnet-etcd/7.1.1/dotnet-etcd.7.1.1.nupkg.sha512",
+    "/home/sharku/.nuget/packages/google.api.commonprotos/2.15.0/google.api.commonprotos.2.15.0.nupkg.sha512",
     "/home/sharku/.nuget/packages/google.protobuf/3.29.3/google.protobuf.3.29.3.nupkg.sha512",
     "/home/sharku/.nuget/packages/grpc.aspnetcore/2.67.0/grpc.aspnetcore.2.67.0.nupkg.sha512",
     "/home/sharku/.nuget/packages/grpc.aspnetcore.server/2.67.0/grpc.aspnetcore.server.2.67.0.nupkg.sha512",

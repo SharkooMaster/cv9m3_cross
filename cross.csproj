@@ -21,6 +21,11 @@
     </PackageReference>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <PackageReference Include="ZstdSharp.Port" Version="0.8.7" />
+    <!-- dotnet-etcd: cross subscribes to /agents/ in etcd to get a
+         consistent, atomic agent-membership view for RendezvousRouter.
+         Same package agent and gateway already use, kept on the same
+         version line. -->
+    <PackageReference Include="dotnet-etcd" Version="7.1.1" />
   </ItemGroup>
 
   <ItemGroup>

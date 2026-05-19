@@ -83,6 +83,10 @@
             "ZstdSharp.Port": {
               "target": "Package",
               "version": "[0.8.7, )"
+            },
+            "dotnet-etcd": {
+              "target": "Package",
+              "version": "[7.1.1, )"
             }
           },
           "imports": [

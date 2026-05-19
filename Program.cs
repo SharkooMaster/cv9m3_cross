@@ -39,6 +39,14 @@ builder.Services.AddOpenTelemetry()
 
 builder.Services.AddHostedService<AgentHealthWatcher>();
 builder.Services.AddHostedService<Cross.Services.JobEvents.JobEventForwarderService>();
+
+// EtcdMembershipWatcher subscribes to /agents/ in etcd and pushes the
+// resulting member list into RendezvousRouter. This makes routing decisions
+// globally consistent across all cross pods, which is what fixes the
+// INTEGRITY_DECOMPRESS class of failures rooted in cross-pod routing drift.
+// Started early in the boot sequence so the initial snapshot lands before
+// the first compress RPC arrives.
+builder.Services.AddHostedService<Cross.Utilities.EtcdMembershipWatcher>();
 if (Globals.EnableCcfBackgroundServices)
 {
     builder.Services.AddHostedService<Cross.Services.CcfStore.CcfPackOptimizerService>();

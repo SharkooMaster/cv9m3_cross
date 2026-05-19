@@ -36,9 +36,78 @@ public static class RendezvousRouter
 
     private static long _resolvedAtTicks = 0;
 
+    // ── Etcd-authoritative membership ──
+    // When EtcdMembershipWatcher publishes a snapshot here we treat it as the
+    // single source of truth and skip the DNS+GetNodeInfo path entirely. The
+    // watcher pushes on every change event from etcd, so every cross pod
+    // observes the same linearised member list at the same time → no more
+    // cross-pod routing drift, which is what caused INTEGRITY_DECOMPRESS.
+    //
+    // If the watcher hasn't published in EtcdStalenessSeconds we treat etcd
+    // as unhealthy and fall back to the legacy DNS+GetNodeInfo path so the
+    // system never goes routing-blind. The watcher republishes on reconnect.
+    private static long _etcdPublishedAtTicks = 0;
+    private const int EtcdStalenessSeconds = 60;
+
+    /// <summary>
+    /// Atomically swap in a membership snapshot from etcd.
+    /// Called by EtcdMembershipWatcher on every /agents/ event.
+    /// nodeToIp keys are pod names (StatefulSet ordinal), values are pod IPs.
+    /// </summary>
+    public static void SetMembershipFromEtcd(IReadOnlyDictionary<string, string> nodeToIp)
+    {
+        if (nodeToIp == null || nodeToIp.Count == 0)
+        {
+            // Treat "no members" as "etcd has nothing to say" rather than a
+            // forced wipe — we don't want a transient watcher race to drop
+            // every agent and freeze routing. If the watcher really observes
+            // an empty membership it will keep republishing and the legacy
+            // DNS fallback will pick the same set up anyway.
+            Console.WriteLine("[RendezvousRouter] etcd published empty membership — keeping previous view");
+            return;
+        }
+
+        var snapshot = nodeToIp.ToDictionary(kv => kv.Key, kv => kv.Value);
+        var sortedNames = snapshot.Keys.OrderBy(x => x, StringComparer.Ordinal).ToArray();
+        var nameBytes = sortedNames.Select(n => Encoding.UTF8.GetBytes(n)).ToArray();
+        var ips = sortedNames.Select(n => snapshot[n]).ToArray();
+
+        lock (_lock)
+        {
+            bool changed =
+                !sortedNames.SequenceEqual(_nodeNames) ||
+                _nodeToIp.Count != snapshot.Count ||
+                snapshot.Any(kv => !_nodeToIp.TryGetValue(kv.Key, out var prev) || prev != kv.Value);
+
+            _nodeNames = sortedNames;
+            _nodeNameBytes = nameBytes;
+            _nodeToIp = snapshot;
+            _agentIps = ips;
+            Interlocked.Exchange(ref _resolvedAtTicks, DateTime.UtcNow.Ticks);
+            Interlocked.Exchange(ref _etcdPublishedAtTicks, DateTime.UtcNow.Ticks);
+
+            if (changed)
+            {
+                var info = string.Join(", ", sortedNames.Select(n => $"{n}={snapshot[n]}"));
+                Console.WriteLine($"[RendezvousRouter] etcd membership ({sortedNames.Length}): [{info}]");
+            }
+        }
+    }
+
+    /// <summary>
+    /// True if etcd has pushed membership within EtcdStalenessSeconds.
+    /// When true, PickAgent/GetAgents skip the DNS+GetNodeInfo path entirely.
+    /// </summary>
+    private static bool IsEtcdFresh()
+    {
+        long t = Interlocked.Read(ref _etcdPublishedAtTicks);
+        return t != 0 && (DateTime.UtcNow.Ticks - t) < TimeSpan.FromSeconds(EtcdStalenessSeconds).Ticks;
+    }
+
     /// <summary>
     /// Force the next GetAgents() call to re-resolve DNS, bypassing the 15s cache.
     /// Called by AgentHealthWatcher on each health-check tick.
+    /// No-op when etcd is the authoritative source (the watcher pushes on change).
     /// </summary>
     public static void ForceRefresh()
     {
@@ -76,18 +145,29 @@ public static class RendezvousRouter
     {
         var nodeNames = _nodeNames;
 
-        // ── CRITICAL: Always check cache staleness, not just empty state. ──
-        // BUG FIX: Previously only refreshed when _nodeNames.Length == 0.
-        // If initial DNS resolved only 1 agent (others not ready yet), PickAgent
-        // would PERMANENTLY route everything to that single agent — never re-resolving.
-        // DateTime.UtcNow.Ticks + Interlocked.Read ≈ 5ns — negligible even at 4M calls.
-        long resolvedTicks = Interlocked.Read(ref _resolvedAtTicks);
-        bool stale = (DateTime.UtcNow.Ticks - resolvedTicks) >= TimeSpan.FromSeconds(15).Ticks;
-        if (nodeNames.Length == 0 || stale)
+        // When etcd is the authoritative source, the watcher pushes on every
+        // change → the in-memory snapshot is already up to date. We MUST NOT
+        // fall through to GetAgents() (which would do DNS+GetNodeInfo with
+        // independent timing per cross pod and re-introduce the drift bug).
+        if (IsEtcdFresh())
         {
-            GetAgents();
-            nodeNames = _nodeNames;
             if (nodeNames.Length == 0) return Globals.AgentsLoadbalancer;
+        }
+        else
+        {
+            // ── Legacy DNS+GetNodeInfo path (used when etcd is down) ──
+            // CRITICAL: Always check cache staleness, not just empty state.
+            // BUG FIX: Previously only refreshed when _nodeNames.Length == 0.
+            // If initial DNS resolved only 1 agent (others not ready yet), PickAgent
+            // would PERMANENTLY route everything to that single agent — never re-resolving.
+            long resolvedTicks = Interlocked.Read(ref _resolvedAtTicks);
+            bool stale = (DateTime.UtcNow.Ticks - resolvedTicks) >= TimeSpan.FromSeconds(15).Ticks;
+            if (nodeNames.Length == 0 || stale)
+            {
+                GetAgents();
+                nodeNames = _nodeNames;
+                if (nodeNames.Length == 0) return Globals.AgentsLoadbalancer;
+            }
         }
         if (nodeNames.Length == 1)
         {
@@ -130,6 +210,14 @@ public static class RendezvousRouter
     /// </summary>
     public static string[] GetAgents()
     {
+        // ── Etcd-authoritative short-circuit ──
+        // If the watcher has pushed within the staleness window, the in-memory
+        // snapshot is the source of truth. Skip DNS entirely — it would race
+        // with what etcd already published and could revert membership to a
+        // stale view when GetNodeInfo times out on a transiently slow agent.
+        if (IsEtcdFresh())
+            return _agentIps.Length > 0 ? _agentIps : new[] { Globals.AgentsLoadbalancer };
+
         long resolvedTicks = Interlocked.Read(ref _resolvedAtTicks);
         if (_nodeNames.Length > 0 && (DateTime.UtcNow.Ticks - resolvedTicks) < TimeSpan.FromSeconds(15).Ticks)
             return _agentIps;
