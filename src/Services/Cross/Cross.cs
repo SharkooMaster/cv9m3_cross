@@ -45,6 +45,25 @@ public class CrossService : ICross
 
     private static int BitCount(byte b) => System.Numerics.BitOperations.PopCount((uint)b);
 
+    private static int ParseEnvInt(string name, int defaultValue, int min)
+    {
+        var raw = Environment.GetEnvironmentVariable(name);
+        if (int.TryParse(raw, out var v) && v >= min) return v;
+        return defaultValue;
+    }
+
+    private static string TakeShort(string s, int n) =>
+        string.IsNullOrEmpty(s) ? "" : (s.Length <= n ? s : s.Substring(0, n));
+
+    private static string Sha256HexLocal(byte[] data)
+    {
+        Span<byte> hash = stackalloc byte[32];
+        System.Security.Cryptography.SHA256.HashData(data, hash);
+        var sb = new StringBuilder(64);
+        for (int i = 0; i < hash.Length; i++) sb.Append(hash[i].ToString("x2"));
+        return sb.ToString();
+    }
+
     private static void WriteVarint(Stream s, uint value)
     {
         while (value >= 0x80)
@@ -2699,6 +2718,139 @@ public class CrossService : ICross
                     sorted[i].BucketKey = sorted[rep].BucketKey;
                     sorted[i].StorageGuid = sorted[rep].StorageGuid ?? "";
                     sorted[i].Chunk = sorted[rep].Chunk;
+                }
+            }
+        }
+
+        // ── Integrity check (3/3): RefRoundTrip ──
+        //
+        // The StoreRoundTrip and FetchedBases checks above prove that
+        // sha256(sorted[i].Chunk) == sorted[i].StorageGuid — i.e. the bytes
+        // we hold hash to the guid we hold. They do NOT prove the round-trip
+        // that decompression actually performs:
+        //
+        //   decompress: ref (BucketId, BucketKey)
+        //     → agent looks up storageGuid' from those coordinates
+        //     → fetches bytes for storageGuid'
+        //     → applies our encoded diff on top.
+        //
+        // For the file to round-trip, those decompress-side bytes must equal
+        // the bytes we encoded the diff against (sorted[i].Chunk). If the
+        // agent's (BucketId, BucketKey) → storageGuid mapping is stale, lazy,
+        // or out of sync with the in-memory snapshot the search returned, the
+        // bytes returned at decompress will be different — and the whole-block
+        // SHA fails with "block N/M: exp=... got=...".
+        //
+        // This check simulates that lookup at compress time for a random
+        // sample of dedup-hit chunks. Sample budget is tunable via
+        // INTEGRITY_REF_ROUNDTRIP_SAMPLE (default 128). Mosaic chunks are
+        // excluded — they have their own multi-donor decode contract.
+        if (global::Cross.Services.JobEvents.IntegrityDiagnostics.Enabled)
+        {
+            int sampleBudget = ParseEnvInt("INTEGRITY_REF_ROUNDTRIP_SAMPLE", 128, 1);
+            var eligible = new List<int>();
+            var mosaicSetForRef = new HashSet<int>(mosaicInfos.Keys);
+            for (int i = 0; i < sorted.Length; i++)
+            {
+                var r = sorted[i];
+                if (r == null || r.NeedToStore || r.BucketId == 0) continue;
+                if (mosaicSetForRef.Contains(i)) continue;
+                if (r.Chunk == null || r.Chunk.Length == 0) continue;
+                eligible.Add(i);
+            }
+
+            if (eligible.Count > 0)
+            {
+                // Pseudo-random but deterministic sample (Fisher–Yates partial shuffle)
+                // so repeated runs over the same data probe the same indices and we
+                // can correlate findings across logs.
+                var rng = new Random(0x5EED5);
+                int take = Math.Min(sampleBudget, eligible.Count);
+                for (int s = 0; s < take; s++)
+                {
+                    int swap = s + rng.Next(eligible.Count - s);
+                    (eligible[s], eligible[swap]) = (eligible[swap], eligible[s]);
+                }
+                var sampledIndices = eligible.Take(take).ToList();
+
+                var swRT = Stopwatch.StartNew();
+                var fetchedBytes = new byte[sorted.Length][];
+                var rtTasks = sampledIndices.Select(async idx =>
+                {
+                    try
+                    {
+                        var r = sorted[idx];
+                        string? targetAgent = r.TargetAgent;
+                        var got = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                            r.BucketId, r.BucketKey,
+                            targetAgent: string.IsNullOrWhiteSpace(targetAgent) ? null : targetAgent);
+                        if (got != null && got.Length > 0)
+                            fetchedBytes[idx] = got;
+                    }
+                    catch { /* leave null — counted as fetch-failure mismatch */ }
+                }).ToList();
+                await Task.WhenAll(rtTasks);
+
+                int total = 0;
+                int mismatches = 0;
+                int fetchFailures = 0;
+                string? firstDetail = null;
+                foreach (var idx in sampledIndices)
+                {
+                    var r = sorted[idx];
+                    byte[]? got = fetchedBytes[idx];
+                    if (got == null || got.Length == 0)
+                    {
+                        fetchFailures++;
+                        mismatches++;
+                        total++;
+                        if (firstDetail == null)
+                            firstDetail = $"idx={idx} bk=({r.BucketId},{r.BucketKey}) FETCH_FAIL exp_guid={TakeShort(r.StorageGuid ?? "", 16)}";
+                        continue;
+                    }
+                    total++;
+                    // ToByteArray() copies the ByteString into a fresh array.
+                    // We can't use .Span here because the enclosing method is
+                    // async (C# disallows ref-struct locals in async bodies).
+                    byte[] expected = r.Chunk!.ToByteArray();
+                    bool equal = got.Length == expected.Length
+                                 && got.AsSpan().SequenceEqual(expected);
+                    if (!equal)
+                    {
+                        mismatches++;
+                        if (firstDetail == null)
+                        {
+                            string expHash = Sha256HexLocal(expected);
+                            string gotHash = Sha256HexLocal(got);
+                            firstDetail =
+                                $"idx={idx} bk=({r.BucketId},{r.BucketKey}) " +
+                                $"exp_guid={TakeShort(r.StorageGuid ?? "", 16)} " +
+                                $"got_hash={TakeShort(gotHash, 16)} " +
+                                $"exp_hash={TakeShort(expHash, 16)} " +
+                                $"sizes exp={expected.Length} got={got.Length}";
+                        }
+                    }
+                }
+                swRT.Stop();
+
+                global::Cross.Services.JobEvents.JobEventBus.EmitStageDone(
+                    "IntegrityCheck:RefRoundTrip",
+                    swRT.Elapsed.TotalMilliseconds,
+                    chunkCount: total,
+                    bucketCount: mismatches,
+                    bytes: (ulong)fetchFailures);
+
+                if (mismatches > 0)
+                {
+                    Console.WriteLine(
+                        $"[Integrity] ❌ RefRoundTrip: {mismatches}/{total} mismatch " +
+                        $"({fetchFailures} fetch-fail) — sample={take} eligible={eligible.Count} — {firstDetail}");
+                }
+                else
+                {
+                    Console.WriteLine(
+                        $"[Integrity] ✓ RefRoundTrip: {total} verified (sample={take}/{eligible.Count}) " +
+                        $"in {swRT.Elapsed.TotalMilliseconds:F1}ms");
                 }
             }
         }
