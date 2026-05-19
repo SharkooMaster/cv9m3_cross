@@ -1703,9 +1703,24 @@ public class CrossService : ICross
 
                                     int freshlyStored = 0;
                                     int dedupedAtStore = 0;
+                                    int batchStoreFailures = 0;
                                     for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
                                     {
                                         var storeRes = batchRes.Results[j];
+
+                                        // Per-item failure signal from the agent. The BatchStore
+                                        // handler swallows per-item exceptions and returns
+                                        // Id=0/Index=0; without this branch cross would happily
+                                        // record a zero-ref in the CCF and silently corrupt the
+                                        // chunk. Skip the merge and leave the existing response
+                                        // intact so later passes (or a higher-level retry) can
+                                        // pick it up; we also count these for diagnostics.
+                                        if (storeRes.Id == 0 && storeRes.Index == 0)
+                                        {
+                                            batchStoreFailures++;
+                                            continue;
+                                        }
+
                                         batchItems[j].response.BucketId = storeRes.Id;
                                         batchItems[j].response.BucketKey = storeRes.Index;
                                         batchItems[j].response.StorageGuid = storeRes.StorageGuid ?? "";
@@ -1723,6 +1738,19 @@ public class CrossService : ICross
                                         {
                                             freshlyStored++;
                                         }
+                                    }
+                                    if (batchStoreFailures > 0)
+                                    {
+                                        Console.WriteLine(
+                                            $"[Compress] BatchStore to {storeAgent}: {batchStoreFailures} per-item failures (agent returned Id=0/Index=0); these rows will not be merged");
+                                        // Surface in the dashboard's integrity track so it shows
+                                        // up next to the round-trip mismatches.
+                                        global::Cross.Services.JobEvents.JobEventBus.EmitStageDone(
+                                            "IntegrityCheck:BatchStoreFailure",
+                                            0,
+                                            chunkCount: batchItems.Count,
+                                            bucketCount: batchStoreFailures,
+                                            bytes: 0);
                                     }
                                     Interlocked.Add(ref totalStored, freshlyStored);
                                     if (dedupedAtStore > 0)
