@@ -1764,33 +1764,55 @@ public class CrossService : ICross
         // ── Integrity check (1/3): verify that every storeGuid the agents
         // gave us actually equals SHA256(chunkBytesWeSent) for store-path
         // entries and SHA256(agentBaseChunk) for dedup-at-store matches.
-        // If this ever fails, the agent's response is lying about what it
-        // stored and the resulting CCF cannot decompress. ──
+        //
+        // Split into two stages so we can tell *which* path produces any
+        // mismatches:
+        //   StoreRoundTrip:NewStore  — NeedToStore=true rows. Compares the
+        //     bytes cross sent against the storage_guid the agent returned.
+        //     A mismatch here means either (a) the agent silently dedup'd
+        //     but cross didn't flip NeedToStore back to false (bookkeeping
+        //     bug, benign at decompress time), or (b) the agent actually
+        //     stored different bytes than what was sent (real corruption).
+        //   StoreRoundTrip:DedupHit  — NeedToStore=false rows. Compares the
+        //     base chunk the agent returned against its storage_guid. A
+        //     mismatch here means the agent's response is internally
+        //     inconsistent (would actually break decompress).
         if (global::Cross.Services.JobEvents.IntegrityDiagnostics.Enabled)
         {
-            var swIntegrity = Stopwatch.StartNew();
             var sortedSnapshot = sorted;
             var chunkMapSnapshot = chunkMap;
-            var result = global::Cross.Services.JobEvents.IntegrityDiagnostics.VerifyHashes(
+
+            var swNew = Stopwatch.StartNew();
+            var newStoreResult = global::Cross.Services.JobEvents.IntegrityDiagnostics.VerifyHashes(
                 sortedSnapshot.Length,
                 i =>
                 {
                     var r = sortedSnapshot[i];
-                    if (r == null || string.IsNullOrEmpty(r.StorageGuid))
+                    if (r == null || string.IsNullOrEmpty(r.StorageGuid) || !r.NeedToStore)
                         return (null, null);
-                    if (r.NeedToStore)
-                    {
-                        if (chunkMapSnapshot.TryGetValue(i, out var ourChunk) && ourChunk != null && ourChunk.Length > 0)
-                            return (r.StorageGuid, ourChunk);
+                    if (chunkMapSnapshot.TryGetValue(i, out var ourChunk) && ourChunk != null && ourChunk.Length > 0)
+                        return (r.StorageGuid, ourChunk);
+                    return (null, null);
+                });
+            swNew.Stop();
+            global::Cross.Services.JobEvents.IntegrityDiagnostics.Emit(
+                "StoreRoundTrip:NewStore", newStoreResult, swNew.Elapsed.TotalMilliseconds);
+
+            var swDedup = Stopwatch.StartNew();
+            var dedupResult = global::Cross.Services.JobEvents.IntegrityDiagnostics.VerifyHashes(
+                sortedSnapshot.Length,
+                i =>
+                {
+                    var r = sortedSnapshot[i];
+                    if (r == null || string.IsNullOrEmpty(r.StorageGuid) || r.NeedToStore)
                         return (null, null);
-                    }
                     if (r.Chunk != null && r.Chunk.Length > 0)
                         return (r.StorageGuid, r.Chunk.ToByteArray());
                     return (null, null);
                 });
-            swIntegrity.Stop();
+            swDedup.Stop();
             global::Cross.Services.JobEvents.IntegrityDiagnostics.Emit(
-                "StoreRoundTrip", result, swIntegrity.Elapsed.TotalMilliseconds);
+                "StoreRoundTrip:DedupHit", dedupResult, swDedup.Elapsed.TotalMilliseconds);
         }
 
         // ── Post-store: clean up mosaic entries for chunks deduped at store time ──
@@ -1985,8 +2007,25 @@ public class CrossService : ICross
                                 item.resp.BucketId = storeRes.Id;
                                 item.resp.BucketKey = storeRes.Index;
                                 item.resp.StorageGuid = storeRes.StorageGuid ?? "";
-                                item.resp.NeedToStore = true;
-                                item.resp.Similarity = 1.0f; // base == original → empty diff
+                                // If the agent silently similarity-dedup'd the second store, the
+                                // returned storage_guid is the BASE chunk's GUID — not sha256 of
+                                // the bytes we just sent. Reflect that in our bookkeeping so the
+                                // CCF references the right base and the integrity diagnostic
+                                // doesn't fire a false positive. (See the matching logic at the
+                                // primary BatchStore handler above.)
+                                if (storeRes.WasDeduplicated)
+                                {
+                                    item.resp.NeedToStore = false;
+                                    item.resp.Duplicate = true;
+                                    item.resp.Similarity = storeRes.Similarity;
+                                    if (storeRes.BaseChunk != null && storeRes.BaseChunk.Length > 0)
+                                        item.resp.Chunk = storeRes.BaseChunk;
+                                }
+                                else
+                                {
+                                    item.resp.NeedToStore = true;
+                                    item.resp.Similarity = 1.0f; // base == original → empty diff
+                                }
                             });
                         }
                         catch

@@ -37,6 +37,9 @@ public static class IntegrityDiagnostics
         int total = 0;
         int mismatches = 0;
         string? firstMismatch = null;
+        int sampleSize = 0;
+        // Track the first-byte distribution of mismatched chunks so the operator
+        // can tell at a glance whether they're truncated, zero-filled, etc.
 
         for (int i = 0; i < count; i++)
         {
@@ -47,12 +50,17 @@ public static class IntegrityDiagnostics
             if (!string.Equals(actual, guid, StringComparison.OrdinalIgnoreCase))
             {
                 mismatches++;
-                firstMismatch ??=
-                    $"idx={i} expected={Take(guid, 16)} got={Take(actual, 16)} ({bytes.Length}B)";
+                if (firstMismatch == null)
+                {
+                    sampleSize = bytes.Length;
+                    string head = BytesHead(bytes, 8);
+                    firstMismatch =
+                        $"idx={i} exp={Take(guid, 16)} got={Take(actual, 16)} {bytes.Length}B head[{head}]";
+                }
             }
         }
 
-        return new Result(total, mismatches, firstMismatch ?? $"ok ({total} verified)");
+        return new Result(total, mismatches, firstMismatch ?? $"ok ({total} verified, {sampleSize}B)");
     }
 
     /// <summary>
@@ -108,4 +116,13 @@ public static class IntegrityDiagnostics
     }
 
     private static string Take(string s, int n) => s.Length <= n ? s : s.Substring(0, n);
+
+    private static string BytesHead(byte[] data, int n)
+    {
+        int take = Math.Min(n, data.Length);
+        var sb = new StringBuilder(take * 2 + 2);
+        for (int i = 0; i < take; i++) sb.Append(data[i].ToString("x2"));
+        if (data.Length > take) sb.Append("..");
+        return sb.ToString();
+    }
 }
