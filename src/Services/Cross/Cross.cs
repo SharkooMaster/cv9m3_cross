@@ -1761,6 +1761,38 @@ public class CrossService : ICross
                 ("agents", storeGroups.Count), ("chunks_stored", totalStored));
         }
 
+        // ── Integrity check (1/3): verify that every storeGuid the agents
+        // gave us actually equals SHA256(chunkBytesWeSent) for store-path
+        // entries and SHA256(agentBaseChunk) for dedup-at-store matches.
+        // If this ever fails, the agent's response is lying about what it
+        // stored and the resulting CCF cannot decompress. ──
+        if (global::Cross.Services.JobEvents.IntegrityDiagnostics.Enabled)
+        {
+            var swIntegrity = Stopwatch.StartNew();
+            var sortedSnapshot = sorted;
+            var chunkMapSnapshot = chunkMap;
+            var result = global::Cross.Services.JobEvents.IntegrityDiagnostics.VerifyHashes(
+                sortedSnapshot.Length,
+                i =>
+                {
+                    var r = sortedSnapshot[i];
+                    if (r == null || string.IsNullOrEmpty(r.StorageGuid))
+                        return (null, null);
+                    if (r.NeedToStore)
+                    {
+                        if (chunkMapSnapshot.TryGetValue(i, out var ourChunk) && ourChunk != null && ourChunk.Length > 0)
+                            return (r.StorageGuid, ourChunk);
+                        return (null, null);
+                    }
+                    if (r.Chunk != null && r.Chunk.Length > 0)
+                        return (r.StorageGuid, r.Chunk.ToByteArray());
+                    return (null, null);
+                });
+            swIntegrity.Stop();
+            global::Cross.Services.JobEvents.IntegrityDiagnostics.Emit(
+                "StoreRoundTrip", result, swIntegrity.Elapsed.TotalMilliseconds);
+        }
+
         // ── Post-store: clean up mosaic entries for chunks deduped at store time ──
         // If the agent matched an existing stored chunk, the error encoding base is now
         // the agent's matched chunk (storeRes.BaseChunk), NOT the stitched mosaic.
@@ -1865,6 +1897,33 @@ public class CrossService : ICross
                 fetchSw.Stop();
                 Observability.RecordStage("FetchBaseChunks", fetchSw.Elapsed.TotalMilliseconds,
                     ("count", baseChunkFetchIndices.Count));
+
+                // ── Integrity check (2/3): for every base chunk we just
+                // fetched, the SHA256 of the returned bytes must equal the
+                // StorageGuid the agent advertised at search time.  A miss
+                // here means (bucketId, bucketIndex) is pointing at different
+                // bytes than what we diffed against during search — exactly
+                // the failure mode where decompression deterministically
+                // breaks even though every chunk "comes back". ──
+                if (global::Cross.Services.JobEvents.IntegrityDiagnostics.Enabled)
+                {
+                    var swIntegrityFetch = Stopwatch.StartNew();
+                    var sortedSnap = sorted;
+                    var fetchedSnap = fetchedChunks;
+                    var fetchResult = global::Cross.Services.JobEvents.IntegrityDiagnostics.VerifyHashes(
+                        sortedSnap.Length,
+                        i =>
+                        {
+                            var bytes = fetchedSnap[i];
+                            if (bytes == null || bytes.Length == 0) return (null, null);
+                            var r = sortedSnap[i];
+                            if (r == null || string.IsNullOrEmpty(r.StorageGuid)) return (null, null);
+                            return (r.StorageGuid, bytes);
+                        });
+                    swIntegrityFetch.Stop();
+                    global::Cross.Services.JobEvents.IntegrityDiagnostics.Emit(
+                        "FetchedBases", fetchResult, swIntegrityFetch.Elapsed.TotalMilliseconds);
+                }
 
                 // Inject fetched chunks into sorted results
                 for (int i = 0; i < sorted.Length; i++)
@@ -4468,6 +4527,25 @@ public class CrossService : ICross
                 Console.WriteLine($"[Decompress] ❌ INTEGRITY FAILURE: SHA256 mismatch. File is corrupted.");
                 Console.WriteLine($"[Decompress]    Expected: {Convert.ToHexString(expectedHash)}");
                 Console.WriteLine($"[Decompress]    Got:      {Convert.ToHexString(actualHash)}");
+
+                // Surface to control center so we can correlate with the
+                // compression-side integrity checks above. The block index /
+                // count are forwarded to the dashboard so a single bad block
+                // doesn't get lost in a 16-block file.
+                int refsResolved = 0;
+                if (refBucketIds != null)
+                {
+                    for (int rr = 0; rr < refBucketIds.Length; rr++)
+                        if (refBucketIds[rr] != 0 && refBucketIds[rr] != ulong.MaxValue) refsResolved++;
+                }
+                global::Cross.Services.JobEvents.IntegrityDiagnostics.EmitDecompressFailure(
+                    blockIndex: 0,
+                    blockCount: 1,
+                    expectedHash: expectedHash,
+                    actualHash: actualHash,
+                    chunkCount: chunkCount,
+                    refsResolved: refsResolved);
+
                 throw new InvalidDataException(
                     "Decompression integrity check failed: SHA256 hash of reconstructed file does not match the original. " +
                     "This means at least one base chunk was corrupted or missing.");
