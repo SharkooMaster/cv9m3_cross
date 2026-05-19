@@ -1809,6 +1809,12 @@ public class CrossService : ICross
         {
             var sortedSnapshot = sorted;
             var chunkMapSnapshot = chunkMap;
+            // Snapshot mosaic indices: those chunks have Chunk = stitched bytes
+            // from N donors and a different decode contract (reference type
+            // 0x03). sha256(Chunk) is intentionally NOT equal to StorageGuid
+            // for mosaics, so they must be excluded from the dedup-hit check
+            // or we'd flag the working mosaic feature as 12% corruption.
+            var mosaicSet = new HashSet<int>(mosaicInfos.Keys);
 
             var swNew = Stopwatch.StartNew();
             var newStoreResult = global::Cross.Services.JobEvents.IntegrityDiagnostics.VerifyHashes(
@@ -1834,6 +1840,8 @@ public class CrossService : ICross
                     var r = sortedSnapshot[i];
                     if (r == null || string.IsNullOrEmpty(r.StorageGuid) || r.NeedToStore)
                         return (null, null);
+                    if (mosaicSet.Contains(i))
+                        return (null, null); // mosaic decode path — see comment above
                     if (r.Chunk != null && r.Chunk.Length > 0)
                         return (r.StorageGuid, r.Chunk.ToByteArray());
                     return (null, null);
@@ -1841,6 +1849,20 @@ public class CrossService : ICross
             swDedup.Stop();
             global::Cross.Services.JobEvents.IntegrityDiagnostics.Emit(
                 "StoreRoundTrip:DedupHit", dedupResult, swDedup.Elapsed.TotalMilliseconds);
+
+            // Surface the mosaic count for visibility — these are healthy
+            // dedup rows that use the stitched-base reference type. Zero
+            // mismatches expected (we don't check sha256 for them); the
+            // dashboard just shows the count alongside the other stages.
+            if (mosaicSet.Count > 0)
+            {
+                global::Cross.Services.JobEvents.JobEventBus.EmitStageDone(
+                    "IntegrityCheck:StoreRoundTrip:Mosaic",
+                    0,
+                    chunkCount: mosaicSet.Count,
+                    bucketCount: 0,
+                    bytes: 0);
+            }
         }
 
         // ── Post-store: clean up mosaic entries for chunks deduped at store time ──
