@@ -43,6 +43,15 @@ public class CrossService : ICross
     string headID = "";
     private readonly global::Cross.Services.Grpc.Agent.ChunkReferenceServiceClient _chunkReferenceClient = new();
 
+    /// <summary>
+    /// When set on the current async flow, <see cref="DecompressFile"/> returns
+    /// the (possibly corrupted) reconstructed bytes instead of throwing on a
+    /// final-stage SHA256 mismatch. Used exclusively by the in-process compress
+    /// → decompress smoketest so it can compare bytes and pinpoint the failing
+    /// chunk. Never read by production callers.
+    /// </summary>
+    private static readonly AsyncLocal<bool> _smoketestSuppressIntegrityThrow = new();
+
     private static int BitCount(byte b) => System.Numerics.BitOperations.PopCount((uint)b);
 
     private static int ParseEnvInt(string name, int defaultValue, int min)
@@ -2163,7 +2172,16 @@ public class CrossService : ICross
                 }
 
                 int threshold = isNonRep ? maxAllowedCluster : maxAllowedRegular;
-                if (differingByteCount > threshold)
+                // Bloat guard is only worth running when we're storing the CCF on
+                // the cluster — re-storing a fresh copy then trades one extra
+                // chunk-write for a smaller CCF that also lives on the cluster.
+                // When CCFs are streamed back to the client (EnableCcfStore=false)
+                // the user gets the bytes once and never sees them again, so the
+                // extra cluster write is pure write-amplification with no payoff,
+                // and crucially it adds a re-store step which is the most fragile
+                // part of the compress pipeline (multiple stale-state propagation
+                // paths feeding the encode case decision). Skip it.
+                if (Globals.EnableCcfStore && differingByteCount > threshold)
                 {
                     sorted[i].NeedToStore = true;
                     sorted[i].Similarity = 1.0f;
@@ -3022,17 +3040,23 @@ public class CrossService : ICross
             byte[] refBytes = BuildV5References(sorted, mosaicInfos);
             int storedForLog = sorted.Count(r => r != null && r.NeedToStore);
 
-            // Release all heavy collections now that refs/errors are computed
-            fileChunks = null!;
-            vectors = null!;
-            bitStrings = null!;
-            mainAgents = null!;
-            chunkMap = null!;
-            mosaicCandidates = null!;
-            mosaicInfos = null!;
-            sorted = null!;
-            representativeSet = null!;
-            groupRepresentative = null!;
+            // Defer the heavy-collection release if the smoketest is on — we need
+            // sorted/mosaicInfos/representativeSet/groupRepresentative/fileChunks
+            // to attribute any round-trip mismatch back to a specific encode case.
+            bool runSmoketest = Globals.IntegrityDecompressSmoketest && _fileLen > 0;
+            if (!runSmoketest)
+            {
+                fileChunks = null!;
+                vectors = null!;
+                bitStrings = null!;
+                mainAgents = null!;
+                chunkMap = null!;
+                mosaicCandidates = null!;
+                mosaicInfos = null!;
+                sorted = null!;
+                representativeSet = null!;
+                groupRepresentative = null!;
+            }
 
             byte[] fileHash = SHA256.HashData(_file.AsSpan(0, _fileLen));
             toReturn = BuildCompressedPayload(
@@ -3043,6 +3067,26 @@ public class CrossService : ICross
                 fileHash);
             swStage.Stop();
             Observability.RecordStage("Serialize", swStage.Elapsed.TotalMilliseconds, ("output_bytes", toReturn.Length));
+
+            if (runSmoketest)
+            {
+                await RunCompressDecompressSmoketestAsync(
+                    toReturn, _file, _fileLen,
+                    fileChunks, sorted, mosaicInfos,
+                    representativeSet, groupRepresentative,
+                    totalChunks);
+
+                fileChunks = null!;
+                vectors = null!;
+                bitStrings = null!;
+                mainAgents = null!;
+                chunkMap = null!;
+                mosaicCandidates = null!;
+                mosaicInfos = null!;
+                sorted = null!;
+                representativeSet = null!;
+                groupRepresentative = null!;
+            }
 
             totalSw.Stop();
             Console.WriteLine($"[Compress] DONE: {totalSw.ElapsedMilliseconds}ms total, in={_fileLen} out={toReturn.Length} ratio={toReturn.Length/(double)Math.Max(1,_fileLen):F3}, dedup={referencesFound}, lshMatches={initialMatches}, stored={storedForLog}");
@@ -3055,6 +3099,203 @@ public class CrossService : ICross
     {
         var res = await CompressFileWithStats(_file);
         return res.CompressedBytes;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // In-process decompress smoke test
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // Decompresses the just-produced CCF inside the SAME pod that compressed
+    // it, then compares byte-for-byte against the original input.  Catches:
+    //
+    //   1. encode-case / decode-case asymmetries (e.g. encoder thought
+    //      baseChunk was X, decoder fetches Y),
+    //   2. fresh-store coordinate drift (cross stored at (B, K) but the
+    //      RendezvousRouter on decode picks a different agent for (B, K)),
+    //   3. write-batcher / WAL races (chunk in WAL but not yet visible to
+    //      GetChunkByReference),
+    //   4. bloat-guard re-store coordinate updates not propagated to the
+    //      eventual encode case.
+    //
+    // Off by default — gated by INTEGRITY_DECOMPRESS_SMOKETEST=true.  When on,
+    // every Compress doubles in latency.  Worth it during integrity hunts.
+    // ═══════════════════════════════════════════════════════════════════════
+    private async Task RunCompressDecompressSmoketestAsync(
+        byte[] toReturn,
+        byte[] originalFile,
+        int originalLen,
+        List<byte[]> fileChunks,
+        global::GatewayService.QueryResponseObject?[] sorted,
+        ConcurrentDictionary<int, global::Cross.Models.MosaicChunkInfo> mosaicInfos,
+        HashSet<int> representativeSet,
+        int[] groupRepresentative,
+        int totalChunks)
+    {
+        var sw = Stopwatch.StartNew();
+        byte[]? roundTripped = null;
+        Exception? decompressError = null;
+        bool priorSuppress = _smoketestSuppressIntegrityThrow.Value;
+        _smoketestSuppressIntegrityThrow.Value = true;
+        try
+        {
+            roundTripped = await DecompressFile(toReturn);
+        }
+        catch (Exception ex)
+        {
+            decompressError = ex;
+        }
+        finally
+        {
+            _smoketestSuppressIntegrityThrow.Value = priorSuppress;
+        }
+        sw.Stop();
+
+        string jobId = global::Cross.Services.JobEvents.JobEventBus.CurrentJobId ?? "no-job";
+
+        if (decompressError != null)
+        {
+            string msg = $"smoketest decompress threw: {decompressError.GetType().Name}: {decompressError.Message}";
+            Console.WriteLine($"[Integrity] ❌ {msg}");
+            global::Cross.Services.JobEvents.JobEventBus.EmitFailed(
+                jobId, "INTEGRITY_SMOKETEST", msg, "Compress");
+            return;
+        }
+
+        if (roundTripped == null || roundTripped.Length != originalLen)
+        {
+            int got = roundTripped?.Length ?? 0;
+            string msg = $"smoketest length mismatch: orig={originalLen}, decompressed={got}";
+            Console.WriteLine($"[Integrity] ❌ {msg}");
+            global::Cross.Services.JobEvents.JobEventBus.EmitFailed(
+                jobId, "INTEGRITY_SMOKETEST", msg, "Compress");
+            return;
+        }
+
+        int firstDiff = -1;
+        for (int i = 0; i < originalLen; i++)
+        {
+            if (originalFile[i] != roundTripped[i]) { firstDiff = i; break; }
+        }
+
+        if (firstDiff < 0)
+        {
+            Console.WriteLine($"[Integrity] ✓ SMOKETEST round-trip OK ({originalLen} bytes, {totalChunks} chunks) in {sw.ElapsedMilliseconds}ms");
+            global::Cross.Services.JobEvents.JobEventBus.EmitStageDone(
+                "IntegrityCheck:Smoketest:Pass",
+                sw.Elapsed.TotalMilliseconds,
+                chunkCount: totalChunks,
+                bucketCount: 0,
+                bytes: (ulong)originalLen);
+            return;
+        }
+
+        int cs = Globals.chunkSize;
+        int chunkIdx = Math.Min(firstDiff / cs, totalChunks - 1);
+
+        // SHA256 of the original chunk vs the round-tripped chunk.
+        int chunkStart = chunkIdx * cs;
+        int chunkEnd = Math.Min(chunkStart + cs, originalLen);
+        int chunkLen = chunkEnd - chunkStart;
+
+        byte[] origHash = SHA256.HashData(originalFile.AsSpan(chunkStart, chunkLen).ToArray());
+        byte[] gotHash = SHA256.HashData(roundTripped.AsSpan(chunkStart, chunkLen).ToArray());
+
+        var r = sorted != null && chunkIdx < sorted.Length ? sorted[chunkIdx] : null;
+        ulong bucketId = r?.BucketId ?? 0;
+        ulong bucketKey = r?.BucketKey ?? 0;
+        string storageGuid = r?.StorageGuid ?? "";
+        bool needToStore = r?.NeedToStore ?? false;
+        bool isMosaic = mosaicInfos != null && mosaicInfos.ContainsKey(chunkIdx);
+        bool isRep = representativeSet != null && representativeSet.Contains(chunkIdx);
+        int rep = (groupRepresentative != null && chunkIdx < groupRepresentative.Length)
+            ? groupRepresentative[chunkIdx] : -1;
+        bool repIsFresh = rep >= 0 && sorted != null && rep < sorted.Length
+                          && sorted[rep] != null
+                          && sorted[rep]!.NeedToStore
+                          && sorted[rep]!.BucketId != 0;
+
+        // Reproduce the encode-case decision exactly so the diagnostic tells
+        // you which branch at Cross.cs ~2916 was taken for the bad chunk.
+        string encodeCase;
+        if (isMosaic) encodeCase = "mosaic";
+        else if (needToStore && bucketId != 0) encodeCase = "self-fresh";
+        else if (!isRep && repIsFresh) encodeCase = $"rep[{rep}]-fresh";
+        else if (r != null && r.Chunk != null && r.Chunk.Length > 0) encodeCase = "dedup-cached";
+        else encodeCase = "empty-base";
+
+        // What did the encoder think the base bytes were?
+        string encoderBaseSha = "n/a";
+        if (isMosaic && mosaicInfos != null && mosaicInfos.TryGetValue(chunkIdx, out var minfo)
+            && minfo.StitchedBase.Length > 0)
+        {
+            encoderBaseSha = HexShort(SHA256.HashData(minfo.StitchedBase));
+        }
+        else if (needToStore && bucketId != 0 && fileChunks != null && chunkIdx < fileChunks.Count)
+        {
+            encoderBaseSha = HexShort(SHA256.HashData(fileChunks[chunkIdx]));
+        }
+        else if (!isRep && repIsFresh && fileChunks != null && rep >= 0 && rep < fileChunks.Count)
+        {
+            encoderBaseSha = HexShort(SHA256.HashData(fileChunks[rep]));
+        }
+        else if (r != null && r.Chunk != null && r.Chunk.Length > 0)
+        {
+            encoderBaseSha = HexShort(SHA256.HashData(r.Chunk.ToByteArray()));
+        }
+
+        // What does the agent return RIGHT NOW for the same ref the decode path used?
+        string fetchedBaseSha = "n/a";
+        int fetchedBaseLen = -1;
+        if (bucketId != 0)
+        {
+            try
+            {
+                string? targetAgent = r?.TargetAgent;
+                var fetched = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                    bucketId, bucketKey,
+                    targetAgent: string.IsNullOrWhiteSpace(targetAgent) ? null : targetAgent);
+                if (fetched != null && fetched.Length > 0)
+                {
+                    fetchedBaseLen = fetched.Length;
+                    fetchedBaseSha = HexShort(SHA256.HashData(fetched));
+                }
+                else
+                {
+                    fetchedBaseSha = "empty";
+                }
+            }
+            catch (Exception ex)
+            {
+                fetchedBaseSha = $"err:{ex.GetType().Name}";
+            }
+        }
+
+        string sgidShort = string.IsNullOrEmpty(storageGuid)
+            ? "(none)"
+            : storageGuid.Substring(0, Math.Min(16, storageGuid.Length));
+
+        string msgDetail =
+            $"chunk #{chunkIdx}/{totalChunks} firstByte={firstDiff} " +
+            $"case={encodeCase} bId={bucketId:x} bKey={bucketKey:x} " +
+            $"sgid={sgidShort} " +
+            $"origSha={HexShort(origHash)} gotSha={HexShort(gotHash)} " +
+            $"encoderBaseSha={encoderBaseSha} fetchedBaseSha={fetchedBaseSha} " +
+            $"fetchedBaseLen={fetchedBaseLen}";
+
+        Console.WriteLine($"[Integrity] ❌ SMOKETEST MISMATCH: {msgDetail}");
+        global::Cross.Services.JobEvents.JobEventBus.EmitFailed(
+            jobId, "INTEGRITY_SMOKETEST", msgDetail, "Compress");
+    }
+
+    private static string HexShort(ReadOnlySpan<byte> bytes, int hexChars = 16)
+    {
+        int n = Math.Min(hexChars, bytes.Length * 2);
+        var sb = new StringBuilder(n);
+        int bytesNeeded = (n + 1) / 2;
+        for (int i = 0; i < bytesNeeded && i < bytes.Length; i++)
+            sb.Append(bytes[i].ToString("x2"));
+        if (sb.Length > n) sb.Length = n;
+        return sb.ToString();
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -4787,9 +5028,15 @@ public class CrossService : ICross
                     chunkCount: chunkCount,
                     refsResolved: refsResolved);
 
-                throw new InvalidDataException(
-                    "Decompression integrity check failed: SHA256 hash of reconstructed file does not match the original. " +
-                    "This means at least one base chunk was corrupted or missing.");
+                // Smoketest path: return the bad bytes so the caller can
+                // byte-diff them against the original and attribute the
+                // failure to a specific chunk + encode case.
+                if (!_smoketestSuppressIntegrityThrow.Value)
+                {
+                    throw new InvalidDataException(
+                        "Decompression integrity check failed: SHA256 hash of reconstructed file does not match the original. " +
+                        "This means at least one base chunk was corrupted or missing.");
+                }
             }
             Console.WriteLine($"[Decompress] ✅ SHA256 integrity verified");
         }

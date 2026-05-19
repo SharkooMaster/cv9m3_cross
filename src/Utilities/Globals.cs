@@ -96,6 +96,17 @@ public static class Globals
         string.Equals(Environment.GetEnvironmentVariable("ENABLE_CCF_STORE"), "true",
             StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Diagnostic: after each block is compressed, decompress it in-process and
+    /// compare byte-for-byte against the original. Catches the exact compress→
+    /// decompress mismatch in the same process the bug occurs in, before the CCF
+    /// even leaves cross. Off by default — adds a full decompress per compress
+    /// (~20% latency) so only flip on while actively hunting integrity bugs.
+    /// </summary>
+    public static bool IntegrityDecompressSmoketest =
+        string.Equals(Environment.GetEnvironmentVariable("INTEGRITY_DECOMPRESS_SMOKETEST"), "true",
+            StringComparison.OrdinalIgnoreCase);
+
     public static bool EnableCcfBackgroundServices =
         !string.Equals(Environment.GetEnvironmentVariable("CCF_BACKGROUND_SERVICES_DISABLED"), "true",
             StringComparison.OrdinalIgnoreCase);
