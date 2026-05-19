@@ -208,7 +208,13 @@ public static class JobEventBus
             TsUnixNs = (ulong)NowUnixNs(),
             Phase = JobPhase.Failed,
             ErrorClass = errorClass ?? string.Empty,
-            ErrorMessage = Truncate(errorMessage, 200) ?? string.Empty,
+            // 200 chars was too short for INTEGRITY_SMOKETEST messages — they
+            // pack chunk idx, encode case, two agent IPs, four SHAs, and the
+            // sorted[] state. Diagnostic messages live in stdout (Console.WriteLine)
+            // with full hashes, this is the dashboard-visible summary; 1500
+            // chars fits the full structured payload without breaking the
+            // ring buffer ($\approx$ 100KB for 100 failed events worst case).
+            ErrorMessage = Truncate(errorMessage, 1500) ?? string.Empty,
             ErrorStage = errorStage ?? string.Empty,
         });
     }

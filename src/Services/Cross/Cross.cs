@@ -1909,6 +1909,18 @@ public class CrossService : ICross
         // ── Post-store: propagate updated store results to non-rep group members ──
         // After BatchStore, representatives now have final BucketId/BucketKey/StorageGuid.
         // Non-reps need these values updated so their references point to the stored rep.
+        //
+        // CRITICAL: TargetAgent MUST be propagated too. A non-rep's TargetAgent was set
+        // by its own search response (whichever agent answered for the non-rep's
+        // bitstring). After we overwrite BucketId/BucketKey to point at the rep's
+        // bucket, that bucket lives on the rep's agent — so any subsequent fetch
+        // (lazy base-chunk fetch + decompress-time GetChunkByReference + the
+        // smoketest's diagnostic fetch) must go to the rep's agent or it will
+        // hit a different agent's view of (B,K) and silently use the wrong base
+        // chunk. That's exactly the divergence that produced ~62/4096 dedup-cached
+        // smoketest failures in fresh-cluster runs (encoderBaseSha consistent
+        // with sorted[i].StorageGuid, fetchedBaseSha pointing at a different
+        // chunk because cross was querying the wrong agent).
         if (Globals.EnableChunkClustering)
         {
             for (int i = 0; i < sorted.Length; i++)
@@ -1920,6 +1932,7 @@ public class CrossService : ICross
                 sorted[i].BucketKey = repResult.BucketKey;
                 sorted[i].StorageGuid = repResult.StorageGuid ?? "";
                 sorted[i].Chunk = repResult.Chunk;
+                sorted[i].TargetAgent = repResult.TargetAgent ?? sorted[i].TargetAgent;
             }
         }
 
@@ -1973,23 +1986,52 @@ public class CrossService : ICross
             }
 
             // Parallel fetch all needed base chunks from the CORRECT agent.
-            // Gateway sets TargetAgent for ALL responses so we know exactly where the data lives.
-            // This prevents the old bug where round-robin hit the wrong agent → recursive cross-agent search → timeout.
+            //
+            // CRITICAL routing rule: pick the agent via RendezvousRouter, NOT
+            // sorted[idx].TargetAgent. TargetAgent was set by whichever agent
+            // answered the search RPC for this chunk's *original* bitstring —
+            // but after rep propagation we may have rewritten BucketId/BucketKey
+            // to point at the rep's bucket, whose owning agent (per current
+            // rendezvous routing) can be different. DecompressFile resolves
+            // base chunks via `RendezvousRouter.PickAgent(UlongToBitstring(bId))`
+            // (see line ~4299 of this file), so the encoder MUST diff against
+            // the bytes THAT agent will serve. If we lazily fetch from
+            // TargetAgent instead, we encode against agent A's view of (B,K)
+            // and decode against agent B's view — silent corruption.
+            //
+            // Concrete failure mode this fixes: 62/4096 chunks per block came
+            // back with case=dedup-cached, sgid (sorted[i].StorageGuid) matching
+            // the decoder's RendezvousRouter-picked agent's view of (B,0), but
+            // encoderBaseSha (= sha256(sorted[i].Chunk) after this lazy fetch)
+            // matching a DIFFERENT chunk because the fetch hit TargetAgent and
+            // got that agent's local (B,0) which had been populated by a
+            // different store operation.
             if (baseChunkFetchIndices.Count > 0)
             {
                 var fetchSw = Stopwatch.StartNew();
                 var fetchedChunks = new byte[sorted.Length][];
+                var fetchedFromAgent = new string?[sorted.Length];
                 var fetchTasks = baseChunkFetchIndices.Select(async idx =>
                 {
                     try
                     {
-                        // Route to the specific agent that owns this chunk (set by gateway)
-                        string? targetAgent = sorted[idx].TargetAgent;
+                        // Re-resolve the canonical owner agent for this bucket
+                        // (post rep-propagation BucketId). This is the SAME
+                        // selector DecompressFile uses, guaranteeing encode/
+                        // decode agree on whose (B,K) view we're diffing against.
+                        string bitstring = UlongToBitstring(sorted[idx].BucketId);
+                        string canonicalAgent = RendezvousRouter.PickAgent(bitstring);
+                        if (string.IsNullOrWhiteSpace(canonicalAgent))
+                            canonicalAgent = sorted[idx].TargetAgent ?? "";
+
                         var chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
                             sorted[idx].BucketId, sorted[idx].BucketKey,
-                            targetAgent: string.IsNullOrWhiteSpace(targetAgent) ? null : targetAgent);
+                            targetAgent: string.IsNullOrWhiteSpace(canonicalAgent) ? null : canonicalAgent);
                         if (chunk != null && chunk.Length > 0)
+                        {
                             fetchedChunks[idx] = chunk;
+                            fetchedFromAgent[idx] = canonicalAgent;
+                        }
                     }
                     catch { /* Will fall back to zeros */ }
                 });
@@ -2025,11 +2067,25 @@ public class CrossService : ICross
                         "FetchedBases", fetchResult, swIntegrityFetch.Elapsed.TotalMilliseconds);
                 }
 
-                // Inject fetched chunks into sorted results
+                // Inject fetched chunks into sorted results AND re-derive the
+                // (Chunk, StorageGuid, TargetAgent) invariant from the fetched
+                // bytes. The previous version only updated Chunk, leaving
+                // StorageGuid stale from the search response — so subsequent
+                // code (and the smoketest) saw SHA(Chunk) ≠ StorageGuid even
+                // though both pieces individually came from the cluster, just
+                // from different points in time / different agents. Anchor
+                // everything to the bytes the canonical-agent JUST returned:
+                // that's what DecompressFile will see, so that's the only
+                // source of truth that matters for encode correctness.
                 for (int i = 0; i < sorted.Length; i++)
                 {
-                    if (fetchedChunks[i] != null)
-                        sorted[i].Chunk = ByteString.CopyFrom(fetchedChunks[i]);
+                    var fetched = fetchedChunks[i];
+                    if (fetched == null) continue;
+
+                    sorted[i].Chunk = ByteString.CopyFrom(fetched);
+                    sorted[i].StorageGuid = Convert.ToHexString(SHA256.HashData(fetched)).ToLowerInvariant();
+                    if (!string.IsNullOrWhiteSpace(fetchedFromAgent[i]))
+                        sorted[i].TargetAgent = fetchedFromAgent[i];
                 }
 
                 // ── CRITICAL: Handle failed base chunk fetches ──
@@ -3244,47 +3300,179 @@ public class CrossService : ICross
         }
 
         // What does the agent return RIGHT NOW for the same ref the decode path used?
-        string fetchedBaseSha = "n/a";
-        int fetchedBaseLen = -1;
+        // We query BOTH the recorded TargetAgent AND the canonical rendezvous owner,
+        // so if they disagree the dashboard tells us immediately. DecompressFile
+        // uses RendezvousRouter.PickAgent(bitstring) — so that's the agent whose
+        // bytes the encoder MUST be diffing against.
+        string targetAgent = r?.TargetAgent ?? "";
+        string bitstringNow = bucketId != 0 ? UlongToBitstring(bucketId) : "";
+        string canonicalAgent = bucketId != 0 ? (RendezvousRouter.PickAgent(bitstringNow) ?? "") : "";
+
+        string targetAgentFetchSha = "n/a";
+        int targetAgentFetchLen = -1;
+        string canonicalAgentFetchSha = "n/a";
+        int canonicalAgentFetchLen = -1;
         if (bucketId != 0)
         {
             try
             {
-                string? targetAgent = r?.TargetAgent;
                 var fetched = await _chunkReferenceClient.GetChunkByReferenceAsync(
                     bucketId, bucketKey,
                     targetAgent: string.IsNullOrWhiteSpace(targetAgent) ? null : targetAgent);
                 if (fetched != null && fetched.Length > 0)
                 {
-                    fetchedBaseLen = fetched.Length;
-                    fetchedBaseSha = HexShort(SHA256.HashData(fetched));
+                    targetAgentFetchLen = fetched.Length;
+                    targetAgentFetchSha = HexFull(SHA256.HashData(fetched));
                 }
                 else
                 {
-                    fetchedBaseSha = "empty";
+                    targetAgentFetchSha = "empty";
                 }
             }
             catch (Exception ex)
             {
-                fetchedBaseSha = $"err:{ex.GetType().Name}";
+                targetAgentFetchSha = $"err:{ex.GetType().Name}";
+            }
+
+            // Only re-fetch from canonical if it differs from TargetAgent — saves an
+            // RPC per chunk in the common case.
+            if (!string.IsNullOrWhiteSpace(canonicalAgent) && canonicalAgent != targetAgent)
+            {
+                try
+                {
+                    var fetched = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                        bucketId, bucketKey, targetAgent: canonicalAgent);
+                    if (fetched != null && fetched.Length > 0)
+                    {
+                        canonicalAgentFetchLen = fetched.Length;
+                        canonicalAgentFetchSha = HexFull(SHA256.HashData(fetched));
+                    }
+                    else
+                    {
+                        canonicalAgentFetchSha = "empty";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    canonicalAgentFetchSha = $"err:{ex.GetType().Name}";
+                }
+            }
+            else
+            {
+                canonicalAgentFetchSha = "same-as-target";
+                canonicalAgentFetchLen = targetAgentFetchLen;
             }
         }
 
+        // Also probe what the agent has for the StorageGuid cross is carrying —
+        // catches the case where sorted[i].StorageGuid points at a guid the
+        // cluster doesn't have any chunk for (e.g., guid leaked from a different
+        // bucket's record into this chunk's sorted[] slot).
+        string sgidFetchSha = "n/a";
+        int sgidFetchLen = -1;
+        if (!string.IsNullOrEmpty(storageGuid))
+        {
+            try
+            {
+                var fetched = await _chunkReferenceClient.GetChunkByStorageGuidAsync(
+                    storageGuid,
+                    targetAgent: string.IsNullOrWhiteSpace(canonicalAgent) ? null : canonicalAgent);
+                if (fetched != null && fetched.Length > 0)
+                {
+                    sgidFetchLen = fetched.Length;
+                    sgidFetchSha = HexFull(SHA256.HashData(fetched));
+                }
+                else
+                {
+                    sgidFetchSha = "empty";
+                }
+            }
+            catch (Exception ex)
+            {
+                sgidFetchSha = $"err:{ex.GetType().Name}";
+            }
+        }
+
+        // Full encoder-base sha (recomputed against the actual encoder bytes)
+        string encoderBaseShaFull = "n/a";
+        if (isMosaic && mosaicInfos != null && mosaicInfos.TryGetValue(chunkIdx, out var minfoFull)
+            && minfoFull.StitchedBase.Length > 0)
+        {
+            encoderBaseShaFull = HexFull(SHA256.HashData(minfoFull.StitchedBase));
+        }
+        else if (needToStore && bucketId != 0 && fileChunks != null && chunkIdx < fileChunks.Count)
+        {
+            encoderBaseShaFull = HexFull(SHA256.HashData(fileChunks[chunkIdx]));
+        }
+        else if (!isRep && repIsFresh && fileChunks != null && rep >= 0 && rep < fileChunks.Count)
+        {
+            encoderBaseShaFull = HexFull(SHA256.HashData(fileChunks[rep]));
+        }
+        else if (r != null && r.Chunk != null && r.Chunk.Length > 0)
+        {
+            encoderBaseShaFull = HexFull(SHA256.HashData(r.Chunk.ToByteArray()));
+        }
+
+        // Always include both the truncated (for the 1500-char EmitFailed cap)
+        // and the full hashes (stdout-only, kubectl logs has them).
+        string console =
+            $"chunk #{chunkIdx}/{totalChunks} firstByte={firstDiff} " +
+            $"case={encodeCase} isRep={isRep} rep={rep} needToStore={needToStore} " +
+            $"bId={bucketId:x} bKey={bucketKey:x} " +
+            $"sgid={storageGuid} " +
+            $"origSha={HexFull(origHash)} gotSha={HexFull(gotHash)} " +
+            $"encoderBaseSha={encoderBaseShaFull} " +
+            $"targetAgent={targetAgent} targetAgentFetchSha={targetAgentFetchSha} targetAgentFetchLen={targetAgentFetchLen} " +
+            $"canonicalAgent={canonicalAgent} canonicalAgentFetchSha={canonicalAgentFetchSha} canonicalAgentFetchLen={canonicalAgentFetchLen} " +
+            $"sgidFetchSha={sgidFetchSha} sgidFetchLen={sgidFetchLen}";
+
+        Console.WriteLine($"[Integrity] ❌ SMOKETEST MISMATCH: {console}");
+
+        // Dashboard event — keep this terser (EmitFailed truncates to 1500 chars
+        // now, see JobEventBus.cs). Full diagnostic is always in stdout above.
         string sgidShort = string.IsNullOrEmpty(storageGuid)
             ? "(none)"
             : storageGuid.Substring(0, Math.Min(16, storageGuid.Length));
-
+        string targetAgentShort = string.IsNullOrEmpty(targetAgent) ? "(none)" : targetAgent;
+        string canonicalAgentShort = string.IsNullOrEmpty(canonicalAgent) ? "(none)" : canonicalAgent;
         string msgDetail =
             $"chunk #{chunkIdx}/{totalChunks} firstByte={firstDiff} " +
-            $"case={encodeCase} bId={bucketId:x} bKey={bucketKey:x} " +
+            $"case={encodeCase} isRep={isRep} rep={rep} needToStore={needToStore} " +
+            $"bId={bucketId:x} bKey={bucketKey:x} " +
             $"sgid={sgidShort} " +
             $"origSha={HexShort(origHash)} gotSha={HexShort(gotHash)} " +
-            $"encoderBaseSha={encoderBaseSha} fetchedBaseSha={fetchedBaseSha} " +
-            $"fetchedBaseLen={fetchedBaseLen}";
+            $"encBaseSha={HexShort(encoderBaseShaFull.AsSpan())} " +
+            $"tgtAgent={targetAgentShort} tgtFetchSha={HexShort(targetAgentFetchSha.AsSpan())} " +
+            $"canAgent={canonicalAgentShort} canFetchSha={HexShort(canonicalAgentFetchSha.AsSpan())} " +
+            $"sgidFetchSha={HexShort(sgidFetchSha.AsSpan())}";
 
-        Console.WriteLine($"[Integrity] ❌ SMOKETEST MISMATCH: {msgDetail}");
         global::Cross.Services.JobEvents.JobEventBus.EmitFailed(
             jobId, "INTEGRITY_SMOKETEST", msgDetail, "Compress");
+    }
+
+    private static string HexFull(ReadOnlySpan<byte> bytes)
+    {
+        var sb = new StringBuilder(bytes.Length * 2);
+        for (int i = 0; i < bytes.Length; i++)
+            sb.Append(bytes[i].ToString("x2"));
+        return sb.ToString();
+    }
+
+    // Truncate an already-hex string to 16 chars without re-hashing — used for
+    // the dashboard message where we already have full hex strings and don't
+    // want to re-hash. If the input isn't hex (e.g., "empty", "err:..."),
+    // return it as-is.
+    private static string HexShort(ReadOnlySpan<char> hexOrLabel)
+    {
+        if (hexOrLabel.Length <= 16) return hexOrLabel.ToString();
+        // Treat anything non-hex (contains '-', ':', etc.) as a label.
+        for (int i = 0; i < hexOrLabel.Length && i < 16; i++)
+        {
+            char c = hexOrLabel[i];
+            bool isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!isHex) return hexOrLabel.ToString();
+        }
+        return hexOrLabel.Slice(0, 16).ToString();
     }
 
     private static string HexShort(ReadOnlySpan<byte> bytes, int hexChars = 16)
