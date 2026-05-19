@@ -1893,18 +1893,34 @@ public class CrossService : ICross
             }
         }
 
-        // ── Post-store: clean up mosaic entries for chunks deduped at store time ──
-        // If the agent matched an existing stored chunk, the error encoding base is now
-        // the agent's matched chunk (storeRes.BaseChunk), NOT the stitched mosaic.
-        // Remove from mosaicInfos so the reference builder writes 0x01 instead of 0x03.
-        if (mosaicInfos.Count > 0)
-        {
-            foreach (var idx in mosaicInfos.Keys.ToList())
-            {
-                if (sorted[idx] != null && !sorted[idx]!.NeedToStore)
-                    mosaicInfos.TryRemove(idx, out _);
-            }
-        }
+        // ── Post-store: NO mosaic cleanup ──
+        // A previous version of this code wiped mosaicInfos[i] for every entry whose
+        // sorted[i].NeedToStore == false, on the theory that BatchStore may have
+        // resolved the chunk against an existing stored base (so the mosaic donor
+        // selection is now stale). That theory does not match the actual pipeline:
+        // every mosaic-rescue path (SmartRefSelect pair-merge, Mosaic-L2 assembly,
+        // Lane-L2 global) sets sorted[i].NeedToStore = false at the same moment it
+        // installs the stitched bytes into sorted[i].Chunk and registers donors in
+        // mosaicInfos[i]. The store-groups loop above only picks up NeedToStore=true
+        // rows, so mosaic-rescued chunks never reach BatchStore and their state never
+        // changes here. The "cleanup" therefore deleted 100% of legitimate mosaic
+        // entries that were created BEFORE this point.
+        //
+        // The downstream effect was silent decode corruption: BuildV5References no
+        // longer saw mosaicInfos[i], so it wrote a plain 0x01 dedup ref pointing at
+        // sorted[i].BucketId/BucketKey (one of the original L1 candidates). But
+        // PatchEncode still found sorted[i].Chunk populated and computed the diff
+        // against the stitched bytes. At decompress, the agent returned the L1
+        // candidate's bytes for (BucketId, BucketKey) and the diff was applied on
+        // top of the wrong base — producing the case=dedup-cached / isRep=True /
+        // needToStore=False INTEGRITY_SMOKETEST failures (encBaseSha ≠ sgid while
+        // tgtFetchSha == sgid == sgidFetchSha) and the matching INTEGRITY_DECOMPRESS
+        // whole-block SHA mismatches.
+        //
+        // Mosaic chunks that bloat-restore later re-promotes to NeedToStore=true are
+        // handled inside the bloat-restore block; the bloat-fallback mosaic adds
+        // (Mosaic-L2 fallback, Lane-fallback) happen after this point and are not
+        // affected either way.
 
         // ── Post-store: propagate updated store results to non-rep group members ──
         // After BatchStore, representatives now have final BucketId/BucketKey/StorageGuid.
