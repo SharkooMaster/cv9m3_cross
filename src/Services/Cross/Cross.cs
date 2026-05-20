@@ -2131,31 +2131,33 @@ public class CrossService : ICross
                 var fetchSw = Stopwatch.StartNew();
                 var fetchedChunks = new byte[sorted.Length][];
                 var fetchedFromAgent = new string?[sorted.Length];
-                var fetchTasks = baseChunkFetchIndices.Select(async idx =>
-                {
-                    try
+                await Parallel.ForEachAsync(
+                    baseChunkFetchIndices,
+                    new ParallelOptions { MaxDegreeOfParallelism = 100 },
+                    async (idx, ct) =>
                     {
-                        // Re-resolve the canonical owner agent for this bucket
-                        // (post rep-propagation BucketId). This is the SAME
-                        // selector DecompressFile uses, guaranteeing encode/
-                        // decode agree on whose (B,K) view we're diffing against.
-                        string bitstring = UlongToBitstring(sorted[idx].BucketId);
-                        string canonicalAgent = RendezvousRouter.PickAgent(bitstring);
-                        if (string.IsNullOrWhiteSpace(canonicalAgent))
-                            canonicalAgent = sorted[idx].TargetAgent ?? "";
-
-                        var chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
-                            sorted[idx].BucketId, sorted[idx].BucketKey,
-                            targetAgent: string.IsNullOrWhiteSpace(canonicalAgent) ? null : canonicalAgent);
-                        if (chunk != null && chunk.Length > 0)
+                        try
                         {
-                            fetchedChunks[idx] = chunk;
-                            fetchedFromAgent[idx] = canonicalAgent;
+                            // Re-resolve the canonical owner agent for this bucket
+                            // (post rep-propagation BucketId). This is the SAME
+                            // selector DecompressFile uses, guaranteeing encode/
+                            // decode agree on whose (B,K) view we're diffing against.
+                            string bitstring = UlongToBitstring(sorted[idx].BucketId);
+                            string canonicalAgent = RendezvousRouter.PickAgent(bitstring);
+                            if (string.IsNullOrWhiteSpace(canonicalAgent))
+                                canonicalAgent = sorted[idx].TargetAgent ?? "";
+
+                            var chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                                sorted[idx].BucketId, sorted[idx].BucketKey,
+                                targetAgent: string.IsNullOrWhiteSpace(canonicalAgent) ? null : canonicalAgent);
+                            if (chunk != null && chunk.Length > 0)
+                            {
+                                fetchedChunks[idx] = chunk;
+                                fetchedFromAgent[idx] = canonicalAgent;
+                            }
                         }
-                    }
-                    catch { /* Will fall back to zeros */ }
-                });
-                await Task.WhenAll(fetchTasks);
+                        catch { /* Will fall back to zeros */ }
+                    });
                 fetchSw.Stop();
                 Observability.RecordStage("FetchBaseChunks", fetchSw.Elapsed.TotalMilliseconds,
                     ("count", baseChunkFetchIndices.Count));
@@ -3011,20 +3013,22 @@ public class CrossService : ICross
 
                 var swRT = Stopwatch.StartNew();
                 var fetchedBytes = new byte[encodeBases.Length][];
-                var rtTasks = sampledIndices.Select(async idx =>
-                {
-                    if (encodeBases[idx] is not ChunkEncodeBase.Ref r) return;
-                    try
+                await Parallel.ForEachAsync(
+                    sampledIndices,
+                    new ParallelOptions { MaxDegreeOfParallelism = 100 },
+                    async (idx, ct) =>
                     {
-                        var got = await _chunkReferenceClient.GetChunkByReferenceAsync(
-                            r.BucketId, r.BucketKey,
-                            targetAgent: string.IsNullOrWhiteSpace(r.TargetAgent) ? null : r.TargetAgent);
-                        if (got != null && got.Length > 0)
-                            fetchedBytes[idx] = got;
-                    }
-                    catch { /* leave null — counted as fetch-failure mismatch */ }
-                }).ToList();
-                await Task.WhenAll(rtTasks);
+                        if (encodeBases[idx] is not ChunkEncodeBase.Ref r) return;
+                        try
+                        {
+                            var got = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                                r.BucketId, r.BucketKey,
+                                targetAgent: string.IsNullOrWhiteSpace(r.TargetAgent) ? null : r.TargetAgent);
+                            if (got != null && got.Length > 0)
+                                fetchedBytes[idx] = got;
+                        }
+                        catch { /* leave null — counted as fetch-failure mismatch */ }
+                    });
 
                 int total = 0;
                 int mismatches = 0;
@@ -3154,79 +3158,81 @@ public class CrossService : ICross
             var demote = new bool[encodeBases.Length];
             int verifyEligible = 0;
 
-            var verifyTasks = Enumerable.Range(0, encodeBases.Length).Select(async i =>
-            {
-                ulong bId, bKey;
-                byte[] expected;
-                switch (encodeBases[i])
+            await Parallel.ForEachAsync(
+                Enumerable.Range(0, encodeBases.Length),
+                new ParallelOptions { MaxDegreeOfParallelism = 100 },
+                async (i, ct) =>
                 {
-                    case ChunkEncodeBase.SelfFresh sf:
-                        bId = sf.BucketId; bKey = sf.BucketKey;
-                        expected = fileChunks[i];
-                        break;
-                    case ChunkEncodeBase.RepFresh rf:
-                        bId = rf.BucketId; bKey = rf.BucketKey;
-                        expected = fileChunks[rf.RepIndex];
-                        break;
-                    case ChunkEncodeBase.Ref r:
-                        bId = r.BucketId; bKey = r.BucketKey;
-                        expected = r.BaseBytes.ToByteArray();
-                        break;
-                    case ChunkEncodeBase.Mosaic m:
-                        // Mosaic chunks rely on donor chunks. If a donor chunk is missing,
-                        // the mosaic cannot be reconstructed. We must verify all donors.
-                        foreach (var donor in m.Info.Donors)
-                        {
-                            if (donor.BucketId != 0)
+                    ulong bId, bKey;
+                    byte[] expected;
+                    switch (encodeBases[i])
+                    {
+                        case ChunkEncodeBase.SelfFresh sf:
+                            bId = sf.BucketId; bKey = sf.BucketKey;
+                            expected = fileChunks[i];
+                            break;
+                        case ChunkEncodeBase.RepFresh rf:
+                            bId = rf.BucketId; bKey = rf.BucketKey;
+                            expected = fileChunks[rf.RepIndex];
+                            break;
+                        case ChunkEncodeBase.Ref r:
+                            bId = r.BucketId; bKey = r.BucketKey;
+                            expected = r.BaseBytes.ToByteArray();
+                            break;
+                        case ChunkEncodeBase.Mosaic m:
+                            // Mosaic chunks rely on donor chunks. If a donor chunk is missing,
+                            // the mosaic cannot be reconstructed. We must verify all donors.
+                            foreach (var donor in m.Info.Donors)
                             {
-                                try
+                                if (donor.BucketId != 0)
                                 {
-                                    string bitstring = UlongToBitstring(donor.BucketId);
-                                    string canonicalAgent = RendezvousRouter.PickAgent(bitstring);
-                                    byte[]? got = await _chunkReferenceClient.GetChunkByReferenceAsync(
-                                        donor.BucketId, donor.BucketKey,
-                                        targetAgent: string.IsNullOrWhiteSpace(canonicalAgent) ? null : canonicalAgent);
-                                    if (got == null || got.Length == 0)
+                                    try
+                                    {
+                                        string bitstring = UlongToBitstring(donor.BucketId);
+                                        string canonicalAgent = RendezvousRouter.PickAgent(bitstring);
+                                        byte[]? got = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                                            donor.BucketId, donor.BucketKey,
+                                            targetAgent: string.IsNullOrWhiteSpace(canonicalAgent) ? null : canonicalAgent);
+                                        if (got == null || got.Length == 0)
+                                        {
+                                            demote[i] = true;
+                                            break;
+                                        }
+                                    }
+                                    catch
                                     {
                                         demote[i] = true;
                                         break;
                                     }
                                 }
-                                catch
-                                {
-                                    demote[i] = true;
-                                    break;
-                                }
                             }
-                        }
+                            return;
+                        default:
+                            // Zeros (already self-contained) don't need a single-bucket round-trip probe.
+                            return;
+                    }
+                    if (bId == 0)
                         return;
-                    default:
-                        // Zeros (already self-contained) don't need a single-bucket round-trip probe.
-                        return;
-                }
-                if (bId == 0)
-                    return;
-                Interlocked.Increment(ref verifyEligible);
+                    Interlocked.Increment(ref verifyEligible);
 
-                try
-                {
-                    string bitstring = UlongToBitstring(bId);
-                    string canonicalAgent = RendezvousRouter.PickAgent(bitstring);
-                    byte[]? got = await _chunkReferenceClient.GetChunkByReferenceAsync(
-                        bId, bKey,
-                        targetAgent: string.IsNullOrWhiteSpace(canonicalAgent) ? null : canonicalAgent);
-                    if (got == null || got.Length != expected.Length
-                        || !got.AsSpan().SequenceEqual(expected))
+                    try
+                    {
+                        string bitstring = UlongToBitstring(bId);
+                        string canonicalAgent = RendezvousRouter.PickAgent(bitstring);
+                        byte[]? got = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                            bId, bKey,
+                            targetAgent: string.IsNullOrWhiteSpace(canonicalAgent) ? null : canonicalAgent);
+                        if (got == null || got.Length != expected.Length
+                            || !got.AsSpan().SequenceEqual(expected))
+                        {
+                            demote[i] = true;
+                        }
+                    }
+                    catch
                     {
                         demote[i] = true;
                     }
-                }
-                catch
-                {
-                    demote[i] = true;
-                }
-            });
-            await Task.WhenAll(verifyTasks);
+                });
 
             int demoted = 0;
             for (int i = 0; i < encodeBases.Length; i++)
@@ -4604,7 +4610,6 @@ public class CrossService : ICross
         // ── Fetch all base chunks in parallel ──
         var fetchSw = Stopwatch.StartNew();
         var baseChunks = new byte[chunkCount][];
-        var fetchTasks = new Task[chunkCount];
         int primaryHits = 0;
         int fallbackHits = 0;
 
@@ -4616,25 +4621,25 @@ public class CrossService : ICross
             catch { allAgentIps = null; }
         }
 
-        for (int i = 0; i < chunkCount; i++)
-        {
-            ulong bucketId = refBucketIds[i];
-            bool isZeroRef = isV3
-                ? (bucketId == 0 && string.IsNullOrEmpty(refStorageGuids[i]))
-                : (bucketId == 0 && refBucketIndices[i] == 0);
-            bool isMosaicRef = mosaicRefs.ContainsKey(i);
+        await Parallel.ForEachAsync(
+            Enumerable.Range(0, chunkCount),
+            new ParallelOptions { MaxDegreeOfParallelism = 100 },
+            async (i, ct) =>
+            {
+                ulong bucketId = refBucketIds[i];
+                bool isZeroRef = isV3
+                    ? (bucketId == 0 && string.IsNullOrEmpty(refStorageGuids[i]))
+                    : (bucketId == 0 && refBucketIndices[i] == 0);
+                bool isMosaicRef = mosaicRefs.ContainsKey(i);
 
-            if (isZeroRef)
-            {
-                baseChunks[i] = new byte[Globals.chunkSize];
-                fetchTasks[i] = Task.CompletedTask;
-            }
-            else if (isMosaicRef)
-            {
-                int idx = i;
-                var (donors, matchBitmap, selectors, donorPositions) = mosaicRefs[idx];
-                fetchTasks[i] = Task.Run(async () =>
+                if (isZeroRef)
                 {
+                    baseChunks[i] = new byte[Globals.chunkSize];
+                }
+                else if (isMosaicRef)
+                {
+                    int idx = i;
+                    var (donors, matchBitmap, selectors, donorPositions) = mosaicRefs[idx];
                     int subSize = Globals.MosaicSubChunkSize;
                     int nComp = Globals.MosaicNComponents;
                     int chSize = Globals.chunkSize;
@@ -4706,14 +4711,11 @@ public class CrossService : ICross
                     }
                     baseChunks[idx] = stitched;
                     Interlocked.Increment(ref primaryHits);
-                });
-            }
-            else if (byteMergeRefs.ContainsKey(i))
-            {
-                int idx = i;
-                var (bmDonors, bitmask) = byteMergeRefs[idx];
-                fetchTasks[i] = Task.Run(async () =>
+                }
+                else if (byteMergeRefs.ContainsKey(i))
                 {
+                    int idx = i;
+                    var (bmDonors, bitmask) = byteMergeRefs[idx];
                     int chSize = Globals.chunkSize;
                     var donorChunks = new byte[2][];
                     var donorFetches = new Task[2];
@@ -4754,14 +4756,11 @@ public class CrossService : ICross
                     }
                     baseChunks[idx] = merged;
                     Interlocked.Increment(ref primaryHits);
-                });
-            }
-            else
-            {
-                int idx = i;
-                ulong bId = bucketId;
-                fetchTasks[i] = Task.Run(async () =>
+                }
+                else
                 {
+                    int idx = i;
+                    ulong bId = bucketId;
                     // Route to the primary agent via RendezvousRouter
                     string bitstring = UlongToBitstring(bId);
                     string targetAgent = RendezvousRouter.PickAgent(bitstring);
@@ -4855,10 +4854,8 @@ public class CrossService : ICross
                     }
 
                     baseChunks[idx] = chunk;
-                });
-            }
-        }
-        await Task.WhenAll(fetchTasks);
+                }
+            });
         fetchSw.Stop();
         int zeroRefChunks = isV3
             ? Enumerable.Range(0, chunkCount).Count(i => refBucketIds[i] == 0 && string.IsNullOrEmpty(refStorageGuids[i]))
