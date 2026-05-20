@@ -46,6 +46,19 @@ public class CcfStoreService
         Console.WriteLine($"[CcfStore] Stored {fileId}.ccf ({ccfBytes.Length} bytes)");
     }
 
+    public async Task StoreCcfStreamAsync(string fileId, string sourcePath, CancellationToken ct = default)
+    {
+        string path = GetCcfPath(fileId);
+        string tempPath = path + ".tmp";
+        await using (var sourceStream = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, true))
+        await using (var destStream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, true))
+        {
+            await sourceStream.CopyToAsync(destStream, ct);
+        }
+        File.Move(tempPath, path, overwrite: true);
+        Console.WriteLine($"[CcfStore] Stored {fileId}.ccf from stream");
+    }
+
     public async Task<byte[]?> GetCcfAsync(string fileId, CancellationToken ct = default)
     {
         string ccfPath = GetCcfPath(fileId);
@@ -78,7 +91,11 @@ public class CcfStoreService
     {
         if (!Directory.Exists(_ccfDir)) yield break;
         foreach (var file in Directory.EnumerateFiles(_ccfDir, "*.ccf"))
+        {
+            // Skip large files (e.g., windowed CCFs) to prevent OOM during packing
+            if (new FileInfo(file).Length > 64 * 1024 * 1024) continue;
             yield return Path.GetFileNameWithoutExtension(file);
+        }
     }
 
     public IEnumerable<string> ListPackedCcfIds()

@@ -177,7 +177,7 @@ public class CompressFileService : FileService.FileServiceBase
     private static readonly System.Buffers.ArrayPool<byte> _windowBufPool =
         System.Buffers.ArrayPool<byte>.Create(
             maxArrayLength: 128 * 1024 * 1024,
-            maxArraysPerBucket: 8);
+            maxArraysPerBucket: 64);
 
     private static long GetMaxUploadBytes()
     {
@@ -254,6 +254,10 @@ public class CompressFileService : FileService.FileServiceBase
                     byte[] data = chunk.Data.ToByteArray();
                     await fs.WriteAsync(data, 0, data.Length, context.CancellationToken);
                     receivedBytes += data.Length;
+                    
+                    if (receivedBytes > 1024L * 1024 * 1024 * 100) // 100GB limit
+                        throw new RpcException(new Status(StatusCode.InvalidArgument, "File too large."));
+                        
                     if (chunk.Eof) break;
                 }
                 await fs.FlushAsync(context.CancellationToken);
@@ -300,6 +304,9 @@ public class CompressFileService : FileService.FileServiceBase
                 }
                 else
                 {
+                    if (receivedBytes > GetWindowedThreshold())
+                        throw new RpcException(new Status(StatusCode.InvalidArgument, $"Monolithic file too large. Max {GetWindowedThreshold()} bytes."));
+
                     byte[] ccfBytes = await File.ReadAllBytesAsync(tempPath, context.CancellationToken);
                     byte[] decompressedBytes = await crossService.DecompressFile(ccfBytes);
                     Console.WriteLine($"[DecompressStream] Decompressed {ccfBytes.Length} → {decompressedBytes.Length} bytes");
@@ -667,11 +674,9 @@ public class CompressFileService : FileService.FileServiceBase
         if (storeOnCluster && clusterTempFs != null && clusterTempPath != null)
         {
             await clusterTempFs.DisposeAsync();
-            byte[] ccfBytes = await File.ReadAllBytesAsync(clusterTempPath, context.CancellationToken);
+            await CcfStoreService.Instance.StoreCcfStreamAsync(fileIdHex, clusterTempPath, context.CancellationToken);
             try { File.Delete(clusterTempPath); } catch { }
-
-            await CcfStoreService.Instance.StoreCcfAsync(fileIdHex, ccfBytes, context.CancellationToken);
-            Console.WriteLine($"[Pipeline] Cluster-stored CCF: fileId={fileIdHex}, {ccfBytes.Length} bytes");
+            Console.WriteLine($"[Pipeline] Cluster-stored CCF: fileId={fileIdHex}, {compressedSize} bytes");
 
             await responseStream.WriteAsync(new FileUploadResponse
             {
@@ -938,6 +943,120 @@ public class CompressFileService : FileService.FileServiceBase
 
         // ── Compress ──
         var crossService = new MyCrossService();
+        long windowedThreshold = GetWindowedThreshold();
+
+        if (receivedBytes > windowedThreshold)
+        {
+            Console.WriteLine($"[ProcessFileStream] File grew to {receivedBytes} bytes (exceeds {windowedThreshold} threshold), switching to windowed compression.");
+            
+            string outTempPath = tempPath + ".out";
+            var (winCompressedSize, winReferencesFound, winTotalChunks) = await crossService.CompressFileWindowedAsync(tempPath, outTempPath, context.CancellationToken);
+            
+            byte[] winCompressedHash;
+            using (var compressedSha = SHA256.Create())
+            await using (var hashFs = new FileStream(outTempPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, true))
+            {
+                byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(1024 * 1024);
+                try
+                {
+                    int read;
+                    while ((read = await hashFs.ReadAsync(buf, 0, buf.Length, context.CancellationToken)) > 0)
+                        compressedSha.TransformBlock(buf, 0, read, null, 0);
+                    compressedSha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+                    winCompressedHash = compressedSha.Hash!;
+                }
+                finally { System.Buffers.ArrayPool<byte>.Shared.Return(buf); }
+            }
+
+            string winFileIdHex = Convert.ToHexString(uploadedSha256).ToLowerInvariant();
+
+            if (storeOnCluster)
+            {
+                await CcfStoreService.Instance.StoreCcfStreamAsync(winFileIdHex, outTempPath, context.CancellationToken);
+                Console.WriteLine($"[ProcessFileStream] Cluster-stored CCF: fileId={winFileIdHex}, {winCompressedSize} bytes");
+
+                await responseStream.WriteAsync(new FileUploadResponse
+                {
+                    Stats = new CompressionStats
+                    {
+                        OriginalSize = (ulong)receivedBytes,
+                        CompressedSize = (ulong)winCompressedSize,
+                        ReferencesFound = (uint)Math.Max(0, winReferencesFound),
+                        TotalChunks = (uint)Math.Max(0, winTotalChunks),
+                        CompressedSha256 = ByteString.CopyFrom(winCompressedHash),
+                        DatacenterBytesStored = 0,
+                        ServerProcessingMs = 0,
+                        AverageErrorRate = 0,
+                        ErrorPayloadBytes = 0,
+                        FileId = winFileIdHex
+                    }
+                });
+                await responseStream.WriteAsync(new FileUploadResponse
+                {
+                    Chunk = new FileChunk { Seq = 0, Data = ByteString.Empty, Eof = true }
+                });
+            }
+            else
+            {
+                await responseStream.WriteAsync(new FileUploadResponse
+                {
+                    Stats = new CompressionStats
+                    {
+                        OriginalSize = (ulong)receivedBytes,
+                        CompressedSize = (ulong)winCompressedSize,
+                        ReferencesFound = (uint)Math.Max(0, winReferencesFound),
+                        TotalChunks = (uint)Math.Max(0, winTotalChunks),
+                        CompressedSha256 = ByteString.CopyFrom(winCompressedHash),
+                        DatacenterBytesStored = 0,
+                        ServerProcessingMs = 0,
+                        AverageErrorRate = 0,
+                        ErrorPayloadBytes = 0
+                    }
+                });
+
+                await using var outFs = new FileStream(outTempPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, true);
+                const int outChunkSize = 1024 * 1024;
+                byte[] chunkBuf = new byte[outChunkSize];
+                uint seq = 0;
+                int read;
+                while ((read = await outFs.ReadAsync(chunkBuf, 0, outChunkSize, context.CancellationToken)) > 0)
+                {
+                    await responseStream.WriteAsync(new FileUploadResponse
+                    {
+                        Chunk = new FileChunk
+                        {
+                            Seq = seq++,
+                            Data = ByteString.CopyFrom(chunkBuf, 0, read),
+                            Eof = false
+                        }
+                    });
+                }
+                await responseStream.WriteAsync(new FileUploadResponse
+                {
+                    Chunk = new FileChunk { Seq = seq, Data = ByteString.Empty, Eof = true }
+                });
+            }
+
+            try { File.Delete(outTempPath); } catch { }
+
+            Console.WriteLine($"[ProcessFileStream] Monolithic (switched to windowed) DONE: {receivedBytes} → {winCompressedSize}");
+
+            jobWallSw.Stop();
+            Cross.Services.JobEvents.JobEventBus.EmitCompleted(
+                jobId,
+                (ulong)winCompressedSize,
+                Math.Max(0, winReferencesFound),
+                Math.Max(0, winTotalChunks),
+                0,
+                0,
+                jobWallSw.Elapsed.TotalMilliseconds,
+                0,
+                0,
+                winFileIdHex);
+            
+            return;
+        }
+
         byte[] fileBytes = await File.ReadAllBytesAsync(tempPath, context.CancellationToken);
 
         var compressSw = System.Diagnostics.Stopwatch.StartNew();

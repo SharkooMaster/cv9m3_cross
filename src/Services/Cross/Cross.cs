@@ -4091,6 +4091,9 @@ public class CrossService : ICross
                 originalLen = br.ReadInt64();
             }
 
+            if (compressedLen < 0 || compressedLen > inputFs.Length - inputFs.Position)
+                throw new InvalidDataException($"Invalid compressed block length: {compressedLen}");
+
             byte[] compressedBlock = new byte[compressedLen];
             int totalRead = 0;
             while (totalRead < compressedLen)
@@ -4180,6 +4183,9 @@ public class CrossService : ICross
                 compressedLen = br.ReadInt64();
                 originalLen = br.ReadInt64();
             }
+
+            if (compressedLen < 0 || compressedLen > inputFs.Length - inputFs.Position)
+                throw new InvalidDataException($"Invalid compressed block length: {compressedLen}");
 
             byte[] compressedBlock = new byte[compressedLen];
             int totalRead = 0;
@@ -4290,6 +4296,8 @@ public class CrossService : ICross
             int off = referencesOffset;
             chunkCount = BitConverter.ToInt32(file, off);
             off += sizeof(int);
+            if (chunkCount < 0 || chunkCount > file.Length)
+                throw new InvalidDataException($"Invalid chunk count: {chunkCount}");
             ushort refTableSize = BitConverter.ToUInt16(file, off);
             off += sizeof(ushort);
 
@@ -4395,6 +4403,8 @@ public class CrossService : ICross
             int off = referencesOffset;
             chunkCount = BitConverter.ToInt32(file, off);
             off += sizeof(int);
+            if (chunkCount < 0 || chunkCount > file.Length)
+                throw new InvalidDataException($"Invalid chunk count: {chunkCount}");
 
             refBucketIds = new ulong[chunkCount];
             refBucketIndices = new ulong[chunkCount];
