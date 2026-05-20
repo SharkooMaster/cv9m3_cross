@@ -287,12 +287,15 @@ public class CrossService : ICross
     /// v5.0.0: Build compact references as byte[] using a ref table + ushort indices.
     /// The caller passes this to BuildCompressedPayload which handles the standard header,
     /// error-dict zstd, SHA256 hash, etc.
+    ///
+    /// Reads <paramref name="encodeBases"/> exclusively — the same source of truth
+    /// PatchEncode consults. Encoder and decoder cannot disagree on the diff basis
+    /// for any chunk: the EncodeBase variant determines both the basis bytes the
+    /// encoder subtracts AND the ref byte (and therefore the decoder's recovery path).
     /// </summary>
-    private static byte[] BuildV5References(
-        QueryResponseObject?[] sorted,
-        ConcurrentDictionary<int, MosaicChunkInfo> mosaicInfos)
+    private static byte[] BuildV5References(ChunkEncodeBase[] encodeBases)
     {
-        int chunkCount = sorted.Length;
+        int chunkCount = encodeBases.Length;
 
         var refTable = new List<(ulong BucketId, ulong BucketIndex)>();
         var refTableLookup = new Dictionary<(ulong, ulong), ushort>();
@@ -311,15 +314,21 @@ public class CrossService : ICross
         // Pre-populate ref table
         for (int i = 0; i < chunkCount; i++)
         {
-            if (sorted[i]!.BucketId == 0) continue;
-            if (mosaicInfos.TryGetValue(i, out var mosaic) && mosaic.Donors.Count > 0)
+            switch (encodeBases[i])
             {
-                foreach (var (dBucketId, dBucketKey) in mosaic.Donors)
-                    GetOrAddRef(dBucketId, dBucketKey);
-            }
-            else
-            {
-                GetOrAddRef(sorted[i]!.BucketId, sorted[i]!.BucketKey);
+                case ChunkEncodeBase.Mosaic m when m.Info.Donors.Count > 0:
+                    foreach (var (dBucketId, dBucketKey) in m.Info.Donors)
+                        GetOrAddRef(dBucketId, dBucketKey);
+                    break;
+                case ChunkEncodeBase.SelfFresh sf:
+                    GetOrAddRef(sf.BucketId, sf.BucketKey);
+                    break;
+                case ChunkEncodeBase.RepFresh rf:
+                    GetOrAddRef(rf.BucketId, rf.BucketKey);
+                    break;
+                case ChunkEncodeBase.Ref r:
+                    GetOrAddRef(r.BucketId, r.BucketKey);
+                    break;
             }
         }
 
@@ -340,47 +349,62 @@ public class CrossService : ICross
             bw.Write(bucketIndex);
         }
 
-        // Per-chunk references
+        // Per-chunk references — one switch per chunk, exhaustive over the
+        // ChunkEncodeBase variants. Any future variant must extend this switch
+        // or the compiler will warn (and the runtime throws).
         for (int i = 0; i < chunkCount; i++)
         {
-            if (mosaicInfos.TryGetValue(i, out var mosaic) && mosaic.Donors.Count > 0)
+            switch (encodeBases[i])
             {
-                if (mosaic.IsByteMerge && mosaic.Donors.Count == 2)
-                {
-                    // 0x05: byte-level pair merge — 2 donors + per-byte bitmask
-                    bw.Write((byte)0x05);
-                    bw.Write(GetOrAddRef(mosaic.Donors[0].BucketId, mosaic.Donors[0].BucketKey));
-                    bw.Write(GetOrAddRef(mosaic.Donors[1].BucketId, mosaic.Donors[1].BucketKey));
-                    bw.Write(mosaic.ByteMergeBitmask);
-                    continue;
-                }
+                case ChunkEncodeBase.Mosaic m when m.Info.Donors.Count > 0:
+                    if (m.Info.IsByteMerge && m.Info.Donors.Count == 2)
+                    {
+                        // 0x05: byte-level pair merge — 2 donors + per-byte bitmask
+                        bw.Write((byte)0x05);
+                        bw.Write(GetOrAddRef(m.Info.Donors[0].BucketId, m.Info.Donors[0].BucketKey));
+                        bw.Write(GetOrAddRef(m.Info.Donors[1].BucketId, m.Info.Donors[1].BucketKey));
+                        bw.Write(m.Info.ByteMergeBitmask);
+                    }
+                    else
+                    {
+                        bw.Write((byte)0x04);
+                        bw.Write((byte)m.Info.Donors.Count);
+                        foreach (var (dBucketId, dBucketKey) in m.Info.Donors)
+                            bw.Write(GetOrAddRef(dBucketId, dBucketKey));
+                        bw.Write(m.Info.MatchBitmap);
+                        bw.Write(m.Info.Selectors);
+                        bw.Write(m.Info.DonorPositions);
+                    }
+                    break;
 
-                bw.Write((byte)0x04);
-                bw.Write((byte)mosaic.Donors.Count);
-                foreach (var (dBucketId, dBucketKey) in mosaic.Donors)
-                    bw.Write(GetOrAddRef(dBucketId, dBucketKey));
-                bw.Write(mosaic.MatchBitmap);
-                bw.Write(mosaic.Selectors);
-                bw.Write(mosaic.DonorPositions);
-                continue;
-            }
+                case ChunkEncodeBase.SelfFresh sf:
+                    bw.Write((byte)0x02);
+                    bw.Write(GetOrAddRef(sf.BucketId, sf.BucketKey));
+                    break;
 
-            if (sorted[i]!.BucketId == 0)
-            {
-                bw.Write((byte)0x00);
-                continue;
-            }
+                case ChunkEncodeBase.RepFresh rf:
+                    bw.Write((byte)0x01);
+                    bw.Write(GetOrAddRef(rf.BucketId, rf.BucketKey));
+                    break;
 
-            ushort tableIdx = GetOrAddRef(sorted[i]!.BucketId, sorted[i]!.BucketKey);
-            if (sorted[i]!.NeedToStore)
-            {
-                bw.Write((byte)0x02);
-                bw.Write(tableIdx);
-            }
-            else
-            {
-                bw.Write((byte)0x01);
-                bw.Write(tableIdx);
+                case ChunkEncodeBase.Ref r:
+                    bw.Write((byte)0x01);
+                    bw.Write(GetOrAddRef(r.BucketId, r.BucketKey));
+                    break;
+
+                case ChunkEncodeBase.Zeros:
+                    bw.Write((byte)0x00);
+                    break;
+
+                case ChunkEncodeBase.Mosaic:
+                    // Degenerate mosaic (0 donors) — encode as zero-ref fallback so
+                    // the decoder doesn't try to consume a malformed donor table.
+                    bw.Write((byte)0x00);
+                    break;
+
+                default:
+                    throw new InvalidOperationException(
+                        $"Unknown ChunkEncodeBase variant at chunk {i}: {encodeBases[i].GetType().Name}");
             }
         }
 
@@ -968,7 +992,17 @@ public class CrossService : ICross
         Console.WriteLine($"[Compress] Route: {phaseSw.ElapsedMilliseconds}ms, {representativeSet.Count} reps (of {fileChunks.Count} chunks) → {agentChunkBuckets.Count} agents");
 
         // ── Phase 2: Fire BatchGet per agent — each gets ONLY its own buckets ──
-        var sorted = new QueryResponseObject?[fileChunks.Count];
+        // pipelineState owns the per-chunk encode/decode contract. The legacy
+        // QueryResponseObject?[] sorted array is kept as a wire-DTO mirror and
+        // is updated whenever encodeBases changes (see ChunkPipelineState.SetEncodeBase).
+        // No code below this point may mutate sorted[i].(BucketId|BucketKey|StorageGuid|
+        // TargetAgent|Chunk) directly — every encode-contract mutation MUST go through
+        // pipelineState.SetEncodeBase to keep the wire mirror and the source of truth
+        // in lock-step. That invariant is what eliminates the encoder/decoder-disagree
+        // bug class (see ChunkEncodeBase.cs xmldoc).
+        var pipelineState = new global::Cross.Services.Cross.ChunkPipelineState(fileChunks.Count);
+        var sorted = pipelineState.Sorted;
+        var encodeBases = pipelineState.EncodeBases;
         // Mosaic: collect top-K candidates per high-entropy chunk (keyed by chunk index)
         var mosaicCandidates = new ConcurrentDictionary<int, List<SearchVectorObject>>();
         {
@@ -1092,7 +1126,7 @@ public class CrossService : ICross
 
                                         if (sim > current)
                                         {
-                                            sorted[idx] = new QueryResponseObject
+                                            pipelineState.AdoptSearchResponse(idx, new QueryResponseObject
                                             {
                                                 BucketId = best.BucketId,
                                                 BucketKey = (ulong)best.BucketKey,
@@ -1103,7 +1137,7 @@ public class CrossService : ICross
                                                 NeedToStore = false,
                                                 TargetAgent = agent,
                                                 StorageGuid = best.StorageGuid ?? ""
-                                            };
+                                            });
                                         }
                                     }
 
@@ -1153,7 +1187,11 @@ public class CrossService : ICross
                 ("agents", agentChunkBuckets.Count), ("queries", fileChunks.Count));
         }
 
-        // Fill representatives that NO agent had a match for → need to store on main agent
+        // Fill representatives that NO agent had a match for → need to store on main agent.
+        // EncodeBase stays as Zeros (the default) until BatchStore runs and assigns a
+        // SelfFresh / Ref via the response handler; only the pipeline flow flags
+        // (NeedToStore, TargetAgent) need to be primed here so the store-groups loop
+        // picks the chunk up and ships it to the right agent.
         for (int i = 0; i < sorted.Length; i++)
         {
             if (!representativeSet.Contains(i)) continue;
@@ -1166,12 +1204,17 @@ public class CrossService : ICross
                     Index = i, Duplicate = true,
                     NeedToStore = true, TargetAgent = mainAgents[i]
                 };
+                // encodeBases[i] remains Zeros (set by ChunkPipelineState constructor).
             }
         }
 
         // Propagate representative results to non-representative group members.
         // Each non-rep shares the same agent reference as its rep — the diff encoding
-        // will compute the byte-level difference against the rep's base chunk.
+        // will compute the byte-level difference against the rep's base chunk. At this
+        // point BatchStore hasn't run yet, so reps are either Ref (had L1 match) or
+        // Zeros (no match → fresh-store later). For Zeros reps the non-rep also stays
+        // Zeros; the post-store rep propagation later folds Ref/SelfFresh/Mosaic state
+        // from rep into the non-rep using the same SelfFresh→RepFresh adaptation rule.
         for (int i = 0; i < sorted.Length; i++)
         {
             if (representativeSet.Contains(i)) continue;
@@ -1189,13 +1232,13 @@ public class CrossService : ICross
                 TargetAgent = repResult.TargetAgent,
                 StorageGuid = repResult.StorageGuid ?? ""
             };
+            // EncodeBase mirrors rep's (which is Ref or Zeros at this point).
+            encodeBases[i] = encodeBases[rep];
         }
 
         // Release search-phase allocations early (async state machine keeps locals alive otherwise)
         allBuckets = null!;
         agentChunkBuckets = null!;
-
-        var mosaicInfos = new ConcurrentDictionary<int, MosaicChunkInfo>();
 
         // ── SMART REFERENCE SELECTION + PAIR MERGE ──
         // For each chunk with Top-K candidates, find the single candidate with the fewest
@@ -1311,16 +1354,16 @@ public class CrossService : ICross
                             (svoB.BucketId, (ulong)svoB.BucketKey)
                         }
                     };
-                    mosaicInfos[idx] = info;
                     sorted[idx]!.NeedToStore = false;
-                    sorted[idx]!.Chunk = ByteString.CopyFrom(merged);
+                    pipelineState.SetEncodeBase(idx, new ChunkEncodeBase.Mosaic(info));
                     Interlocked.Increment(ref pairMerged);
                 }
                 else if (bestSingleIdx >= 0 && bestSingleDiffs < currentDiffs)
                 {
-                    // Single byte-best upgrade
+                    // Single byte-best upgrade — adopt this candidate as the Ref base.
                     var best = candBytes[bestSingleIdx].svo;
-                    sorted[idx] = new QueryResponseObject
+                    string keptAgent = sorted[idx]?.TargetAgent ?? "";
+                    var adopted = new QueryResponseObject
                     {
                         BucketId = best.BucketId,
                         BucketKey = (ulong)best.BucketKey,
@@ -1329,9 +1372,10 @@ public class CrossService : ICross
                         Index = idx,
                         Duplicate = true,
                         NeedToStore = false,
-                        TargetAgent = sorted[idx]?.TargetAgent ?? "",
+                        TargetAgent = keptAgent,
                         StorageGuid = best.StorageGuid ?? ""
                     };
+                    pipelineState.AdoptSearchResponse(idx, adopted);
                     Interlocked.Increment(ref smartUpgraded);
                 }
             });
@@ -1452,14 +1496,21 @@ public class CrossService : ICross
 
                 info.Donors = donors.Select(d => (d.BucketId, d.BucketKey)).ToList();
                 info.StitchedBase = stitched;
-                mosaicInfos[idx] = info;
-
-                // Replace the empty base chunk with the stitched mosaic
-                sorted[idx]!.Chunk = ByteString.CopyFrom(stitched);
+                // NOTE: NeedToStore is INTENTIONALLY not flipped here. Mosaic-L2 Assembly
+                // produces a stitched base for chunks that have no L1 match (rep.BucketId == 0
+                // && rep.NeedToStore == true) — the chunk still needs to be stored fresh so
+                // its bytes are available for future deduplication, but the diff against the
+                // stitched mosaic is written into the CCF in addition. The store-groups loop
+                // picks it up because NeedToStore stays true; after BatchStore the EncodeBase
+                // gets overwritten with SelfFresh, which is the desired final state.
+                pipelineState.SetEncodeBase(idx, new ChunkEncodeBase.Mosaic(info));
             });
 
+            int mosaicCount = 0;
+            for (int i = 0; i < encodeBases.Length; i++)
+                if (encodeBases[i] is ChunkEncodeBase.Mosaic) mosaicCount++;
             swMosaic.Stop();
-            Console.WriteLine($"[Compress] Mosaic L2: {swMosaic.ElapsedMilliseconds}ms, {mosaicInfos.Count}/{mosaicCandidates.Count} chunks assembled");
+            Console.WriteLine($"[Compress] Mosaic L2: {swMosaic.ElapsedMilliseconds}ms, {mosaicCount}/{mosaicCandidates.Count} chunks assembled");
         }
 
         // ── GLOBAL LANE SEARCH (Level 2 sub-chunk index) ──
@@ -1480,7 +1531,7 @@ public class CrossService : ICross
                 if (sorted[i] == null || !sorted[i]!.NeedToStore) continue;
                 if (!chunkMap.TryGetValue(i, out var src) || src == null) continue;
                 // Skip chunks that already have a full mosaic assembly
-                if (mosaicInfos.ContainsKey(i)) continue;
+                if (encodeBases[i] is ChunkEncodeBase.Mosaic) continue;
                 laneTargets.Add(i);
             }
 
@@ -1630,10 +1681,8 @@ public class CrossService : ICross
 
                         info.Donors = donors.Select(d => (d.BucketId, d.BucketKey)).ToList();
                         info.StitchedBase = stitched;
-                        mosaicInfos[idx] = info;
-
                         sorted[idx]!.NeedToStore = false;
-                        sorted[idx]!.Chunk = ByteString.CopyFrom(stitched);
+                        pipelineState.SetEncodeBase(idx, new ChunkEncodeBase.Mosaic(info));
                         Interlocked.Increment(ref laneSaved);
                     });
                 }
@@ -1749,21 +1798,66 @@ public class CrossService : ICross
                                             continue;
                                         }
 
-                                        batchItems[j].response.BucketId = storeRes.Id;
-                                        batchItems[j].response.BucketKey = storeRes.Index;
-                                        batchItems[j].response.StorageGuid = storeRes.StorageGuid ?? "";
+                                        int chunkIdx = batchItems[j].index;
+                                        string storedAgent = agent;
+
+                                        // The Mosaic-L2 Assembly path can mark a chunk
+                                        // NeedToStore=true for ambient L1 source while
+                                        // already holding a Mosaic EncodeBase — DO NOT
+                                        // overwrite that with SelfFresh / Ref. The chunk
+                                        // is encoded via stitched donors; the fresh-store
+                                        // exists only so future similar chunks can find
+                                        // it as an L1 candidate. Record the bucket coords
+                                        // as ambient bookkeeping, leave EncodeBase alone.
+                                        if (encodeBases[chunkIdx] is ChunkEncodeBase.Mosaic)
+                                        {
+                                            pipelineState.RecordAmbientFreshStore(
+                                                chunkIdx,
+                                                storeRes.Id,
+                                                storeRes.Index,
+                                                storeRes.StorageGuid ?? "",
+                                                storedAgent);
+                                            if (storeRes.WasDeduplicated)
+                                            {
+                                                batchItems[j].response.NeedToStore = false;
+                                                batchItems[j].response.Duplicate = true;
+                                                batchItems[j].response.Similarity = storeRes.Similarity;
+                                                dedupedAtStore++;
+                                            }
+                                            else
+                                            {
+                                                freshlyStored++;
+                                            }
+                                            continue;
+                                        }
 
                                         if (storeRes.WasDeduplicated)
                                         {
+                                            // Store-time similarity dedup: the agent
+                                            // matched our bytes against an existing
+                                            // chunk and returned that chunk's bytes
+                                            // as BaseChunk. Adopt it as our Ref base.
+                                            var baseBytes = storeRes.BaseChunk ?? ByteString.Empty;
+                                            pipelineState.SetEncodeBase(chunkIdx,
+                                                new ChunkEncodeBase.Ref(
+                                                    storeRes.Id,
+                                                    storeRes.Index,
+                                                    storeRes.StorageGuid ?? "",
+                                                    storedAgent,
+                                                    baseBytes));
                                             batchItems[j].response.NeedToStore = false;
                                             batchItems[j].response.Duplicate = true;
                                             batchItems[j].response.Similarity = storeRes.Similarity;
-                                            if (storeRes.BaseChunk != null && storeRes.BaseChunk.Length > 0)
-                                                batchItems[j].response.Chunk = storeRes.BaseChunk;
                                             dedupedAtStore++;
                                         }
                                         else
                                         {
+                                            pipelineState.SetEncodeBase(chunkIdx,
+                                                new ChunkEncodeBase.SelfFresh(
+                                                    storeRes.Id,
+                                                    storeRes.Index,
+                                                    storeRes.StorageGuid ?? "",
+                                                    storedAgent));
                                             freshlyStored++;
                                         }
                                     }
@@ -1836,13 +1930,15 @@ public class CrossService : ICross
         if (global::Cross.Services.JobEvents.IntegrityDiagnostics.Enabled)
         {
             var sortedSnapshot = sorted;
+            var encodeBasesSnapshot = encodeBases;
             var chunkMapSnapshot = chunkMap;
-            // Snapshot mosaic indices: those chunks have Chunk = stitched bytes
-            // from N donors and a different decode contract (reference type
-            // 0x03). sha256(Chunk) is intentionally NOT equal to StorageGuid
-            // for mosaics, so they must be excluded from the dedup-hit check
-            // or we'd flag the working mosaic feature as 12% corruption.
-            var mosaicSet = new HashSet<int>(mosaicInfos.Keys);
+            // Mosaic chunks have a different decode contract (re-stitch from donors
+            // instead of fetch-by-bucket). sha256(stored bytes) is intentionally NOT
+            // equal to the agent-returned StorageGuid for mosaics — exclude them or
+            // we'd flag the working mosaic feature as 12% corruption.
+            int mosaicCount = 0;
+            for (int i = 0; i < encodeBasesSnapshot.Length; i++)
+                if (encodeBasesSnapshot[i] is ChunkEncodeBase.Mosaic) mosaicCount++;
 
             var swNew = Stopwatch.StartNew();
             var newStoreResult = global::Cross.Services.JobEvents.IntegrityDiagnostics.VerifyHashes(
@@ -1865,14 +1961,13 @@ public class CrossService : ICross
                 sortedSnapshot.Length,
                 i =>
                 {
-                    var r = sortedSnapshot[i];
-                    if (r == null || string.IsNullOrEmpty(r.StorageGuid) || r.NeedToStore)
-                        return (null, null);
-                    if (mosaicSet.Contains(i))
-                        return (null, null); // mosaic decode path — see comment above
-                    if (r.Chunk != null && r.Chunk.Length > 0)
-                        return (r.StorageGuid, r.Chunk.ToByteArray());
-                    return (null, null);
+                    // Only check Ref-encoded chunks — SelfFresh/RepFresh/Zeros aren't
+                    // dedup-hits, Mosaic uses the donor-stitch contract (no single
+                    // (B,K)→sha relationship to verify).
+                    if (encodeBasesSnapshot[i] is not ChunkEncodeBase.Ref r) return (null, null);
+                    if (string.IsNullOrEmpty(r.StorageGuid)) return (null, null);
+                    if (r.BaseBytes.Length == 0) return (null, null);
+                    return (r.StorageGuid, r.BaseBytes.ToByteArray());
                 });
             swDedup.Stop();
             global::Cross.Services.JobEvents.IntegrityDiagnostics.Emit(
@@ -1882,73 +1977,67 @@ public class CrossService : ICross
             // dedup rows that use the stitched-base reference type. Zero
             // mismatches expected (we don't check sha256 for them); the
             // dashboard just shows the count alongside the other stages.
-            if (mosaicSet.Count > 0)
+            if (mosaicCount > 0)
             {
                 global::Cross.Services.JobEvents.JobEventBus.EmitStageDone(
                     "IntegrityCheck:StoreRoundTrip:Mosaic",
                     0,
-                    chunkCount: mosaicSet.Count,
+                    chunkCount: mosaicCount,
                     bucketCount: 0,
                     bytes: 0);
             }
         }
 
-        // ── Post-store: NO mosaic cleanup ──
-        // A previous version of this code wiped mosaicInfos[i] for every entry whose
-        // sorted[i].NeedToStore == false, on the theory that BatchStore may have
-        // resolved the chunk against an existing stored base (so the mosaic donor
-        // selection is now stale). That theory does not match the actual pipeline:
-        // every mosaic-rescue path (SmartRefSelect pair-merge, Mosaic-L2 assembly,
-        // Lane-L2 global) sets sorted[i].NeedToStore = false at the same moment it
-        // installs the stitched bytes into sorted[i].Chunk and registers donors in
-        // mosaicInfos[i]. The store-groups loop above only picks up NeedToStore=true
-        // rows, so mosaic-rescued chunks never reach BatchStore and their state never
-        // changes here. The "cleanup" therefore deleted 100% of legitimate mosaic
-        // entries that were created BEFORE this point.
+        // ── Post-store: propagate updated rep EncodeBase to non-reps ──
         //
-        // The downstream effect was silent decode corruption: BuildV5References no
-        // longer saw mosaicInfos[i], so it wrote a plain 0x01 dedup ref pointing at
-        // sorted[i].BucketId/BucketKey (one of the original L1 candidates). But
-        // PatchEncode still found sorted[i].Chunk populated and computed the diff
-        // against the stitched bytes. At decompress, the agent returned the L1
-        // candidate's bytes for (BucketId, BucketKey) and the diff was applied on
-        // top of the wrong base — producing the case=dedup-cached / isRep=True /
-        // needToStore=False INTEGRITY_SMOKETEST failures (encBaseSha ≠ sgid while
-        // tgtFetchSha == sgid == sgidFetchSha) and the matching INTEGRITY_DECOMPRESS
-        // whole-block SHA mismatches.
+        // After BatchStore, every representative has a definitive EncodeBase. Non-reps
+        // need to adopt the rep's encode contract atomically — copying just one or two
+        // fields out of the legacy QueryResponseObject triple (Chunk / BucketId / mosaic)
+        // is exactly how the silent-corruption bug class got introduced multiple times
+        // in this file's history. Going through the sum type means the encoder and the
+        // decoder cannot disagree by construction.
         //
-        // Mosaic chunks that bloat-restore later re-promotes to NeedToStore=true are
-        // handled inside the bloat-restore block; the bloat-fallback mosaic adds
-        // (Mosaic-L2 fallback, Lane-fallback) happen after this point and are not
-        // affected either way.
-
-        // ── Post-store: propagate updated store results to non-rep group members ──
-        // After BatchStore, representatives now have final BucketId/BucketKey/StorageGuid.
-        // Non-reps need these values updated so their references point to the stored rep.
+        // Adaptation rule (rep variant → non-rep variant):
+        //   Zeros       → Zeros           (rep's search found nothing AND nothing
+        //                                  rescued it — pathological; surfaces as 0x00
+        //                                  zero-ref for both, decoder applies diff vs
+        //                                  zeros for both, consistent.)
+        //   SelfFresh   → RepFresh        (rep stores its OWN bytes fresh; non-rep
+        //                                  must diff against rep's bytes (fileChunks[rep])
+        //                                  and reference rep's bucket — that's exactly
+        //                                  what the legacy DiffEncode "rep[N]-fresh"
+        //                                  branch did, now made first-class.)
+        //   Ref         → Ref(same)       (rep found an L1 match or got store-time
+        //                                  dedup'd into an existing chunk; the L1
+        //                                  match's bytes are what's stored at the
+        //                                  bucket, so non-rep diffs against the same
+        //                                  bytes and references the same bucket.)
+        //   Mosaic      → Mosaic(same)    (rep's basis is a stitched composite of
+        //                                  multiple donors; non-rep diffs against the
+        //                                  same composite and the decoder re-stitches
+        //                                  from the same donors. Sharing the same
+        //                                  MosaicChunkInfo reference is safe — the
+        //                                  struct is immutable from this point on.)
         //
-        // CRITICAL: TargetAgent MUST be propagated too. A non-rep's TargetAgent was set
-        // by its own search response (whichever agent answered for the non-rep's
-        // bitstring). After we overwrite BucketId/BucketKey to point at the rep's
-        // bucket, that bucket lives on the rep's agent — so any subsequent fetch
-        // (lazy base-chunk fetch + decompress-time GetChunkByReference + the
-        // smoketest's diagnostic fetch) must go to the rep's agent or it will
-        // hit a different agent's view of (B,K) and silently use the wrong base
-        // chunk. That's exactly the divergence that produced ~62/4096 dedup-cached
-        // smoketest failures in fresh-cluster runs (encoderBaseSha consistent
-        // with sorted[i].StorageGuid, fetchedBaseSha pointing at a different
-        // chunk because cross was querying the wrong agent).
+        // TargetAgent propagation: SetEncodeBase projects TargetAgent from whichever
+        // variant carries one (SelfFresh / RepFresh / Ref). For Mosaic the variant
+        // doesn't carry one (the decoder talks to multiple agents, one per donor) so
+        // sorted[i].TargetAgent stays at whatever the search phase set — which is
+        // correct because no fetch-by-single-bucket happens for mosaic chunks.
         if (Globals.EnableChunkClustering)
         {
             for (int i = 0; i < sorted.Length; i++)
             {
                 if (representativeSet.Contains(i)) continue;
                 int rep = groupRepresentative[i];
-                var repResult = sorted[rep]!;
-                sorted[i].BucketId = repResult.BucketId;
-                sorted[i].BucketKey = repResult.BucketKey;
-                sorted[i].StorageGuid = repResult.StorageGuid ?? "";
-                sorted[i].Chunk = repResult.Chunk;
-                sorted[i].TargetAgent = repResult.TargetAgent ?? sorted[i].TargetAgent;
+                var repBase = encodeBases[rep];
+                ChunkEncodeBase nonRepBase = repBase switch
+                {
+                    ChunkEncodeBase.SelfFresh sf => new ChunkEncodeBase.RepFresh(
+                        sf.BucketId, sf.BucketKey, sf.StorageGuid, sf.TargetAgent, rep),
+                    _ => repBase,
+                };
+                pipelineState.SetEncodeBase(i, nonRepBase);
             }
         }
 
@@ -2083,25 +2172,31 @@ public class CrossService : ICross
                         "FetchedBases", fetchResult, swIntegrityFetch.Elapsed.TotalMilliseconds);
                 }
 
-                // Inject fetched chunks into sorted results AND re-derive the
-                // (Chunk, StorageGuid, TargetAgent) invariant from the fetched
-                // bytes. The previous version only updated Chunk, leaving
-                // StorageGuid stale from the search response — so subsequent
-                // code (and the smoketest) saw SHA(Chunk) ≠ StorageGuid even
-                // though both pieces individually came from the cluster, just
-                // from different points in time / different agents. Anchor
-                // everything to the bytes the canonical-agent JUST returned:
-                // that's what DecompressFile will see, so that's the only
-                // source of truth that matters for encode correctness.
+                // Inject fetched chunks into the encode contract AND re-derive the
+                // (BaseBytes, StorageGuid, TargetAgent) tuple from the fetched bytes.
+                // A previous version only updated Chunk, leaving StorageGuid stale
+                // from the search response — so subsequent code (and the smoketest)
+                // saw SHA(Chunk) ≠ StorageGuid even though both pieces individually
+                // came from the cluster, just from different points in time / different
+                // agents. The bytes the canonical agent JUST returned are what
+                // DecompressFile will see, so that's the only source of truth that
+                // matters for encode correctness: re-issue a Ref EncodeBase from
+                // those bytes atomically.
                 for (int i = 0; i < sorted.Length; i++)
                 {
                     var fetched = fetchedChunks[i];
                     if (fetched == null) continue;
+                    if (encodeBases[i] is not ChunkEncodeBase.Ref currentRef) continue;
 
-                    sorted[i].Chunk = ByteString.CopyFrom(fetched);
-                    sorted[i].StorageGuid = Convert.ToHexString(SHA256.HashData(fetched)).ToLowerInvariant();
-                    if (!string.IsNullOrWhiteSpace(fetchedFromAgent[i]))
-                        sorted[i].TargetAgent = fetchedFromAgent[i];
+                    string newAgent = !string.IsNullOrWhiteSpace(fetchedFromAgent[i])
+                        ? fetchedFromAgent[i]!
+                        : currentRef.TargetAgent;
+                    pipelineState.SetEncodeBase(i, new ChunkEncodeBase.Ref(
+                        currentRef.BucketId,
+                        currentRef.BucketKey,
+                        Convert.ToHexString(SHA256.HashData(fetched)).ToLowerInvariant(),
+                        newAgent,
+                        ByteString.CopyFrom(fetched)));
                 }
 
                 // ── CRITICAL: Handle failed base chunk fetches ──
@@ -2124,9 +2219,9 @@ public class CrossService : ICross
                 }
                 else
                 {
-                            // No agent to store to — clear reference so zeros-diff is at least correct
-                            sorted[idx].BucketId = 0;
-                            sorted[idx].BucketKey = 0;
+                            // No agent to store to — clear reference so zeros-diff is at least correct.
+                            // Drop EncodeBase to Zeros so encoder and decoder both diff against zeros.
+                            pipelineState.SetEncodeBase(idx, ChunkEncodeBase.Zeros.Instance);
                         }
                     }
                 }
@@ -2154,9 +2249,6 @@ public class CrossService : ICross
                                 storeReq.Vector.AddRange(item.vector);
                                 storeReq.Chunk = ByteString.CopyFrom(item.chunk);
                                 var storeRes = await client.StoreAsync(storeReq);
-                                item.resp.BucketId = storeRes.Id;
-                                item.resp.BucketKey = storeRes.Index;
-                                item.resp.StorageGuid = storeRes.StorageGuid ?? "";
                                 // If the agent silently similarity-dedup'd the second store, the
                                 // returned storage_guid is the BASE chunk's GUID — not sha256 of
                                 // the bytes we just sent. Reflect that in our bookkeeping so the
@@ -2165,14 +2257,24 @@ public class CrossService : ICross
                                 // primary BatchStore handler above.)
                                 if (storeRes.WasDeduplicated)
                                 {
+                                    var baseBytes = storeRes.BaseChunk ?? ByteString.Empty;
+                                    pipelineState.SetEncodeBase(item.index, new ChunkEncodeBase.Ref(
+                                        storeRes.Id,
+                                        storeRes.Index,
+                                        storeRes.StorageGuid ?? "",
+                                        item.agent,
+                                        baseBytes));
                                     item.resp.NeedToStore = false;
                                     item.resp.Duplicate = true;
                                     item.resp.Similarity = storeRes.Similarity;
-                                    if (storeRes.BaseChunk != null && storeRes.BaseChunk.Length > 0)
-                                        item.resp.Chunk = storeRes.BaseChunk;
                                 }
                                 else
                                 {
+                                    pipelineState.SetEncodeBase(item.index, new ChunkEncodeBase.SelfFresh(
+                                        storeRes.Id,
+                                        storeRes.Index,
+                                        storeRes.StorageGuid ?? "",
+                                        item.agent));
                                     item.resp.NeedToStore = true;
                                     item.resp.Similarity = 1.0f; // base == original → empty diff
                                 }
@@ -2180,9 +2282,8 @@ public class CrossService : ICross
                         }
                         catch
                         {
-                            // Store also failed — clear reference (zeros-diff is correct for (0,0) refs)
-                            item.resp.BucketId = 0;
-                            item.resp.BucketKey = 0;
+                            // Store also failed — drop EncodeBase to Zeros (zeros-diff is correct).
+                            pipelineState.SetEncodeBase(item.index, ChunkEncodeBase.Zeros.Instance);
                         }
                     }).ToList();
                     await Task.WhenAll(fixTasks);
@@ -2255,9 +2356,7 @@ public class CrossService : ICross
                 // paths feeding the encode case decision). Skip it.
                 if (Globals.EnableCcfStore && differingByteCount > threshold)
                 {
-                    sorted[i].NeedToStore = true;
-                    sorted[i].Similarity = 1.0f;
-                    sorted[i].TargetAgent = mainAgents[i];
+                    pipelineState.PrepareReStoreRouting(i, mainAgents[i]);
                     bloatedDiffRestore.Add(i);
                     emptyDiffCount++;
                 }
@@ -2451,11 +2550,10 @@ public class CrossService : ICross
 
                 info.Donors = donors.Select(d => (d.BucketId, d.BucketKey)).ToList();
                 info.StitchedBase = stitched;
-                mosaicInfos[i] = info;
 
                 // Undo the bloat: restore to dedup state with mosaic base
                 sorted[i]!.NeedToStore = false;
-                sorted[i]!.Chunk = ByteString.CopyFrom(stitched);
+                pipelineState.SetEncodeBase(i, new ChunkEncodeBase.Mosaic(info));
                 rescued.Add(i);
                 Interlocked.Increment(ref mosaicSaved);
             });
@@ -2487,7 +2585,7 @@ public class CrossService : ICross
             foreach (var i in bloatedDiffRestore)
             {
                 if (!chunkMap.TryGetValue(i, out var src) || src == null) continue;
-                if (mosaicInfos.ContainsKey(i)) continue; // already rescued by top-K mosaic fallback
+                if (encodeBases[i] is ChunkEncodeBase.Mosaic) continue; // already rescued by top-K mosaic fallback
                 fallbackTargets.Add(i);
             }
 
@@ -2642,10 +2740,9 @@ public class CrossService : ICross
 
                         info.Donors = donors.Select(d => (d.BucketId, d.BucketKey)).ToList();
                         info.StitchedBase = stitched;
-                        mosaicInfos[idx] = info;
 
                         sorted[idx]!.NeedToStore = false;
-                        sorted[idx]!.Chunk = ByteString.CopyFrom(stitched);
+                        pipelineState.SetEncodeBase(idx, new ChunkEncodeBase.Mosaic(info));
                         rescued.Add(idx);
                         Interlocked.Increment(ref laneFallbackSaved);
                     });
@@ -2735,17 +2832,31 @@ public class CrossService : ICross
                                 for (int j = 0; j < batchItems.Count && j < batchRes.Results.Count; j++)
                                 {
                                     var storeRes = batchRes.Results[j];
-                                    batchItems[j].response.BucketId = storeRes.Id;
-                                    batchItems[j].response.BucketKey = storeRes.Index;
-                                    batchItems[j].response.StorageGuid = storeRes.StorageGuid ?? "";
+                                    int chunkIdx = batchItems[j].index;
+                                    string storedAgent = agent;
 
                                     if (storeRes.WasDeduplicated)
                                     {
+                                        var baseBytes = storeRes.BaseChunk ?? ByteString.Empty;
+                                        pipelineState.SetEncodeBase(chunkIdx, new ChunkEncodeBase.Ref(
+                                            storeRes.Id,
+                                            storeRes.Index,
+                                            storeRes.StorageGuid ?? "",
+                                            storedAgent,
+                                            baseBytes));
                                         batchItems[j].response.NeedToStore = false;
                                         batchItems[j].response.Duplicate = true;
                                         batchItems[j].response.Similarity = storeRes.Similarity;
-                                        if (storeRes.BaseChunk != null && storeRes.BaseChunk.Length > 0)
-                                            batchItems[j].response.Chunk = storeRes.BaseChunk;
+                                    }
+                                    else
+                                    {
+                                        pipelineState.SetEncodeBase(chunkIdx, new ChunkEncodeBase.SelfFresh(
+                                            storeRes.Id,
+                                            storeRes.Index,
+                                            storeRes.StorageGuid ?? "",
+                                            storedAgent));
+                                        // NeedToStore stays true (legacy semantics: the chunk's
+                                        // bytes live at its own bucket now, signal for stats).
                                     }
                                 }
                                 reStored = true;
@@ -2785,30 +2896,42 @@ public class CrossService : ICross
                 (storeFailures > 0 ? $", storeFailures={storeFailures}" : ""));
         }
 
-        // ── Post-BloatRestore: re-propagate rep results to non-reps ──
-        // If a representative was ejected by the bloat guard and re-stored, its
-        // BucketId/BucketKey/StorageGuid changed. Non-reps that reference that rep
-        // need the updated values.
-        if (Globals.EnableChunkClustering && bloatedDiffRestore.Count > 0)
+        // ── Post-BloatRestore: re-propagate rep EncodeBase to non-reps ──
+        // Three things may have changed rep state between the original post-store
+        // propagation and now:
+        //   1. The rep was bloated and re-stored → rep's EncodeBase is now SelfFresh
+        //      (fresh-stored) or Ref (deduped at re-store). The bucket coords changed.
+        //   2. The rep was bloated and rescued by Mosaic-Fallback / Lane-Fallback →
+        //      rep's EncodeBase is now Mosaic. Non-reps must adopt the new stitched base.
+        //   3. The rep was NOT bloated → rep's EncodeBase is unchanged from before.
+        //
+        // Non-reps whose own state was also bloated and re-stored independently must
+        // NOT be overwritten: they now have their own SelfFresh/Ref bucket and we'd be
+        // throwing that away. Detect that via "non-rep was in bloatedDiffRestore" —
+        // those went through their own re-store and own whatever EncodeBase that
+        // produced. Non-reps that weren't bloated have an EncodeBase still inherited
+        // from the rep's pre-bloat state, so they need re-derivation now.
+        //
+        // Same SelfFresh→RepFresh adaptation as the initial post-store propagation
+        // (see that block for the full rationale).
+        if (Globals.EnableChunkClustering)
         {
-            var ejectedReps = new HashSet<int>();
-            foreach (var idx in bloatedDiffRestore)
+            var bloatedSet = bloatedDiffRestore.Count > 0
+                ? new HashSet<int>(bloatedDiffRestore)
+                : null;
+            for (int i = 0; i < sorted.Length; i++)
             {
-                if (representativeSet.Contains(idx))
-                    ejectedReps.Add(idx);
-            }
-            if (ejectedReps.Count > 0)
-            {
-                for (int i = 0; i < sorted.Length; i++)
+                if (representativeSet.Contains(i)) continue;
+                if (bloatedSet != null && bloatedSet.Contains(i)) continue; // owns its own EncodeBase
+                int rep = groupRepresentative[i];
+                var repBase = encodeBases[rep];
+                ChunkEncodeBase nonRepBase = repBase switch
                 {
-                    if (representativeSet.Contains(i)) continue;
-                    int rep = groupRepresentative[i];
-                    if (!ejectedReps.Contains(rep)) continue;
-                    sorted[i].BucketId = sorted[rep].BucketId;
-                    sorted[i].BucketKey = sorted[rep].BucketKey;
-                    sorted[i].StorageGuid = sorted[rep].StorageGuid ?? "";
-                    sorted[i].Chunk = sorted[rep].Chunk;
-                }
+                    ChunkEncodeBase.SelfFresh sf => new ChunkEncodeBase.RepFresh(
+                        sf.BucketId, sf.BucketKey, sf.StorageGuid, sf.TargetAgent, rep),
+                    _ => repBase,
+                };
+                pipelineState.SetEncodeBase(i, nonRepBase);
             }
         }
 
@@ -2838,14 +2961,23 @@ public class CrossService : ICross
         if (global::Cross.Services.JobEvents.IntegrityDiagnostics.Enabled)
         {
             int sampleBudget = ParseEnvInt("INTEGRITY_REF_ROUNDTRIP_SAMPLE", 128, 1);
+            // Only Ref-encoded chunks are eligible for the round-trip probe:
+            //   - SelfFresh   — decoder will fetch from the chunk's own bucket, the
+            //                   bytes there ARE fileChunks[i], no agent-side staleness
+            //                   risk because we just wrote them.
+            //   - RepFresh    — decoder fetches rep's bucket, same reasoning.
+            //   - Mosaic      — decoder doesn't fetch a single bucket; re-stitches.
+            //   - Zeros       — no bucket reference at all.
+            //   - Ref         — decoder fetches an EXISTING stored chunk's bucket; this
+            //                   is exactly where the encoder vs decoder disagreement
+            //                   surfaces (agent's (B,K) → guid mapping might be stale
+            //                   relative to our in-memory BaseBytes). Sample these.
             var eligible = new List<int>();
-            var mosaicSetForRef = new HashSet<int>(mosaicInfos.Keys);
-            for (int i = 0; i < sorted.Length; i++)
+            for (int i = 0; i < encodeBases.Length; i++)
             {
-                var r = sorted[i];
-                if (r == null || r.NeedToStore || r.BucketId == 0) continue;
-                if (mosaicSetForRef.Contains(i)) continue;
-                if (r.Chunk == null || r.Chunk.Length == 0) continue;
+                if (encodeBases[i] is not ChunkEncodeBase.Ref r) continue;
+                if (r.BucketId == 0) continue;
+                if (r.BaseBytes.Length == 0) continue;
                 eligible.Add(i);
             }
 
@@ -2864,16 +2996,15 @@ public class CrossService : ICross
                 var sampledIndices = eligible.Take(take).ToList();
 
                 var swRT = Stopwatch.StartNew();
-                var fetchedBytes = new byte[sorted.Length][];
+                var fetchedBytes = new byte[encodeBases.Length][];
                 var rtTasks = sampledIndices.Select(async idx =>
                 {
+                    if (encodeBases[idx] is not ChunkEncodeBase.Ref r) return;
                     try
                     {
-                        var r = sorted[idx];
-                        string? targetAgent = r.TargetAgent;
                         var got = await _chunkReferenceClient.GetChunkByReferenceAsync(
                             r.BucketId, r.BucketKey,
-                            targetAgent: string.IsNullOrWhiteSpace(targetAgent) ? null : targetAgent);
+                            targetAgent: string.IsNullOrWhiteSpace(r.TargetAgent) ? null : r.TargetAgent);
                         if (got != null && got.Length > 0)
                             fetchedBytes[idx] = got;
                     }
@@ -2887,7 +3018,7 @@ public class CrossService : ICross
                 string? firstDetail = null;
                 foreach (var idx in sampledIndices)
                 {
-                    var r = sorted[idx];
+                    if (encodeBases[idx] is not ChunkEncodeBase.Ref r) continue;
                     byte[]? got = fetchedBytes[idx];
                     if (got == null || got.Length == 0)
                     {
@@ -2895,14 +3026,14 @@ public class CrossService : ICross
                         mismatches++;
                         total++;
                         if (firstDetail == null)
-                            firstDetail = $"idx={idx} bk=({r.BucketId},{r.BucketKey}) FETCH_FAIL exp_guid={TakeShort(r.StorageGuid ?? "", 16)}";
+                            firstDetail = $"idx={idx} bk=({r.BucketId},{r.BucketKey}) FETCH_FAIL exp_guid={TakeShort(r.StorageGuid, 16)}";
                         continue;
                     }
                     total++;
                     // ToByteArray() copies the ByteString into a fresh array.
                     // We can't use .Span here because the enclosing method is
                     // async (C# disallows ref-struct locals in async bodies).
-                    byte[] expected = r.Chunk!.ToByteArray();
+                    byte[] expected = r.BaseBytes.ToByteArray();
                     bool equal = got.Length == expected.Length
                                  && got.AsSpan().SequenceEqual(expected);
                     if (!equal)
@@ -2914,7 +3045,7 @@ public class CrossService : ICross
                             string gotHash = Sha256HexLocal(got);
                             firstDetail =
                                 $"idx={idx} bk=({r.BucketId},{r.BucketKey}) " +
-                                $"exp_guid={TakeShort(r.StorageGuid ?? "", 16)} " +
+                                $"exp_guid={TakeShort(r.StorageGuid, 16)} " +
                                 $"got_hash={TakeShort(gotHash, 16)} " +
                                 $"exp_hash={TakeShort(expHash, 16)} " +
                                 $"sizes exp={expected.Length} got={got.Length}";
@@ -3001,19 +3132,11 @@ public class CrossService : ICross
             for (int i = 0; i < chunkCount; i++)
             {
                 byte[] original = fileChunks[i];
-                byte[] baseChunk;
-
-                if (mosaicInfos.TryGetValue(i, out var mosaicForDiff))
-                    baseChunk = mosaicForDiff.StitchedBase;
-                else if (sorted[i].NeedToStore && sorted[i].BucketId != 0)
-                    baseChunk = fileChunks[i];
-                else if (!representativeSet.Contains(i) && sorted[groupRepresentative[i]].NeedToStore
-                         && sorted[groupRepresentative[i]].BucketId != 0)
-                    baseChunk = fileChunks[groupRepresentative[i]];
-                else if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
-                    baseChunk = sorted[i].Chunk.ToByteArray();
-                else
-                    baseChunk = Array.Empty<byte>();
+                // Single source of truth: the EncodeBase tells PatchEncode exactly
+                // which bytes to subtract from `original` to produce the diff. The
+                // very same value is consumed by BuildV5References to write the
+                // matching ref byte, so encoder and decoder cannot disagree.
+                byte[] baseChunk = encodeBases[i].GetBasisBytes(i, fileChunks, cs);
 
                 int baseLen = Math.Min(baseChunk.Length, cs);
                 var errs = new List<(ushort Offset, byte Value)>();
@@ -3109,11 +3232,11 @@ public class CrossService : ICross
         {
             using var stage = Observability.StartStage("Serialize");
             var swStage = Stopwatch.StartNew();
-            byte[] refBytes = BuildV5References(sorted, mosaicInfos);
+            byte[] refBytes = BuildV5References(encodeBases);
             int storedForLog = sorted.Count(r => r != null && r.NeedToStore);
 
             // Defer the heavy-collection release if the smoketest is on — we need
-            // sorted/mosaicInfos/representativeSet/groupRepresentative/fileChunks
+            // sorted/encodeBases/representativeSet/groupRepresentative/fileChunks
             // to attribute any round-trip mismatch back to a specific encode case.
             bool runSmoketest = Globals.IntegrityDecompressSmoketest && _fileLen > 0;
             if (!runSmoketest)
@@ -3124,8 +3247,9 @@ public class CrossService : ICross
                 mainAgents = null!;
                 chunkMap = null!;
                 mosaicCandidates = null!;
-                mosaicInfos = null!;
                 sorted = null!;
+                encodeBases = null!;
+                pipelineState = null!;
                 representativeSet = null!;
                 groupRepresentative = null!;
             }
@@ -3144,7 +3268,7 @@ public class CrossService : ICross
             {
                 await RunCompressDecompressSmoketestAsync(
                     toReturn, _file, _fileLen,
-                    fileChunks, sorted, mosaicInfos,
+                    fileChunks, sorted, encodeBases,
                     representativeSet, groupRepresentative,
                     totalChunks);
 
@@ -3154,8 +3278,9 @@ public class CrossService : ICross
                 mainAgents = null!;
                 chunkMap = null!;
                 mosaicCandidates = null!;
-                mosaicInfos = null!;
                 sorted = null!;
+                encodeBases = null!;
+                pipelineState = null!;
                 representativeSet = null!;
                 groupRepresentative = null!;
             }
@@ -3198,7 +3323,7 @@ public class CrossService : ICross
         int originalLen,
         List<byte[]> fileChunks,
         global::GatewayService.QueryResponseObject?[] sorted,
-        ConcurrentDictionary<int, global::Cross.Models.MosaicChunkInfo> mosaicInfos,
+        global::Cross.Models.ChunkEncodeBase[] encodeBases,
         HashSet<int> representativeSet,
         int[] groupRepresentative,
         int totalChunks)
@@ -3273,46 +3398,37 @@ public class CrossService : ICross
         byte[] gotHash = SHA256.HashData(roundTripped.AsSpan(chunkStart, chunkLen).ToArray());
 
         var r = sorted != null && chunkIdx < sorted.Length ? sorted[chunkIdx] : null;
-        ulong bucketId = r?.BucketId ?? 0;
-        ulong bucketKey = r?.BucketKey ?? 0;
-        string storageGuid = r?.StorageGuid ?? "";
+        var eb = encodeBases != null && chunkIdx < encodeBases.Length
+            ? encodeBases[chunkIdx]
+            : global::Cross.Models.ChunkEncodeBase.Zeros.Instance;
+        ulong bucketId = eb.BucketId();
+        ulong bucketKey = eb.BucketKey();
+        string storageGuid = eb.StorageGuid();
         bool needToStore = r?.NeedToStore ?? false;
-        bool isMosaic = mosaicInfos != null && mosaicInfos.ContainsKey(chunkIdx);
+        bool isMosaic = eb is global::Cross.Models.ChunkEncodeBase.Mosaic;
         bool isRep = representativeSet != null && representativeSet.Contains(chunkIdx);
         int rep = (groupRepresentative != null && chunkIdx < groupRepresentative.Length)
             ? groupRepresentative[chunkIdx] : -1;
-        bool repIsFresh = rep >= 0 && sorted != null && rep < sorted.Length
-                          && sorted[rep] != null
-                          && sorted[rep]!.NeedToStore
-                          && sorted[rep]!.BucketId != 0;
+        bool repIsFresh = rep >= 0 && encodeBases != null && rep < encodeBases.Length
+                          && encodeBases[rep] is global::Cross.Models.ChunkEncodeBase.SelfFresh;
 
-        // Reproduce the encode-case decision exactly so the diagnostic tells
-        // you which branch at Cross.cs ~2916 was taken for the bad chunk.
-        string encodeCase;
-        if (isMosaic) encodeCase = "mosaic";
-        else if (needToStore && bucketId != 0) encodeCase = "self-fresh";
-        else if (!isRep && repIsFresh) encodeCase = $"rep[{rep}]-fresh";
-        else if (r != null && r.Chunk != null && r.Chunk.Length > 0) encodeCase = "dedup-cached";
-        else encodeCase = "empty-base";
+        // Encode-case label comes straight from the sum type — no decision tree to
+        // get out of sync with PatchEncode any more.
+        string encodeCase = eb.CaseLabel();
 
-        // What did the encoder think the base bytes were?
+        // What did the encoder use as the diff basis? Hash the exact same bytes
+        // PatchEncode subtracted from fileChunks[chunkIdx]. If this doesn't match
+        // what the decoder recovered, the EncodeBase is inconsistent with the
+        // wire fields / decoder pipeline.
         string encoderBaseSha = "n/a";
-        if (isMosaic && mosaicInfos != null && mosaicInfos.TryGetValue(chunkIdx, out var minfo)
-            && minfo.StitchedBase.Length > 0)
+        if (fileChunks != null && chunkIdx < fileChunks.Count)
         {
-            encoderBaseSha = HexShort(SHA256.HashData(minfo.StitchedBase));
-        }
-        else if (needToStore && bucketId != 0 && fileChunks != null && chunkIdx < fileChunks.Count)
-        {
-            encoderBaseSha = HexShort(SHA256.HashData(fileChunks[chunkIdx]));
-        }
-        else if (!isRep && repIsFresh && fileChunks != null && rep >= 0 && rep < fileChunks.Count)
-        {
-            encoderBaseSha = HexShort(SHA256.HashData(fileChunks[rep]));
-        }
-        else if (r != null && r.Chunk != null && r.Chunk.Length > 0)
-        {
-            encoderBaseSha = HexShort(SHA256.HashData(r.Chunk.ToByteArray()));
+            try
+            {
+                byte[] basis = eb.GetBasisBytes(chunkIdx, fileChunks, fileChunks[chunkIdx].Length);
+                encoderBaseSha = HexShort(SHA256.HashData(basis));
+            }
+            catch { /* leave as n/a */ }
         }
 
         // What does the agent return RIGHT NOW for the same ref the decode path used?
@@ -3409,24 +3525,16 @@ public class CrossService : ICross
             }
         }
 
-        // Full encoder-base sha (recomputed against the actual encoder bytes)
+        // Full encoder-base sha (same EncodeBase basis bytes, full hash).
         string encoderBaseShaFull = "n/a";
-        if (isMosaic && mosaicInfos != null && mosaicInfos.TryGetValue(chunkIdx, out var minfoFull)
-            && minfoFull.StitchedBase.Length > 0)
+        if (fileChunks != null && chunkIdx < fileChunks.Count)
         {
-            encoderBaseShaFull = HexFull(SHA256.HashData(minfoFull.StitchedBase));
-        }
-        else if (needToStore && bucketId != 0 && fileChunks != null && chunkIdx < fileChunks.Count)
-        {
-            encoderBaseShaFull = HexFull(SHA256.HashData(fileChunks[chunkIdx]));
-        }
-        else if (!isRep && repIsFresh && fileChunks != null && rep >= 0 && rep < fileChunks.Count)
-        {
-            encoderBaseShaFull = HexFull(SHA256.HashData(fileChunks[rep]));
-        }
-        else if (r != null && r.Chunk != null && r.Chunk.Length > 0)
-        {
-            encoderBaseShaFull = HexFull(SHA256.HashData(r.Chunk.ToByteArray()));
+            try
+            {
+                byte[] basis = eb.GetBasisBytes(chunkIdx, fileChunks, fileChunks[chunkIdx].Length);
+                encoderBaseShaFull = HexFull(SHA256.HashData(basis));
+            }
+            catch { /* leave as n/a */ }
         }
 
         // Always include both the truncated (for the 1500-char EmitFailed cap)
