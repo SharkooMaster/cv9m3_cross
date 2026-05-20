@@ -1787,8 +1787,12 @@ public class CrossService : ICross
                                     {
                                         var storeRes = batchRes.Results[j];
 
-                                        // Per-item failure signal from the agent.
-                                        if (!storeRes.Success)
+                                        // Per-item failure signal from the agent. We use a
+                                        // "failed" field (default false = success) so that
+                                        // the proto3 default for missing fields is treated as
+                                        // success — robust against version skew where an older
+                                        // agent may not set the field at all.
+                                        if (storeRes.Failed)
                                         {
                                             batchStoreFailures++;
                                             continue;
