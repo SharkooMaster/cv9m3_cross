@@ -2082,10 +2082,25 @@ public class CrossService : ICross
                 // we MUST use the agent's base chunk: vector similarity ≠ byte identity!
                 bool skipDiff = sorted[i].NeedToStore && sorted[i].BucketId != 0;
 
-                if (!skipDiff && sorted[i].BucketId != 0
-                    && (sorted[i].Chunk == null || sorted[i].Chunk.Length == 0))
+                if (!skipDiff && sorted[i].BucketId != 0)
                 {
-                    // This chunk matched a reference but has no base bytes — need to fetch
+                    // ── CRITICAL: refetch every Ref from the CANONICAL agent. ──
+                    // The gateway sets QueryResponseObject.TargetAgent to whichever
+                    // agent SERVED the search RPC — that's
+                    // RendezvousRouter.PickAgent(query.BucketString), i.e. canonical
+                    // for the QUERY's bitstring. The MATCH may live in a neighbour
+                    // bucket (response.BucketId != query.BucketId) whose canonical
+                    // owner is a DIFFERENT agent. The decoder ALWAYS resolves base
+                    // chunks via RendezvousRouter.PickAgent(UlongToBitstring(BucketId))
+                    // — canonical of the MATCHED bucket. If we trust the inline
+                    // bytes, the encoder diffs against the search agent's view of
+                    // (B,K) while the decoder reconstructs against the canonical
+                    // owner's view of (B,K). On a small cluster the two agents
+                    // happen to be the same and the smoketest passes; the
+                    // RefRoundTrip diagnostic exposes the divergence as fetch
+                    // failures on r.TargetAgent (the wrong agent). Make canonical
+                    // the single source of truth: refetch unconditionally and
+                    // rebuild the Ref EncodeBase from those bytes below.
                     baseChunkFetchIndices.Add(i);
                 }
             }
