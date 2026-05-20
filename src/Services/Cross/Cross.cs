@@ -40,6 +40,7 @@ public class CrossService : ICross
         => preferredEncoding == "v6.0.0" || (string.IsNullOrEmpty(preferredEncoding) && Globals.CcfEncodingV6)
             ? "v6.0.0" : "v5.6.0";
     private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0", "v5.1.0", "v5.2.0", "v5.3.0", "v5.4.0", "v5.5.0", "v5.6.0", "v6.0.0" };
+    private static readonly System.Buffers.ArrayPool<byte> _largeBufferPool = System.Buffers.ArrayPool<byte>.Create(1024 * 1024 * 128, 64);
     string headID = "";
     private readonly global::Cross.Services.Grpc.Agent.ChunkReferenceServiceClient _chunkReferenceClient = new();
 
@@ -2124,91 +2125,101 @@ public class CrossService : ICross
             if (baseChunkFetchIndices.Count > 0)
             {
                 var fetchSw = Stopwatch.StartNew();
-                var fetchedChunks = new byte[sorted.Length][];
-                var fetchedFromAgent = new string?[sorted.Length];
-                await Parallel.ForEachAsync(
-                    baseChunkFetchIndices,
-                    new ParallelOptions { MaxDegreeOfParallelism = 100 },
-                    async (idx, ct) =>
-                    {
-                        try
+                var fetchedChunks = System.Buffers.ArrayPool<byte[]>.Shared.Rent(sorted.Length);
+                var fetchedFromAgent = System.Buffers.ArrayPool<string?>.Shared.Rent(sorted.Length);
+                try
+                {
+                    await Parallel.ForEachAsync(
+                        baseChunkFetchIndices,
+                        new ParallelOptions { MaxDegreeOfParallelism = 100 },
+                        async (idx, ct) =>
                         {
-                            // Re-resolve the canonical owner agent for this bucket
-                            // (post rep-propagation BucketId). This is the SAME
-                            // selector DecompressFile uses, guaranteeing encode/
-                            // decode agree on whose (B,K) view we're diffing against.
-                            string bitstring = UlongToBitstring(sorted[idx].BucketId);
-                            string canonicalAgent = RendezvousRouter.PickAgent(bitstring);
-                            if (string.IsNullOrWhiteSpace(canonicalAgent))
-                                canonicalAgent = sorted[idx].TargetAgent ?? "";
-
-                            var chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
-                                sorted[idx].BucketId, sorted[idx].BucketKey,
-                                targetAgent: string.IsNullOrWhiteSpace(canonicalAgent) ? null : canonicalAgent);
-                            if (chunk != null && chunk.Length > 0)
+                            try
                             {
-                                fetchedChunks[idx] = chunk;
-                                fetchedFromAgent[idx] = canonicalAgent;
+                                // Re-resolve the canonical owner agent for this bucket
+                                // (post rep-propagation BucketId). This is the SAME
+                                // selector DecompressFile uses, guaranteeing encode/
+                                // decode agree on whose (B,K) view we're diffing against.
+                                string bitstring = UlongToBitstring(sorted[idx].BucketId);
+                                string canonicalAgent = RendezvousRouter.PickAgent(bitstring);
+                                if (string.IsNullOrWhiteSpace(canonicalAgent))
+                                    canonicalAgent = sorted[idx].TargetAgent ?? "";
+
+                                var chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                                    sorted[idx].BucketId, sorted[idx].BucketKey,
+                                    targetAgent: string.IsNullOrWhiteSpace(canonicalAgent) ? null : canonicalAgent);
+                                if (chunk != null && chunk.Length > 0)
+                                {
+                                    fetchedChunks[idx] = chunk;
+                                    fetchedFromAgent[idx] = canonicalAgent;
+                                }
                             }
-                        }
-                        catch { /* Will fall back to zeros */ }
-                    });
-                fetchSw.Stop();
-                Observability.RecordStage("FetchBaseChunks", fetchSw.Elapsed.TotalMilliseconds,
-                    ("count", baseChunkFetchIndices.Count));
-
-                // ── Integrity check (2/3): for every base chunk we just
-                // fetched, the SHA256 of the returned bytes must equal the
-                // StorageGuid the agent advertised at search time.  A miss
-                // here means (bucketId, bucketIndex) is pointing at different
-                // bytes than what we diffed against during search — exactly
-                // the failure mode where decompression deterministically
-                // breaks even though every chunk "comes back". ──
-                if (global::Cross.Services.JobEvents.IntegrityDiagnostics.Enabled)
-                {
-                    var swIntegrityFetch = Stopwatch.StartNew();
-                    var sortedSnap = sorted;
-                    var fetchedSnap = fetchedChunks;
-                    var fetchResult = global::Cross.Services.JobEvents.IntegrityDiagnostics.VerifyHashes(
-                        sortedSnap.Length,
-                        i =>
-                        {
-                            var bytes = fetchedSnap[i];
-                            if (bytes == null || bytes.Length == 0) return (null, null);
-                            var r = sortedSnap[i];
-                            if (r == null || string.IsNullOrEmpty(r.StorageGuid)) return (null, null);
-                            return (r.StorageGuid, bytes);
+                            catch { /* Will fall back to zeros */ }
                         });
-                    swIntegrityFetch.Stop();
-                    global::Cross.Services.JobEvents.IntegrityDiagnostics.Emit(
-                        "FetchedBases", fetchResult, swIntegrityFetch.Elapsed.TotalMilliseconds);
+                    fetchSw.Stop();
+                    Observability.RecordStage("FetchBaseChunks", fetchSw.Elapsed.TotalMilliseconds,
+                        ("count", baseChunkFetchIndices.Count));
+
+                    // ── Integrity check (2/3): for every base chunk we just
+                    // fetched, the SHA256 of the returned bytes must equal the
+                    // StorageGuid the agent advertised at search time.  A miss
+                    // here means (bucketId, bucketIndex) is pointing at different
+                    // bytes than what we diffed against during search — exactly
+                    // the failure mode where decompression deterministically
+                    // breaks even though every chunk "comes back". ──
+                    if (global::Cross.Services.JobEvents.IntegrityDiagnostics.Enabled)
+                    {
+                        var swIntegrityFetch = Stopwatch.StartNew();
+                        var sortedSnap = sorted;
+                        var fetchedSnap = fetchedChunks;
+                        var fetchResult = global::Cross.Services.JobEvents.IntegrityDiagnostics.VerifyHashes(
+                            sortedSnap.Length,
+                            i =>
+                            {
+                                var bytes = fetchedSnap[i];
+                                if (bytes == null || bytes.Length == 0) return (null, null);
+                                var r = sortedSnap[i];
+                                if (r == null || string.IsNullOrEmpty(r.StorageGuid)) return (null, null);
+                                return (r.StorageGuid, bytes);
+                            });
+                        swIntegrityFetch.Stop();
+                        global::Cross.Services.JobEvents.IntegrityDiagnostics.Emit(
+                            "FetchedBases", fetchResult, swIntegrityFetch.Elapsed.TotalMilliseconds);
+                    }
+
+                    // Inject fetched chunks into the encode contract AND re-derive the
+                    // (BaseBytes, StorageGuid, TargetAgent) tuple from the fetched bytes.
+                    // A previous version only updated Chunk, leaving StorageGuid stale
+                    // from the search response — so subsequent code (and the smoketest)
+                    // saw SHA(Chunk) ≠ StorageGuid even though both pieces individually
+                    // came from the cluster, just from different points in time / different
+                    // agents. The bytes the canonical agent JUST returned are what
+                    // DecompressFile will see, so that's the only source of truth that
+                    // matters for encode correctness: re-issue a Ref EncodeBase from
+                    // those bytes atomically.
+                    for (int i = 0; i < sorted.Length; i++)
+                    {
+                        var fetched = fetchedChunks[i];
+                        if (fetched == null) continue;
+                        if (encodeBases[i] is not ChunkEncodeBase.Ref currentRef) continue;
+
+                        string newAgent = !string.IsNullOrWhiteSpace(fetchedFromAgent[i])
+                            ? fetchedFromAgent[i]!
+                            : currentRef.TargetAgent;
+                        pipelineState.SetEncodeBase(i, new ChunkEncodeBase.Ref(
+                            currentRef.BucketId,
+                            currentRef.BucketKey,
+                            Convert.ToHexString(SHA256.HashData(fetched)).ToLowerInvariant(),
+                            newAgent,
+                            ByteString.CopyFrom(fetched)));
+                    }
                 }
-
-                // Inject fetched chunks into the encode contract AND re-derive the
-                // (BaseBytes, StorageGuid, TargetAgent) tuple from the fetched bytes.
-                // A previous version only updated Chunk, leaving StorageGuid stale
-                // from the search response — so subsequent code (and the smoketest)
-                // saw SHA(Chunk) ≠ StorageGuid even though both pieces individually
-                // came from the cluster, just from different points in time / different
-                // agents. The bytes the canonical agent JUST returned are what
-                // DecompressFile will see, so that's the only source of truth that
-                // matters for encode correctness: re-issue a Ref EncodeBase from
-                // those bytes atomically.
-                for (int i = 0; i < sorted.Length; i++)
+                finally
                 {
-                    var fetched = fetchedChunks[i];
-                    if (fetched == null) continue;
-                    if (encodeBases[i] is not ChunkEncodeBase.Ref currentRef) continue;
-
-                    string newAgent = !string.IsNullOrWhiteSpace(fetchedFromAgent[i])
-                        ? fetchedFromAgent[i]!
-                        : currentRef.TargetAgent;
-                    pipelineState.SetEncodeBase(i, new ChunkEncodeBase.Ref(
-                        currentRef.BucketId,
-                        currentRef.BucketKey,
-                        Convert.ToHexString(SHA256.HashData(fetched)).ToLowerInvariant(),
-                        newAgent,
-                        ByteString.CopyFrom(fetched)));
+                    Array.Clear(fetchedChunks, 0, sorted.Length);
+                    System.Buffers.ArrayPool<byte[]>.Shared.Return(fetchedChunks);
+                    Array.Clear(fetchedFromAgent, 0, sorted.Length);
+                    System.Buffers.ArrayPool<string?>.Shared.Return(fetchedFromAgent);
                 }
 
                 // ── CRITICAL: Handle failed base chunk fetches ──
@@ -3006,84 +3017,92 @@ public class CrossService : ICross
                 var sampledIndices = eligible.Take(take).ToList();
 
                 var swRT = Stopwatch.StartNew();
-                var fetchedBytes = new byte[encodeBases.Length][];
-                await Parallel.ForEachAsync(
-                    sampledIndices,
-                    new ParallelOptions { MaxDegreeOfParallelism = 100 },
-                    async (idx, ct) =>
-                    {
-                        if (encodeBases[idx] is not ChunkEncodeBase.Ref r) return;
-                        try
-                        {
-                            var got = await _chunkReferenceClient.GetChunkByReferenceAsync(
-                                r.BucketId, r.BucketKey,
-                                targetAgent: string.IsNullOrWhiteSpace(r.TargetAgent) ? null : r.TargetAgent);
-                            if (got != null && got.Length > 0)
-                                fetchedBytes[idx] = got;
-                        }
-                        catch { /* leave null — counted as fetch-failure mismatch */ }
-                    });
-
-                int total = 0;
-                int mismatches = 0;
-                int fetchFailures = 0;
-                string? firstDetail = null;
-                foreach (var idx in sampledIndices)
+                var fetchedBytes = System.Buffers.ArrayPool<byte[]>.Shared.Rent(encodeBases.Length);
+                try
                 {
-                    if (encodeBases[idx] is not ChunkEncodeBase.Ref r) continue;
-                    byte[]? got = fetchedBytes[idx];
-                    if (got == null || got.Length == 0)
+                    await Parallel.ForEachAsync(
+                        sampledIndices,
+                        new ParallelOptions { MaxDegreeOfParallelism = 100 },
+                        async (idx, ct) =>
+                        {
+                            if (encodeBases[idx] is not ChunkEncodeBase.Ref r) return;
+                            try
+                            {
+                                var got = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                                    r.BucketId, r.BucketKey,
+                                    targetAgent: string.IsNullOrWhiteSpace(r.TargetAgent) ? null : r.TargetAgent);
+                                if (got != null && got.Length > 0)
+                                    fetchedBytes[idx] = got;
+                            }
+                            catch { /* leave null — counted as fetch-failure mismatch */ }
+                        });
+
+                    int total = 0;
+                    int mismatches = 0;
+                    int fetchFailures = 0;
+                    string? firstDetail = null;
+                    foreach (var idx in sampledIndices)
                     {
-                        fetchFailures++;
-                        mismatches++;
+                        if (encodeBases[idx] is not ChunkEncodeBase.Ref r) continue;
+                        byte[]? got = fetchedBytes[idx];
+                        if (got == null || got.Length == 0)
+                        {
+                            fetchFailures++;
+                            mismatches++;
+                            total++;
+                            if (firstDetail == null)
+                                firstDetail = $"idx={idx} bk=({r.BucketId},{r.BucketKey}) FETCH_FAIL exp_guid={TakeShort(r.StorageGuid, 16)}";
+                            continue;
+                        }
                         total++;
-                        if (firstDetail == null)
-                            firstDetail = $"idx={idx} bk=({r.BucketId},{r.BucketKey}) FETCH_FAIL exp_guid={TakeShort(r.StorageGuid, 16)}";
-                        continue;
-                    }
-                    total++;
-                    // ToByteArray() copies the ByteString into a fresh array.
-                    // We can't use .Span here because the enclosing method is
-                    // async (C# disallows ref-struct locals in async bodies).
-                    byte[] expected = r.BaseBytes.ToByteArray();
-                    bool equal = got.Length == expected.Length
-                                 && got.AsSpan().SequenceEqual(expected);
-                    if (!equal)
-                    {
-                        mismatches++;
-                        if (firstDetail == null)
+                        // ToByteArray() copies the ByteString into a fresh array.
+                        // We can't use .Span here because the enclosing method is
+                        // async (C# disallows ref-struct locals in async bodies).
+                        byte[] expected = r.BaseBytes.ToByteArray();
+                        bool equal = got.Length == expected.Length
+                                     && got.AsSpan().SequenceEqual(expected);
+                        if (!equal)
                         {
-                            string expHash = Sha256HexLocal(expected);
-                            string gotHash = Sha256HexLocal(got);
-                            firstDetail =
-                                $"idx={idx} bk=({r.BucketId},{r.BucketKey}) " +
-                                $"exp_guid={TakeShort(r.StorageGuid, 16)} " +
-                                $"got_hash={TakeShort(gotHash, 16)} " +
-                                $"exp_hash={TakeShort(expHash, 16)} " +
-                                $"sizes exp={expected.Length} got={got.Length}";
+                            mismatches++;
+                            if (firstDetail == null)
+                            {
+                                string expHash = Sha256HexLocal(expected);
+                                string gotHash = Sha256HexLocal(got);
+                                firstDetail =
+                                    $"idx={idx} bk=({r.BucketId},{r.BucketKey}) " +
+                                    $"exp_guid={TakeShort(r.StorageGuid, 16)} " +
+                                    $"got_hash={TakeShort(gotHash, 16)} " +
+                                    $"exp_hash={TakeShort(expHash, 16)} " +
+                                    $"sizes exp={expected.Length} got={got.Length}";
+                            }
                         }
                     }
-                }
-                swRT.Stop();
+                    swRT.Stop();
 
-                global::Cross.Services.JobEvents.JobEventBus.EmitStageDone(
-                    "IntegrityCheck:RefRoundTrip",
-                    swRT.Elapsed.TotalMilliseconds,
-                    chunkCount: total,
-                    bucketCount: mismatches,
-                    bytes: (ulong)fetchFailures);
+                    global::Cross.Services.JobEvents.JobEventBus.EmitStageDone(
+                        "IntegrityCheck:RefRoundTrip",
+                        swRT.Elapsed.TotalMilliseconds,
+                        chunkCount: total,
+                        bucketCount: mismatches,
+                        bytes: (ulong)fetchFailures);
 
-                if (mismatches > 0)
-                {
-                    Console.WriteLine(
-                        $"[Integrity] ❌ RefRoundTrip: {mismatches}/{total} mismatch " +
-                        $"({fetchFailures} fetch-fail) — sample={take} eligible={eligible.Count} — {firstDetail}");
+                    if (mismatches > 0)
+                    {
+                        Console.WriteLine(
+                            $"[Integrity] ❌ RefRoundTrip: {mismatches}/{total} mismatch " +
+                            $"({fetchFailures} fetch-fail) — sample={take} eligible={eligible.Count} — {firstDetail}");
+                    }
+                    else
+                    {
+                        Console.WriteLine(
+                            $"[Integrity] ✓ RefRoundTrip: {total} verified (sample={take}/{eligible.Count}) " +
+                            $"in {swRT.Elapsed.TotalMilliseconds:F1}ms");
+                    }
                 }
-                else
+                finally
                 {
-                    Console.WriteLine(
-                        $"[Integrity] ✓ RefRoundTrip: {total} verified (sample={take}/{eligible.Count}) " +
-                        $"in {swRT.Elapsed.TotalMilliseconds:F1}ms");
+                    Array.Clear(fetchedBytes, 0, encodeBases.Length);
+                    System.Buffers.ArrayPool<byte[]>.Shared.Return(fetchedBytes);
                 }
             }
         }
@@ -3848,42 +3867,43 @@ public class CrossService : ICross
         long headerBytes = 4 + 8 + 4;
         totalCompressedSize += headerBytes;
 
-        byte[] windowBuffer = new byte[windowSize];
-
-        for (int block = 0; block < blockCount; block++)
+        byte[] windowBuffer = _largeBufferPool.Rent(windowSize);
+        try
         {
-            ct.ThrowIfCancellationRequested();
-
-            // Read one window
-            int remaining = (int)Math.Min(windowSize, originalFileSize - inputFs.Position);
-            int totalRead = 0;
-            while (totalRead < remaining)
+            for (int block = 0; block < blockCount; block++)
             {
-                int r = await inputFs.ReadAsync(windowBuffer.AsMemory(totalRead, remaining - totalRead), ct);
-                if (r == 0) break;
-                totalRead += r;
+                ct.ThrowIfCancellationRequested();
+
+                // Read one window
+                int remaining = (int)Math.Min(windowSize, originalFileSize - inputFs.Position);
+                int totalRead = 0;
+                while (totalRead < remaining)
+                {
+                    int r = await inputFs.ReadAsync(windowBuffer.AsMemory(totalRead, remaining - totalRead), ct);
+                    if (r == 0) break;
+                    totalRead += r;
+                }
+
+                Console.WriteLine($"[CompressWindowed] Block {block + 1}/{blockCount}: {totalRead} bytes");
+
+                var (compressedBlock, refs, chunks, _, _, _) = await CompressFileWithStats(windowBuffer, totalRead);
+                totalRefs += refs;
+                totalChunks += chunks;
+
+                // v5: int32 block headers (blocks can't exceed window size)
+                bw.Write((int)compressedBlock.Length);
+                bw.Write((int)totalRead);
+                await outputFs.WriteAsync(compressedBlock, 0, compressedBlock.Length, ct);
+                await outputFs.FlushAsync(ct);
+
+                totalCompressedSize += 4 + 4 + compressedBlock.Length;
+
+                Console.WriteLine($"[CompressWindowed] Block {block + 1}/{blockCount}: compressed {totalRead} → {compressedBlock.Length} (ratio {(double)compressedBlock.Length / Math.Max(1, totalRead):F3})");
             }
-
-            // Exact-size slice (last window may be smaller)
-            byte[] windowData = totalRead == windowSize
-                ? windowBuffer
-                : windowBuffer[..totalRead];
-
-            Console.WriteLine($"[CompressWindowed] Block {block + 1}/{blockCount}: {totalRead} bytes");
-
-            var (compressedBlock, refs, chunks, _, _, _) = await CompressFileWithStats(windowData);
-            totalRefs += refs;
-            totalChunks += chunks;
-
-            // v5: int32 block headers (blocks can't exceed window size)
-            bw.Write((int)compressedBlock.Length);
-            bw.Write((int)totalRead);
-            await outputFs.WriteAsync(compressedBlock, 0, compressedBlock.Length, ct);
-            await outputFs.FlushAsync(ct);
-
-            totalCompressedSize += 4 + 4 + compressedBlock.Length;
-
-            Console.WriteLine($"[CompressWindowed] Block {block + 1}/{blockCount}: compressed {totalRead} → {compressedBlock.Length} (ratio {(double)compressedBlock.Length / Math.Max(1, totalRead):F3})");
+        }
+        finally
+        {
+            _largeBufferPool.Return(windowBuffer);
         }
 
         // Write SHA256 hash as trailer at end of file
@@ -3936,101 +3956,103 @@ public class CrossService : ICross
         long headerBytes = 4 + 8 + 4;
         totalCompressedSize += headerBytes;
 
-        byte[] windowBuffer = new byte[windowSize];
-        long totalReadSoFar = 0;
-
-        // ── 3. Process windows in order as they become available ──
-        Console.WriteLine($"[CompressWindowedStream] 🚀 STARTING compression (file={originalFileSize} bytes, {blockCount} blocks, file may still be growing)");
-        for (int block = 0; block < blockCount; block++)
+        byte[] windowBuffer = _largeBufferPool.Rent(windowSize);
+        try
         {
-            ct.ThrowIfCancellationRequested();
+            long totalReadSoFar = 0;
 
-            // Read one window (with retries if file is still being written)
-            int remaining = (int)Math.Min(windowSize, originalFileSize - totalReadSoFar);
-            int totalRead = 0;
-            int retries = 0;
-            const int maxRetries = 1000; // More retries for large files
-            
-            Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: Starting read (need {remaining} bytes, file size={inputFs.Length}, pos={inputFs.Position})");
-            
-            while (totalRead < remaining && retries < maxRetries)
+            // ── 3. Process windows in order as they become available ──
+            Console.WriteLine($"[CompressWindowedStream] 🚀 STARTING compression (file={originalFileSize} bytes, {blockCount} blocks, file may still be growing)");
+            for (int block = 0; block < blockCount; block++)
             {
-                long filePos = inputFs.Position;
-                long fileLength = inputFs.Length;
-                long availableBytes = fileLength - filePos;
-                
-                if (availableBytes < remaining - totalRead)
-                {
-                    // File not ready yet, wait a bit
-                    if (retries % 50 == 0) // Log every 5 seconds
-                        Console.WriteLine($"[CompressWindowedStream] Block {block + 1}: waiting for data (have {availableBytes}, need {remaining - totalRead}, file size={fileLength}/{originalFileSize})");
-                    await Task.Delay(100, ct);
-                    retries++;
-                    continue;
-                }
+                ct.ThrowIfCancellationRequested();
 
-                // remaining - totalRead is at most windowSize (64 MB), and we already verified
-                // availableBytes >= remaining - totalRead, so this is safe (no int overflow)
-                int toRead = remaining - totalRead;
-                int r = await inputFs.ReadAsync(windowBuffer.AsMemory(totalRead, toRead), ct);
-                if (r == 0)
+                // Read one window (with retries if file is still being written)
+                int remaining = (int)Math.Min(windowSize, originalFileSize - totalReadSoFar);
+                int totalRead = 0;
+                int retries = 0;
+                const int maxRetries = 1000; // More retries for large files
+                
+                Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: Starting read (need {remaining} bytes, file size={inputFs.Length}, pos={inputFs.Position})");
+                
+                while (totalRead < remaining && retries < maxRetries)
                 {
-                    if (retries < maxRetries)
+                    long filePos = inputFs.Position;
+                    long fileLength = inputFs.Length;
+                    long availableBytes = fileLength - filePos;
+                    
+                    if (availableBytes < remaining - totalRead)
                     {
+                        // File not ready yet, wait a bit
+                        if (retries % 50 == 0) // Log every 5 seconds
+                            Console.WriteLine($"[CompressWindowedStream] Block {block + 1}: waiting for data (have {availableBytes}, need {remaining - totalRead}, file size={fileLength}/{originalFileSize})");
                         await Task.Delay(100, ct);
                         retries++;
                         continue;
                     }
-                    break;
-                }
-                totalRead += r;
-            }
 
-            if (totalRead == 0 && block < blockCount - 1)
-            {
-                Console.WriteLine($"[CompressWindowedStream] WARNING: Block {block + 1} read 0 bytes, file may not be complete yet. Waiting...");
-                int extraRetries = 0;
-                while (totalRead == 0 && extraRetries < 500)
-                {
-                    await Task.Delay(200, ct);
-                    long fileLength = inputFs.Length;
-                    long available = fileLength - inputFs.Position;
-                    if (available > 0)
+                    // remaining - totalRead is at most windowSize (64 MB), and we already verified
+                    // availableBytes >= remaining - totalRead, so this is safe (no int overflow)
+                    int toRead = remaining - totalRead;
+                    int r = await inputFs.ReadAsync(windowBuffer.AsMemory(totalRead, toRead), ct);
+                    if (r == 0)
                     {
-                        int r = await inputFs.ReadAsync(windowBuffer.AsMemory(0, remaining), ct);
-                        if (r > 0) totalRead = r;
+                        if (retries < maxRetries)
+                        {
+                            await Task.Delay(100, ct);
+                            retries++;
+                            continue;
+                        }
+                        break;
                     }
-                    extraRetries++;
+                    totalRead += r;
                 }
-                if (totalRead == 0)
-                    throw new InvalidDataException($"Failed to read window {block + 1}: file may not be complete");
+
+                if (totalRead == 0 && block < blockCount - 1)
+                {
+                    Console.WriteLine($"[CompressWindowedStream] WARNING: Block {block + 1} read 0 bytes, file may not be complete yet. Waiting...");
+                    int extraRetries = 0;
+                    while (totalRead == 0 && extraRetries < 500)
+                    {
+                        await Task.Delay(200, ct);
+                        long fileLength = inputFs.Length;
+                        long available = fileLength - inputFs.Position;
+                        if (available > 0)
+                        {
+                            int r = await inputFs.ReadAsync(windowBuffer.AsMemory(0, remaining), ct);
+                            if (r > 0) totalRead = r;
+                        }
+                        extraRetries++;
+                    }
+                    if (totalRead == 0)
+                        throw new InvalidDataException($"Failed to read window {block + 1}: file may not be complete");
+                }
+
+                // Update hash as we read
+                sha.TransformBlock(windowBuffer, 0, totalRead, null, 0);
+                totalReadSoFar += totalRead;
+
+                Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: {totalRead} bytes (total read: {totalReadSoFar}/{originalFileSize})");
+
+                // Compress this window using the existing v3.0.0 pipeline (unchanged!)
+                var (compressedBlock, refs, chunks, _, _, _) = await CompressFileWithStats(windowBuffer, totalRead);
+                totalRefs += refs;
+                totalChunks += chunks;
+
+                // v5: int32 block headers
+                bw.Write((int)compressedBlock.Length);
+                bw.Write((int)totalRead);
+                await outputStream.WriteAsync(compressedBlock, 0, compressedBlock.Length, ct);
+                await outputStream.FlushAsync(ct);
+
+                totalCompressedSize += 4 + 4 + compressedBlock.Length;
+
+                Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: compressed {totalRead} → {compressedBlock.Length} (ratio {(double)compressedBlock.Length / Math.Max(1, totalRead):F3}) → STREAMED");
             }
-
-            // Exact-size slice (last window may be smaller)
-            byte[] windowData = totalRead == windowSize
-                ? windowBuffer
-                : windowBuffer[..totalRead];
-
-            // Update hash as we read
-            sha.TransformBlock(windowData, 0, windowData.Length, null, 0);
-            totalReadSoFar += totalRead;
-
-            Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: {totalRead} bytes (total read: {totalReadSoFar}/{originalFileSize})");
-
-            // Compress this window using the existing v3.0.0 pipeline (unchanged!)
-            var (compressedBlock, refs, chunks, _, _, _) = await CompressFileWithStats(windowData);
-            totalRefs += refs;
-            totalChunks += chunks;
-
-            // v5: int32 block headers
-            bw.Write((int)compressedBlock.Length);
-            bw.Write((int)totalRead);
-            await outputStream.WriteAsync(compressedBlock, 0, compressedBlock.Length, ct);
-            await outputStream.FlushAsync(ct);
-
-            totalCompressedSize += 4 + 4 + compressedBlock.Length;
-
-            Console.WriteLine($"[CompressWindowedStream] Block {block + 1}/{blockCount}: compressed {totalRead} → {compressedBlock.Length} (ratio {(double)compressedBlock.Length / Math.Max(1, totalRead):F3}) → STREAMED");
+        }
+        finally
+        {
+            _largeBufferPool.Return(windowBuffer);
         }
 
         // ── 4. Finalize hash and write as TRAILER (no seeking needed!) ──
@@ -4094,29 +4116,36 @@ public class CrossService : ICross
             if (compressedLen < 0 || compressedLen > inputFs.Length - inputFs.Position)
                 throw new InvalidDataException($"Invalid compressed block length: {compressedLen}");
 
-            byte[] compressedBlock = new byte[compressedLen];
-            int totalRead = 0;
-            while (totalRead < compressedLen)
+            byte[] compressedBlock = _largeBufferPool.Rent((int)compressedLen);
+            try
             {
-                int r = await inputFs.ReadAsync(compressedBlock.AsMemory(totalRead, (int)(compressedLen - totalRead)), ct);
-                if (r == 0) throw new InvalidDataException($"Unexpected EOF in block {block}.");
-                totalRead += r;
+                int totalRead = 0;
+                while (totalRead < compressedLen)
+                {
+                    int r = await inputFs.ReadAsync(compressedBlock.AsMemory(totalRead, (int)(compressedLen - totalRead)), ct);
+                    if (r == 0) throw new InvalidDataException($"Unexpected EOF in block {block}.");
+                    totalRead += r;
+                }
+
+                Console.WriteLine($"[DecompressWindowed] Block {block + 1}/{blockCount}: {compressedLen} compressed → decompressing...");
+
+                byte[] decompressedBlock = await DecompressFile(compressedBlock, (int)compressedLen);
+
+                if (decompressedBlock.Length != originalLen)
+                    throw new InvalidDataException(
+                        $"Block {block}: decompressed size {decompressedBlock.Length} != expected {originalLen}.");
+
+                // Write to output and update rolling hash
+                await outputFs.WriteAsync(decompressedBlock, 0, decompressedBlock.Length, ct);
+                sha.TransformBlock(decompressedBlock, 0, decompressedBlock.Length, null, 0);
+                totalDecompressed += decompressedBlock.Length;
+
+                Console.WriteLine($"[DecompressWindowed] Block {block + 1}/{blockCount}: OK ({decompressedBlock.Length} bytes)");
             }
-
-            Console.WriteLine($"[DecompressWindowed] Block {block + 1}/{blockCount}: {compressedLen} compressed → decompressing...");
-
-            byte[] decompressedBlock = await DecompressFile(compressedBlock);
-
-            if (decompressedBlock.Length != originalLen)
-                throw new InvalidDataException(
-                    $"Block {block}: decompressed size {decompressedBlock.Length} != expected {originalLen}.");
-
-            // Write to output and update rolling hash
-            await outputFs.WriteAsync(decompressedBlock, 0, decompressedBlock.Length, ct);
-            sha.TransformBlock(decompressedBlock, 0, decompressedBlock.Length, null, 0);
-            totalDecompressed += decompressedBlock.Length;
-
-            Console.WriteLine($"[DecompressWindowed] Block {block + 1}/{blockCount}: OK ({decompressedBlock.Length} bytes)");
+            finally
+            {
+                _largeBufferPool.Return(compressedBlock);
+            }
         }
 
         // ── 3. Read SHA256 hash from trailer (after all blocks) ──
@@ -4187,30 +4216,37 @@ public class CrossService : ICross
             if (compressedLen < 0 || compressedLen > inputFs.Length - inputFs.Position)
                 throw new InvalidDataException($"Invalid compressed block length: {compressedLen}");
 
-            byte[] compressedBlock = new byte[compressedLen];
-            int totalRead = 0;
-            while (totalRead < compressedLen)
+            byte[] compressedBlock = _largeBufferPool.Rent((int)compressedLen);
+            try
             {
-                int r = await inputFs.ReadAsync(compressedBlock.AsMemory(totalRead, (int)(compressedLen - totalRead)), ct);
-                if (r == 0) throw new InvalidDataException($"Unexpected EOF in block {block}.");
-                totalRead += r;
+                int totalRead = 0;
+                while (totalRead < compressedLen)
+                {
+                    int r = await inputFs.ReadAsync(compressedBlock.AsMemory(totalRead, (int)(compressedLen - totalRead)), ct);
+                    if (r == 0) throw new InvalidDataException($"Unexpected EOF in block {block}.");
+                    totalRead += r;
+                }
+
+                Console.WriteLine($"[DecompressWindowedStream] Block {block + 1}/{blockCount}: {compressedLen} compressed → decompressing...");
+
+                byte[] decompressedBlock = await DecompressFile(compressedBlock, (int)compressedLen);
+
+                if (decompressedBlock.Length != originalLen)
+                    throw new InvalidDataException(
+                        $"Block {block}: decompressed size {decompressedBlock.Length} != expected {originalLen}.");
+
+                // Stream directly to output and update rolling hash
+                await outputStream.WriteAsync(decompressedBlock, 0, decompressedBlock.Length, ct);
+                await outputStream.FlushAsync(ct);
+                sha.TransformBlock(decompressedBlock, 0, decompressedBlock.Length, null, 0);
+                totalDecompressed += decompressedBlock.Length;
+
+                Console.WriteLine($"[DecompressWindowedStream] Block {block + 1}/{blockCount}: OK ({decompressedBlock.Length} bytes) → streamed");
             }
-
-            Console.WriteLine($"[DecompressWindowedStream] Block {block + 1}/{blockCount}: {compressedLen} compressed → decompressing...");
-
-            byte[] decompressedBlock = await DecompressFile(compressedBlock);
-
-            if (decompressedBlock.Length != originalLen)
-                throw new InvalidDataException(
-                    $"Block {block}: decompressed size {decompressedBlock.Length} != expected {originalLen}.");
-
-            // Stream directly to output and update rolling hash
-            await outputStream.WriteAsync(decompressedBlock, 0, decompressedBlock.Length, ct);
-            await outputStream.FlushAsync(ct);
-            sha.TransformBlock(decompressedBlock, 0, decompressedBlock.Length, null, 0);
-            totalDecompressed += decompressedBlock.Length;
-
-            Console.WriteLine($"[DecompressWindowedStream] Block {block + 1}/{blockCount}: OK ({decompressedBlock.Length} bytes) → streamed");
+            finally
+            {
+                _largeBufferPool.Return(compressedBlock);
+            }
         }
 
         // ── 3. Read SHA256 hash from trailer (after all blocks) ──
@@ -4253,14 +4289,17 @@ public class CrossService : ICross
         return IsV4Format(headerBytes) || IsV5Format(headerBytes);
     }
 
-    public async Task<byte[]> DecompressFile(byte[] file)
+    public Task<byte[]> DecompressFile(byte[] file) => DecompressFile(file, -1);
+
+    public async Task<byte[]> DecompressFile(byte[] file, int fileLen = -1)
     {
         using var rootSpan = Observability.StartStage("DecompressFile");
-        if (file == null || file.Length == 0)
+        int actualLen = fileLen < 0 ? (file?.Length ?? 0) : fileLen;
+        if (file == null || actualLen == 0)
             throw new ArgumentException("Compressed input is empty.", nameof(file));
 
         var parseSw = Stopwatch.StartNew();
-        var header = ParseHeader(file);
+        var header = ParseHeader(file.AsSpan(0, actualLen));
         parseSw.Stop();
         Observability.RecordStage("Deserialize", parseSw.Elapsed.TotalMilliseconds);
 
@@ -4271,7 +4310,7 @@ public class CrossService : ICross
         int errorOffset = referencesOffset + header.ReferencesLength;
         int trimOffset = errorOffset + header.ErrorLength;
 
-        if (trimOffset > file.Length)
+        if (trimOffset > actualLen)
             throw new InvalidDataException("Compressed payload section lengths exceed file size.");
 
         // ── Parse references based on version ──
@@ -4296,7 +4335,7 @@ public class CrossService : ICross
             int off = referencesOffset;
             chunkCount = BitConverter.ToInt32(file, off);
             off += sizeof(int);
-            if (chunkCount < 0 || chunkCount > file.Length)
+            if (chunkCount < 0 || chunkCount > actualLen)
                 throw new InvalidDataException($"Invalid chunk count: {chunkCount}");
             ushort refTableSize = BitConverter.ToUInt16(file, off);
             off += sizeof(ushort);
@@ -4403,7 +4442,7 @@ public class CrossService : ICross
             int off = referencesOffset;
             chunkCount = BitConverter.ToInt32(file, off);
             off += sizeof(int);
-            if (chunkCount < 0 || chunkCount > file.Length)
+            if (chunkCount < 0 || chunkCount > actualLen)
                 throw new InvalidDataException($"Invalid chunk count: {chunkCount}");
 
             refBucketIds = new ulong[chunkCount];
@@ -4619,7 +4658,7 @@ public class CrossService : ICross
 
         // ── Fetch all base chunks in parallel ──
         var fetchSw = Stopwatch.StartNew();
-        var baseChunks = new byte[chunkCount][];
+        var baseChunks = System.Buffers.ArrayPool<byte[]>.Shared.Rent(chunkCount);
         int primaryHits = 0;
         int fallbackHits = 0;
 
@@ -4873,16 +4912,53 @@ public class CrossService : ICross
         Console.WriteLine($"[Decompress] FetchBaseChunks: {fetchSw.ElapsedMilliseconds}ms, {chunkCount} chunks, version={header.Version}, primary={primaryHits}, fallback={fallbackHits}, zeroRef={zeroRefChunks}");
         Observability.RecordStage("FetchBaseChunks", fetchSw.Elapsed.TotalMilliseconds, ("chunk_count", chunkCount));
 
+        // ── Assemble output: reconstructed buffer + trim chunk ──
+        int trimLength;
+        byte[]? expectedHash = null;
+
+        if (header.TrimLength >= 0)
+        {
+            // v2.1.0+/v3.0.0: trimLength is explicit in header; hash follows trim chunk
+            trimLength = header.TrimLength;
+            int hashOffset = trimOffset + trimLength;
+            if (hashOffset + sizeof(int) <= actualLen)
+            {
+                int hashLen = BitConverter.ToInt32(file, hashOffset);
+                if (hashLen > 0 && hashOffset + sizeof(int) + hashLen <= actualLen)
+                {
+                    expectedHash = new byte[hashLen];
+                    Buffer.BlockCopy(file, hashOffset + sizeof(int), expectedHash, 0, hashLen);
+                }
+            }
+        }
+        else
+        {
+            // v2.0.0: no trimLength in header, trim runs to end of file
+            trimLength = actualLen - trimOffset;
+        }
+
         // ── Stitch base chunks into one continuous buffer ──
         var applySw = Stopwatch.StartNew();
-        byte[] baseBuffer = new byte[chunkCount * Globals.chunkSize];
-        for (int i = 0; i < chunkCount; i++)
+        int baseBufferLength = chunkCount * Globals.chunkSize;
+        byte[] baseBuffer = new byte[baseBufferLength + trimLength];
+        try
         {
-            if (baseChunks[i].Length != Globals.chunkSize)
-                throw new InvalidDataException(
-                    $"Base chunk {i} has length {baseChunks[i].Length}, expected {Globals.chunkSize}.");
-            Buffer.BlockCopy(baseChunks[i], 0, baseBuffer, i * Globals.chunkSize, Globals.chunkSize);
+            for (int i = 0; i < chunkCount; i++)
+            {
+                if (baseChunks[i].Length != Globals.chunkSize)
+                    throw new InvalidDataException(
+                        $"Base chunk {i} has length {baseChunks[i].Length}, expected {Globals.chunkSize}.");
+                Buffer.BlockCopy(baseChunks[i], 0, baseBuffer, i * Globals.chunkSize, Globals.chunkSize);
+            }
         }
+        finally
+        {
+            Array.Clear(baseChunks, 0, chunkCount);
+            System.Buffers.ArrayPool<byte[]>.Shared.Return(baseChunks);
+        }
+
+        if (trimLength > 0)
+            Buffer.BlockCopy(file, trimOffset, baseBuffer, baseBufferLength, trimLength);
 
         // ── Apply error encoding ──
         if (isTransformProgram)
@@ -4946,7 +5022,7 @@ public class CrossService : ICross
                         for (int ci = cStart; ci <= cEnd; ci++)
                         {
                             int bufOff = ci * v6ChunkSize + bOff;
-                            for (int f = 0; f < fLen && bufOff + f < baseBuffer.Length; f++)
+                            for (int f = 0; f < fLen && bufOff + f < baseBufferLength; f++)
                                 baseBuffer[bufOff + f] = vals[f];
                         }
                         break;
@@ -4963,7 +5039,7 @@ public class CrossService : ICross
                         {
                             int step = ci - cStart;
                             int bufOff = ci * v6ChunkSize + bOff;
-                            for (int f = 0; f < fLen && bufOff + f < baseBuffer.Length; f++)
+                            for (int f = 0; f < fLen && bufOff + f < baseBufferLength; f++)
                                 baseBuffer[bufOff + f] = (byte)(startVal[f] + step * delta[f]);
                         }
                         break;
@@ -4975,7 +5051,7 @@ public class CrossService : ICross
                         int pLen = pBr.ReadUInt16();
                         byte[] vals = pBr.ReadBytes(pLen);
                         int bufOff = cIdx * v6ChunkSize + bOff;
-                        for (int f = 0; f < pLen && bufOff + f < baseBuffer.Length; f++)
+                        for (int f = 0; f < pLen && bufOff + f < baseBufferLength; f++)
                             baseBuffer[bufOff + f] = vals[f];
                         break;
                     }
@@ -5014,7 +5090,7 @@ public class CrossService : ICross
                         if (((maskByte >> bit) & 1) == 1)
                         {
                             int p = bytePos * 8 + bit;
-                            if (baseOff + p < baseBuffer.Length && resValIdx < rawRes.Length)
+                            if (baseOff + p < baseBufferLength && resValIdx < rawRes.Length)
                                 baseBuffer[baseOff + p] = rawRes[resValIdx++];
                         }
                     }
@@ -5029,9 +5105,9 @@ public class CrossService : ICross
             using var errBr = new BinaryReader(errMs);
             int patchCount = errBr.ReadInt32();
             int originalSize = errBr.ReadInt32();
-            if (originalSize != baseBuffer.Length)
+            if (originalSize != baseBufferLength)
                 throw new InvalidDataException(
-                    $"v5.6.0 originalSize {originalSize} does not match base buffer {baseBuffer.Length}.");
+                    $"v5.6.0 originalSize {originalSize} does not match base buffer {baseBufferLength}.");
             int bmChunkCount = errBr.ReadInt32();
             int compModeLen = errBr.ReadInt32();
             int compBitmaskLen = errBr.ReadInt32();
@@ -5094,7 +5170,7 @@ public class CrossService : ICross
                         if (((maskByte >> bit) & 1) == 1)
                         {
                             int p = bytePos * 8 + bit;
-                            if (baseOff + p < baseBuffer.Length)
+                            if (baseOff + p < baseBufferLength)
                                 baseBuffer[baseOff + p] = valStream[valIdx++];
                         }
                     }
@@ -5109,9 +5185,9 @@ public class CrossService : ICross
             using var errBr = new BinaryReader(errMs);
             int patchCount = errBr.ReadInt32();
             int originalSize = errBr.ReadInt32();
-            if (originalSize != baseBuffer.Length)
+            if (originalSize != baseBufferLength)
                 throw new InvalidDataException(
-                    $"v5.5.0 originalSize {originalSize} does not match base buffer {baseBuffer.Length}.");
+                    $"v5.5.0 originalSize {originalSize} does not match base buffer {baseBufferLength}.");
             int directChunkCount = errBr.ReadInt32();
             int compModeLen = errBr.ReadInt32();
             int compSkipLen = errBr.ReadInt32();
@@ -5184,7 +5260,7 @@ public class CrossService : ICross
                         uint skipVal = ReadVarint(skipRdr);
                         pos += (int)skipVal;
                         if (pos >= cs) break;
-                        if (baseOff + pos < baseBuffer.Length)
+                        if (baseOff + pos < baseBufferLength)
                             baseBuffer[baseOff + pos] = valStream[valIdx++];
                         pos++;
                     }
@@ -5201,7 +5277,7 @@ public class CrossService : ICross
                             if (((maskByte >> bit) & 1) == 1)
                             {
                                 int p = bytePos * 8 + bit;
-                                if (baseOff + p < baseBuffer.Length)
+                                if (baseOff + p < baseBufferLength)
                                     baseBuffer[baseOff + p] = valStream[valIdx++];
                             }
                         }
@@ -5217,9 +5293,9 @@ public class CrossService : ICross
             using var errBr = new BinaryReader(errMs);
             int patchCount = errBr.ReadInt32();
             int originalSize = errBr.ReadInt32();
-            if (originalSize != baseBuffer.Length)
+            if (originalSize != baseBufferLength)
                 throw new InvalidDataException(
-                    $"v5.4.0 originalSize {originalSize} does not match base buffer {baseBuffer.Length}.");
+                    $"v5.4.0 originalSize {originalSize} does not match base buffer {baseBufferLength}.");
             int fourStreamChunkCount = errBr.ReadInt32();
             int compModeLen = errBr.ReadInt32();
             int compSkipLen = errBr.ReadInt32();
@@ -5287,7 +5363,7 @@ public class CrossService : ICross
                             if (((maskByte >> bit) & 1) == 1)
                             {
                                 int pos = bytePos * 8 + bit;
-                                if (baseOff + pos < baseBuffer.Length)
+                                if (baseOff + pos < baseBufferLength)
                                     baseBuffer[baseOff + pos] ^= valStream[valIdx++];
                             }
                         }
@@ -5302,7 +5378,7 @@ public class CrossService : ICross
                         uint skipVal = ReadVarint(skipMs);
                         pos += (int)skipVal;
                         if (pos >= cs) break;
-                        if (baseOff + pos < baseBuffer.Length)
+                        if (baseOff + pos < baseBufferLength)
                             baseBuffer[baseOff + pos] ^= valStream[valIdx++];
                         pos++;
                     }
@@ -5316,9 +5392,9 @@ public class CrossService : ICross
             using var errBr = new BinaryReader(errMs);
             int patchCount = errBr.ReadInt32();
             int originalSize = errBr.ReadInt32();
-            if (originalSize != baseBuffer.Length)
+            if (originalSize != baseBufferLength)
                 throw new InvalidDataException(
-                    $"v5.3.0 originalSize {originalSize} does not match base buffer {baseBuffer.Length}.");
+                    $"v5.3.0 originalSize {originalSize} does not match base buffer {baseBufferLength}.");
             int compSkipLen = errBr.ReadInt32();
             int compValLen = errBr.ReadInt32();
 
@@ -5360,9 +5436,9 @@ public class CrossService : ICross
                 uint skip = ReadVarint(skipMs);
                 byte xorByte = valStream[p];
                 cursor += (int)skip;
-                if (cursor < 0 || cursor >= baseBuffer.Length)
+                if (cursor < 0 || cursor >= baseBufferLength)
                     throw new InvalidDataException(
-                        $"v5.3.0 patch {p}/{patchCount}: cursor {cursor} out of range (buffer {baseBuffer.Length}, skip {skip}).");
+                        $"v5.3.0 patch {p}/{patchCount}: cursor {cursor} out of range (buffer {baseBufferLength}, skip {skip}).");
                 baseBuffer[cursor] ^= xorByte;
                 cursor++;
             }
@@ -5374,18 +5450,18 @@ public class CrossService : ICross
             using var patchReader = new BinaryReader(patchStream);
             int patchCount = patchReader.ReadInt32();
             int originalSize = patchReader.ReadInt32();
-            if (originalSize != baseBuffer.Length)
+            if (originalSize != baseBufferLength)
                 throw new InvalidDataException(
-                    $"v5.2.0 originalSize {originalSize} does not match base buffer {baseBuffer.Length}.");
+                    $"v5.2.0 originalSize {originalSize} does not match base buffer {baseBufferLength}.");
             int cursor = 0;
             for (int p = 0; p < patchCount; p++)
             {
                 uint skip = ReadVarint(patchStream);
                 byte xorByte = (byte)patchStream.ReadByte();
                 cursor += (int)skip;
-                if (cursor < 0 || cursor >= baseBuffer.Length)
+                if (cursor < 0 || cursor >= baseBufferLength)
                     throw new InvalidDataException(
-                        $"v5.2.0 patch {p}/{patchCount}: cursor {cursor} out of range (buffer {baseBuffer.Length}, skip {skip}).");
+                        $"v5.2.0 patch {p}/{patchCount}: cursor {cursor} out of range (buffer {baseBufferLength}, skip {skip}).");
                 baseBuffer[cursor] ^= xorByte;
                 cursor++;
             }
@@ -5396,18 +5472,18 @@ public class CrossService : ICross
             using var patchReader = new BinaryReader(new MemoryStream(errorBytes, writable: false));
             int patchCount = patchReader.ReadInt32();
             int originalSize = patchReader.ReadInt32();
-            if (originalSize != baseBuffer.Length)
+            if (originalSize != baseBufferLength)
                 throw new InvalidDataException(
-                    $"v5.1.0 originalSize {originalSize} does not match base buffer {baseBuffer.Length}.");
+                    $"v5.1.0 originalSize {originalSize} does not match base buffer {baseBufferLength}.");
             int cursor = 0;
             for (int p = 0; p < patchCount; p++)
             {
                 uint skip = patchReader.ReadUInt32();
                 byte xorByte = patchReader.ReadByte();
                 cursor += (int)skip;
-                if (cursor < 0 || cursor >= baseBuffer.Length)
+                if (cursor < 0 || cursor >= baseBufferLength)
                     throw new InvalidDataException(
-                        $"v5.1.0 patch cursor {cursor} out of range (buffer size {baseBuffer.Length}, patch {p}/{patchCount}, skip {skip}).");
+                        $"v5.1.0 patch cursor {cursor} out of range (buffer size {baseBufferLength}, patch {p}/{patchCount}, skip {skip}).");
                 baseBuffer[cursor] ^= xorByte;
                 cursor++;
             }
@@ -5415,10 +5491,10 @@ public class CrossService : ICross
         else if (isXorPatch)
         {
             // v5.0.0: flat XOR buffer
-            if (errorBytes.Length != baseBuffer.Length)
+            if (errorBytes.Length != baseBufferLength)
                 throw new InvalidDataException(
-                    $"XOR patch size {errorBytes.Length} does not match base buffer {baseBuffer.Length}.");
-            for (int i = 0; i < baseBuffer.Length; i++)
+                    $"XOR patch size {errorBytes.Length} does not match base buffer {baseBufferLength}.");
+            for (int i = 0; i < baseBufferLength; i++)
                 baseBuffer[i] = (byte)(baseBuffer[i] ^ errorBytes[i]);
         }
         else
@@ -5428,14 +5504,14 @@ public class CrossService : ICross
             foreach (var (startPos, runLength, diffValue) in patches!)
             {
                 cursor += startPos;
-                if (cursor < 0 || cursor >= baseBuffer.Length)
+                if (cursor < 0 || cursor >= baseBufferLength)
                     throw new InvalidDataException(
-                        $"Patch cursor {cursor} out of range (buffer size {baseBuffer.Length}).");
+                        $"Patch cursor {cursor} out of range (buffer size {baseBufferLength}).");
                 for (int j = 0; j < runLength; j++)
                 {
-                    if (cursor + j >= baseBuffer.Length)
+                    if (cursor + j >= baseBufferLength)
                         throw new InvalidDataException(
-                            $"Run extends beyond buffer (cursor={cursor}, runLength={runLength}, buffer={baseBuffer.Length}).");
+                            $"Run extends beyond buffer (cursor={cursor}, runLength={runLength}, buffer={baseBufferLength}).");
                     int patched = baseBuffer[cursor + j] + diffValue;
                     if (patched < 0 || patched > 255)
                         throw new InvalidDataException($"Patched byte {patched} out of range at cursor {cursor + j}.");
@@ -5445,40 +5521,10 @@ public class CrossService : ICross
             }
         }
 
-        // ── Assemble output: reconstructed buffer + trim chunk ──
-        int trimLength;
-        byte[]? expectedHash = null;
-
-        if (header.TrimLength >= 0)
-        {
-            // v2.1.0+/v3.0.0: trimLength is explicit in header; hash follows trim chunk
-            trimLength = header.TrimLength;
-            int hashOffset = trimOffset + trimLength;
-            if (hashOffset + sizeof(int) <= file.Length)
-            {
-                int hashLen = BitConverter.ToInt32(file, hashOffset);
-                if (hashLen > 0 && hashOffset + sizeof(int) + hashLen <= file.Length)
-                {
-                    expectedHash = new byte[hashLen];
-                    Buffer.BlockCopy(file, hashOffset + sizeof(int), expectedHash, 0, hashLen);
-                }
-            }
-        }
-        else
-        {
-            // v2.0.0: no trimLength in header, trim runs to end of file
-            trimLength = file.Length - trimOffset;
-        }
-
-        byte[] result = new byte[baseBuffer.Length + trimLength];
-        Buffer.BlockCopy(baseBuffer, 0, result, 0, baseBuffer.Length);
-        if (trimLength > 0)
-            Buffer.BlockCopy(file, trimOffset, result, baseBuffer.Length, trimLength);
-
         // ── SHA256 integrity verification (v2.1.0+) ──
         if (expectedHash != null)
         {
-            byte[] actualHash = SHA256.HashData(result);
+            byte[] actualHash = SHA256.HashData(baseBuffer);
             if (!actualHash.AsSpan().SequenceEqual(expectedHash))
             {
                 Console.WriteLine($"[Decompress] ❌ INTEGRITY FAILURE: SHA256 mismatch. File is corrupted.");
@@ -5520,7 +5566,7 @@ public class CrossService : ICross
         Observability.RecordStage("ApplyPatchAndEgress", applySw.Elapsed.TotalMilliseconds,
             ("chunk_count", chunkCount), ("patches", patches?.Length ?? 0));
 
-        return result;
+        return baseBuffer;
     }
 
     public async Task<byte[]> _CompressFile(byte[] _file)
