@@ -59,6 +59,18 @@ public class CcfStoreService
         Console.WriteLine($"[CcfStore] Stored {fileId}.ccf from stream");
     }
 
+    public async Task<(string? FilePath, byte[]? Data)> GetCcfLocationAsync(string fileId, CancellationToken ct = default)
+    {
+        string ccfPath = GetCcfPath(fileId);
+        if (File.Exists(ccfPath))
+            return (ccfPath, null);
+
+        byte[]? fromPack = await GetCcfFromPackAsync(fileId, ct);
+        if (fromPack != null) return (null, fromPack);
+
+        return (null, null);
+    }
+
     public async Task<byte[]?> GetCcfAsync(string fileId, CancellationToken ct = default)
     {
         string ccfPath = GetCcfPath(fileId);

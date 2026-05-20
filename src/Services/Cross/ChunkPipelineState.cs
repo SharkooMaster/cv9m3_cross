@@ -77,6 +77,7 @@ internal sealed class ChunkPipelineState
                 s.StorageGuid = sf.StorageGuid;
                 s.TargetAgent = sf.TargetAgent;
                 s.Chunk = ByteString.Empty;
+                s.IsMatched = true;
                 break;
             case ChunkEncodeBase.RepFresh rf:
                 s.BucketId = rf.BucketId;
@@ -84,6 +85,7 @@ internal sealed class ChunkPipelineState
                 s.StorageGuid = rf.StorageGuid;
                 s.TargetAgent = rf.TargetAgent;
                 s.Chunk = ByteString.Empty;
+                s.IsMatched = true;
                 break;
             case ChunkEncodeBase.Ref r:
                 s.BucketId = r.BucketId;
@@ -91,6 +93,7 @@ internal sealed class ChunkPipelineState
                 s.StorageGuid = r.StorageGuid;
                 s.TargetAgent = r.TargetAgent;
                 s.Chunk = r.BaseBytes;
+                s.IsMatched = true;
                 break;
             case ChunkEncodeBase.Mosaic m:
                 s.Chunk = ByteString.CopyFrom(m.Info.StitchedBase);
@@ -121,6 +124,7 @@ internal sealed class ChunkPipelineState
         s.BucketKey = bucketKey;
         s.StorageGuid = storageGuid;
         s.TargetAgent = targetAgent;
+        s.IsMatched = true;
     }
 
     /// <summary>
@@ -136,7 +140,7 @@ internal sealed class ChunkPipelineState
     public void AdoptSearchResponse(int i, QueryResponseObject response)
     {
         Sorted[i] = response;
-        if (response.BucketId == 0)
+        if (!response.IsMatched)
         {
             EncodeBases[i] = ChunkEncodeBase.Zeros.Instance;
         }

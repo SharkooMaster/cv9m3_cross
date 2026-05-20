@@ -527,6 +527,10 @@ public class CompressFileService : FileService.FileServiceBase
     {
         int windowSize = MyCrossService.WindowSize;
         int parallelism = GetPipelineParallelism();
+
+        if (declaredSize < 0 || declaredSize > 1024L * 1024 * 1024 * 1024 * 1024) // 1 PB limit
+            throw new RpcException(new Status(StatusCode.InvalidArgument, $"Invalid declared size: {declaredSize}"));
+
         int blockCount = (int)((declaredSize + windowSize - 1) / windowSize);
         if (blockCount == 0) blockCount = 1;
 
@@ -1172,28 +1176,42 @@ public class CompressFileService : FileService.FileServiceBase
 
         Console.WriteLine($"[DecompressById] Fetching CCF for fileId={fileId}");
 
-        byte[]? ccfBytes = await CcfStoreService.Instance.GetCcfAsync(fileId, context.CancellationToken);
-        if (ccfBytes == null)
+        var (ccfPath, ccfBytes) = await CcfStoreService.Instance.GetCcfLocationAsync(fileId, context.CancellationToken);
+        if (ccfPath == null && ccfBytes == null)
             throw new RpcException(new Status(StatusCode.NotFound,
                 $"CCF not found for fileId={fileId}. File may not have been compressed in cluster-stored mode."));
 
-        Console.WriteLine($"[DecompressById] Got {ccfBytes.Length} byte CCF, decompressing...");
+        long ccfLength = ccfPath != null ? new FileInfo(ccfPath).Length : ccfBytes!.Length;
+        Console.WriteLine($"[DecompressById] Got CCF (length={ccfLength}), decompressing...");
 
         await _compressionGate.WaitAsync(context.CancellationToken);
         try
         {
             byte[] magicBytes = new byte[4];
-            Buffer.BlockCopy(ccfBytes, 0, magicBytes, 0, Math.Min(4, ccfBytes.Length));
+            if (ccfPath != null)
+            {
+                using var fs = new FileStream(ccfPath, FileMode.Open, FileAccess.Read);
+                fs.Read(magicBytes, 0, 4);
+            }
+            else
+            {
+                Buffer.BlockCopy(ccfBytes!, 0, magicBytes, 0, Math.Min(4, ccfBytes!.Length));
+            }
+
             bool isWindowed = MyCrossService.IsWindowedFormat(magicBytes);
 
             var crossService = new MyCrossService();
 
             if (isWindowed)
             {
-                string tempPath = Path.Combine(Path.GetTempPath(), $"cross-dbi-{Guid.NewGuid():N}.bin");
+                string tempPath = ccfPath ?? Path.Combine(Path.GetTempPath(), $"cross-dbi-{Guid.NewGuid():N}.bin");
+                bool deleteTemp = ccfPath == null;
                 try
                 {
-                    await File.WriteAllBytesAsync(tempPath, ccfBytes, context.CancellationToken);
+                    if (deleteTemp)
+                    {
+                        await File.WriteAllBytesAsync(tempPath, ccfBytes!, context.CancellationToken);
+                    }
                     var grpcStream = new GrpcResponseStream(responseStream, context.CancellationToken);
                     (long decompressedSize, byte[] decompressedHash) =
                         await crossService.DecompressFileWindowedStreamAsync(tempPath, grpcStream, context.CancellationToken);
@@ -1202,7 +1220,7 @@ public class CompressFileService : FileService.FileServiceBase
                     {
                         DecompressStats = new DecompressionStats
                         {
-                            CompressedSize = (ulong)ccfBytes.Length,
+                            CompressedSize = (ulong)ccfLength,
                             DecompressedSize = (ulong)decompressedSize,
                             DecompressedSha256 = ByteString.CopyFrom(decompressedHash)
                         }
@@ -1214,12 +1232,16 @@ public class CompressFileService : FileService.FileServiceBase
                 }
                 finally
                 {
-                    try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                    if (deleteTemp)
+                    {
+                        try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                    }
                 }
             }
             else
             {
-                byte[] decompressedBytes = await crossService.DecompressFile(ccfBytes);
+                byte[] dataToDecompress = ccfBytes ?? await File.ReadAllBytesAsync(ccfPath!, context.CancellationToken);
+                byte[] decompressedBytes = await crossService.DecompressFile(dataToDecompress);
                 byte[] decompressedHash;
                 using (var sha = SHA256.Create())
                     decompressedHash = sha.ComputeHash(decompressedBytes);
@@ -1228,7 +1250,7 @@ public class CompressFileService : FileService.FileServiceBase
                 {
                     DecompressStats = new DecompressionStats
                     {
-                        CompressedSize = (ulong)ccfBytes.Length,
+                        CompressedSize = (ulong)ccfLength,
                         DecompressedSize = (ulong)decompressedBytes.Length,
                         DecompressedSha256 = ByteString.CopyFrom(decompressedHash)
                     }

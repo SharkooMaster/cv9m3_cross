@@ -1199,10 +1199,11 @@ public class CrossService : ICross
             {
                 sorted[i] = new QueryResponseObject
                 {
-                    BucketId = 0, BucketKey = 0,
+                    BucketId = ulong.MaxValue, BucketKey = ulong.MaxValue,
                     Similarity = 1.0f, Chunk = ByteString.Empty,
                     Index = i, Duplicate = true,
-                    NeedToStore = true, TargetAgent = mainAgents[i]
+                    NeedToStore = true, TargetAgent = mainAgents[i],
+                    IsMatched = false
                 };
                 // encodeBases[i] remains Zeros (set by ChunkPipelineState constructor).
             }
@@ -1497,7 +1498,7 @@ public class CrossService : ICross
                 info.Donors = donors.Select(d => (d.BucketId, d.BucketKey)).ToList();
                 info.StitchedBase = stitched;
                 // NOTE: NeedToStore is INTENTIONALLY not flipped here. Mosaic-L2 Assembly
-                // produces a stitched base for chunks that have no L1 match (rep.BucketId == 0
+                // produces a stitched base for chunks that have no L1 match (!rep.IsMatched
                 // && rep.NeedToStore == true) — the chunk still needs to be stored fresh so
                 // its bytes are available for future deduplication, but the diff against the
                 // stitched mosaic is written into the CCF in addition. The store-groups loop
@@ -1785,14 +1786,8 @@ public class CrossService : ICross
                                     {
                                         var storeRes = batchRes.Results[j];
 
-                                        // Per-item failure signal from the agent. The BatchStore
-                                        // handler swallows per-item exceptions and returns
-                                        // Id=0/Index=0; without this branch cross would happily
-                                        // record a zero-ref in the CCF and silently corrupt the
-                                        // chunk. Skip the merge and leave the existing response
-                                        // intact so later passes (or a higher-level retry) can
-                                        // pick it up; we also count these for diagnostics.
-                                        if (storeRes.Id == 0 && storeRes.Index == 0)
+                                        // Per-item failure signal from the agent.
+                                        if (!storeRes.Success)
                                         {
                                             batchStoreFailures++;
                                             continue;
@@ -2072,17 +2067,17 @@ public class CrossService : ICross
             {
                 sorted[i] = new QueryResponseObject()
                 {
-                        BucketId = 0, BucketKey = 0, Similarity = 0,
-                        Chunk = ByteString.Empty, Index = i, Duplicate = false
+                        BucketId = ulong.MaxValue, BucketKey = ulong.MaxValue, Similarity = 0,
+                        Chunk = ByteString.Empty, Index = i, Duplicate = false, IsMatched = false
                     };
                 }
 
                 // Only skip diff/fetch for chunks WE stored (NeedToStore) — their storageGuid
                 // points to the original bytes. For search matches (even similarity ≈ 1.0),
                 // we MUST use the agent's base chunk: vector similarity ≠ byte identity!
-                bool skipDiff = sorted[i].NeedToStore && sorted[i].BucketId != 0;
+                bool skipDiff = sorted[i].NeedToStore && sorted[i].IsMatched;
 
-                if (!skipDiff && sorted[i].BucketId != 0)
+                if (!skipDiff && sorted[i].IsMatched)
                 {
                     // ── CRITICAL: refetch every Ref from the CANONICAL agent. ──
                     // The gateway sets QueryResponseObject.TargetAgent to whichever
@@ -2217,14 +2212,14 @@ public class CrossService : ICross
                 }
 
                 // ── CRITICAL: Handle failed base chunk fetches ──
-                // If we have a valid reference (BucketId != 0) but couldn't fetch the base chunk,
+                // If we have a valid reference (BucketId != ulong.MaxValue) but couldn't fetch the base chunk,
                 // diffing against zeros would cause DATA CORRUPTION on decompression.
                 // Fix: store the chunk as its own reference (empty diff = base == original).
                 var failedFetchStore = new List<(int index, QueryResponseObject resp, byte[] chunk, string agent, float[] vector, string bucket)>();
                 foreach (var idx in baseChunkFetchIndices)
                 {
                     if (fetchedChunks[idx] != null) continue; // fetch succeeded
-                    if (sorted[idx].BucketId == 0) continue;  // already no ref, zeros diff is correct
+                    if (!sorted[idx].IsMatched) continue;  // already no ref, zeros diff is correct
 
                     // Base fetch FAILED with a valid reference → must store chunk to avoid corruption
                     if (chunkMap.TryGetValue(idx, out var chunkBytes) && chunkBytes != null && chunkBytes.Length == Globals.chunkSize)
@@ -2331,13 +2326,13 @@ public class CrossService : ICross
 
             for (int i = 0; i < sorted.Length; i++)
             {
-                if (sorted[i].BucketId == 0 && sorted[i].BucketKey == 0)
+                if (!sorted[i].IsMatched)
                 {
                     zeroRefCount++;
                     continue;
                 }
 
-                if (sorted[i].NeedToStore && sorted[i].BucketId != 0)
+                if (sorted[i].NeedToStore && sorted[i].IsMatched)
                 {
                     emptyDiffCount++;
                     continue;
@@ -2347,7 +2342,7 @@ public class CrossService : ICross
                 bool isNonRep = !representativeSet.Contains(i);
                 int rep = groupRepresentative[i];
 
-                if (isNonRep && sorted[rep].NeedToStore && sorted[rep].BucketId != 0)
+                if (isNonRep && sorted[rep].NeedToStore && sorted[rep].IsMatched)
                     baseChunk = fileChunks[rep];
                 else if (sorted[i].Chunk != null && sorted[i].Chunk.Length > 0)
                     baseChunk = sorted[i].Chunk.ToByteArray();
@@ -2902,9 +2897,9 @@ public class CrossService : ICross
 
             await Task.WhenAll(reStoreTasks);
 
-            int reDeduped = bloatedDiffRestore.Count(i => !sorted[i].NeedToStore && sorted[i].BucketId != 0);
-            int freshStored = bloatedDiffRestore.Count(i => sorted[i].NeedToStore && sorted[i].BucketId != 0);
-            int storeFailures = bloatedDiffRestore.Count(i => sorted[i].BucketId == 0);
+            int reDeduped = bloatedDiffRestore.Count(i => !sorted[i].NeedToStore && sorted[i].IsMatched);
+            int freshStored = bloatedDiffRestore.Count(i => sorted[i].NeedToStore && sorted[i].IsMatched);
+            int storeFailures = bloatedDiffRestore.Count(i => !sorted[i].IsMatched);
 
             phaseSw.Stop();
             Console.WriteLine($"[Compress] BloatRestore: {phaseSw.ElapsedMilliseconds}ms, {bloatedDiffRestore.Count} chunks" +
@@ -2992,7 +2987,6 @@ public class CrossService : ICross
             for (int i = 0; i < encodeBases.Length; i++)
             {
                 if (encodeBases[i] is not ChunkEncodeBase.Ref r) continue;
-                if (r.BucketId == 0) continue;
                 if (r.BaseBytes.Length == 0) continue;
                 eligible.Add(i);
             }
@@ -3098,8 +3092,8 @@ public class CrossService : ICross
         // "referencesFound" = chunks that truly reuse an existing base (not stored fresh).
         // With clustering, non-reps that weren't ejected count as references (they diff
         // against the rep's base chunk and share its agent reference).
-        int referencesFound = sorted.Count(r => r != null && !r.NeedToStore && r.BucketId != 0);
-        int storedChunks = sorted.Count(r => r != null && r.NeedToStore && r.BucketId != 0);
+        int referencesFound = sorted.Count(r => r != null && !r.NeedToStore && r.IsMatched);
+        int storedChunks = sorted.Count(r => r != null && r.NeedToStore && r.IsMatched);
         int clusteredNonReps = Globals.EnableChunkClustering ? fileChunks.Count - representativeSet.Count : 0;
         int ejectedByBloat = bloatedDiffRestore.Count(i => !representativeSet.Contains(i));
 
@@ -3113,7 +3107,7 @@ public class CrossService : ICross
             int pos = 0;
             for (int i = 0; i < sorted.Length; i++)
             {
-                if (sorted[i] != null && sorted[i].NeedToStore && sorted[i].BucketId != 0)
+                if (sorted[i] != null && sorted[i].NeedToStore && sorted[i].IsMatched)
                 {
                     Buffer.BlockCopy(fileChunks[i], 0, storedData, pos, Globals.chunkSize);
                     pos += Globals.chunkSize;
@@ -3184,7 +3178,7 @@ public class CrossService : ICross
                             // the mosaic cannot be reconstructed. We must verify all donors.
                             foreach (var donor in m.Info.Donors)
                             {
-                                if (donor.BucketId != 0)
+                                if (donor.BucketId != ulong.MaxValue)
                                 {
                                     try
                                     {
@@ -3211,7 +3205,7 @@ public class CrossService : ICross
                             // Zeros (already self-contained) don't need a single-bucket round-trip probe.
                             return;
                     }
-                    if (bId == 0)
+                    if (bId == ulong.MaxValue)
                         return;
                     Interlocked.Increment(ref verifyEligible);
 
@@ -3587,8 +3581,8 @@ public class CrossService : ICross
         // uses RendezvousRouter.PickAgent(bitstring) — so that's the agent whose
         // bytes the encoder MUST be diffing against.
         string targetAgent = r?.TargetAgent ?? "";
-        string bitstringNow = bucketId != 0 ? UlongToBitstring(bucketId) : "";
-        string canonicalAgent = bucketId != 0 ? (RendezvousRouter.PickAgent(bitstringNow) ?? "") : "";
+        string bitstringNow = bucketId != ulong.MaxValue ? UlongToBitstring(bucketId) : "";
+        string canonicalAgent = bucketId != ulong.MaxValue ? (RendezvousRouter.PickAgent(bitstringNow) ?? "") : "";
 
         string targetAgentFetchSha = "n/a";
         int targetAgentFetchLen = -1;
@@ -3803,6 +3797,9 @@ public class CrossService : ICross
         long originalFileSize = new FileInfo(inputPath).Length;
         int windowSize = WindowSize;
 
+        if (originalFileSize < 0 || originalFileSize > 1024L * 1024 * 1024 * 1024 * 1024) // 1 PB limit
+            throw new InvalidDataException($"Invalid file size: {originalFileSize}");
+
         // ── 1. Compute SHA256 of entire original file (streaming — no full load) ──
         byte[] originalHash;
         using (var sha = System.Security.Cryptography.SHA256.Create())
@@ -3910,6 +3907,9 @@ public class CrossService : ICross
     {
         long originalFileSize = declaredFileSize;
         int windowSize = WindowSize;
+
+        if (originalFileSize < 0 || originalFileSize > 1024L * 1024 * 1024 * 1024 * 1024) // 1 PB limit
+            throw new InvalidDataException($"Invalid declared file size: {originalFileSize}");
 
         // ── 1. Determine block count from declared size ──
         int blockCount = (int)((originalFileSize + windowSize - 1) / windowSize);
@@ -4321,8 +4321,8 @@ public class CrossService : ICross
                 switch (flag)
                 {
                     case 0x00:
-                        refBucketIds[i] = 0;
-                        refBucketIndices[i] = 0;
+                        refBucketIds[i] = ulong.MaxValue;
+                        refBucketIndices[i] = ulong.MaxValue;
                         refStorageGuids[i] = "";
                         break;
                     case 0x01:
@@ -4416,7 +4416,7 @@ public class CrossService : ICross
                 switch (flag)
                 {
                     case 0x00: // zero-ref
-                        refBucketIds[i] = 0;
+                        refBucketIds[i] = ulong.MaxValue;
                         refStorageGuids[i] = "";
                         break;
                     case 0x01: // full ref: bucketId + storageGuid
@@ -4638,8 +4638,8 @@ public class CrossService : ICross
             {
                 ulong bucketId = refBucketIds[i];
                 bool isZeroRef = isV3
-                    ? (bucketId == 0 && string.IsNullOrEmpty(refStorageGuids[i]))
-                    : (bucketId == 0 && refBucketIndices[i] == 0);
+                    ? (bucketId == ulong.MaxValue && string.IsNullOrEmpty(refStorageGuids[i]))
+                    : (bucketId == ulong.MaxValue && refBucketIndices[i] == ulong.MaxValue);
                 bool isMosaicRef = mosaicRefs.ContainsKey(i);
 
                 if (isZeroRef)
@@ -4868,8 +4868,8 @@ public class CrossService : ICross
             });
         fetchSw.Stop();
         int zeroRefChunks = isV3
-            ? Enumerable.Range(0, chunkCount).Count(i => refBucketIds[i] == 0 && string.IsNullOrEmpty(refStorageGuids[i]))
-            : Enumerable.Range(0, chunkCount).Count(i => refBucketIds[i] == 0 && refBucketIndices[i] == 0);
+            ? Enumerable.Range(0, chunkCount).Count(i => refBucketIds[i] == ulong.MaxValue && string.IsNullOrEmpty(refStorageGuids[i]))
+            : Enumerable.Range(0, chunkCount).Count(i => refBucketIds[i] == ulong.MaxValue && refBucketIndices[i] == ulong.MaxValue);
         Console.WriteLine($"[Decompress] FetchBaseChunks: {fetchSw.ElapsedMilliseconds}ms, {chunkCount} chunks, version={header.Version}, primary={primaryHits}, fallback={fallbackHits}, zeroRef={zeroRefChunks}");
         Observability.RecordStage("FetchBaseChunks", fetchSw.Elapsed.TotalMilliseconds, ("chunk_count", chunkCount));
 
@@ -5493,7 +5493,7 @@ public class CrossService : ICross
                 if (refBucketIds != null)
                 {
                     for (int rr = 0; rr < refBucketIds.Length; rr++)
-                        if (refBucketIds[rr] != 0 && refBucketIds[rr] != ulong.MaxValue) refsResolved++;
+                        if (refBucketIds[rr] != ulong.MaxValue) refsResolved++;
                 }
                 global::Cross.Services.JobEvents.IntegrityDiagnostics.EmitDecompressFailure(
                     blockIndex: 0,

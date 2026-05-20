@@ -102,7 +102,7 @@ internal static class ChunkEncodeBaseExt
         ChunkEncodeBase.SelfFresh s => s.BucketId,
         ChunkEncodeBase.RepFresh r => r.BucketId,
         ChunkEncodeBase.Ref r => r.BucketId,
-        _ => 0UL
+        _ => ulong.MaxValue
     };
 
     public static ulong BucketKey(this ChunkEncodeBase b) => b switch
@@ -110,7 +110,7 @@ internal static class ChunkEncodeBaseExt
         ChunkEncodeBase.SelfFresh s => s.BucketKey,
         ChunkEncodeBase.RepFresh r => r.BucketKey,
         ChunkEncodeBase.Ref r => r.BucketKey,
-        _ => 0UL
+        _ => ulong.MaxValue
     };
 
     public static string StorageGuid(this ChunkEncodeBase b) => b switch

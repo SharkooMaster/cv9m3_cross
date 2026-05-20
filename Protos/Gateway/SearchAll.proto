@@ -35,4 +35,5 @@ message QueryResponseObject
     bool need_to_store = 7; // OPTIMIZATION: Gateway indicates chunk needs storing (Cross will handle it)
     string target_agent = 8; // OPTIMIZATION: Which agent to store the chunk to (if need_to_store=true)
     string storage_guid = 9; // SHA256 of matched/stored chunk — content-addressable, globally unique
+    bool is_matched = 10; // true = match found, false = no match found (bucket_id/key are invalid)
 }
