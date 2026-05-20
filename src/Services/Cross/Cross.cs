@@ -2345,16 +2345,15 @@ public class CrossService : ICross
                 }
 
                 int threshold = isNonRep ? maxAllowedCluster : maxAllowedRegular;
-                // Bloat guard is only worth running when we're storing the CCF on
-                // the cluster — re-storing a fresh copy then trades one extra
-                // chunk-write for a smaller CCF that also lives on the cluster.
-                // When CCFs are streamed back to the client (EnableCcfStore=false)
-                // the user gets the bytes once and never sees them again, so the
-                // extra cluster write is pure write-amplification with no payoff,
-                // and crucially it adds a re-store step which is the most fragile
-                // part of the compress pipeline (multiple stale-state propagation
-                // paths feeding the encode case decision). Skip it.
-                if (Globals.EnableCcfStore && differingByteCount > threshold)
+                // Bloat guard runs unconditionally. The encoder's similarity floor
+                // is 60% byte-level Hamming similarity — anything below that has a
+                // diff so close to a full raw chunk that emitting a Ref + diff is
+                // strictly worse than just storing the chunk's own bytes fresh and
+                // emitting a zero-diff SelfFresh. The CCF-storage flag only affects
+                // *where* the resulting compressed bytes get written; it does not
+                // change the per-chunk encoding economics. Re-storing here is the
+                // only way to get the CCF's average error rate below 100%.
+                if (differingByteCount > threshold)
                 {
                     pipelineState.PrepareReStoreRouting(i, mainAgents[i]);
                     bloatedDiffRestore.Add(i);

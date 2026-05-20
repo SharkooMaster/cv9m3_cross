@@ -19,22 +19,25 @@ public static class Globals
 
     /// <summary>
     /// Maximum fraction of differing bytes allowed before a matched chunk is re-stored.
+    /// Mirror of "byte similarity must be ≥ 60%": diff ≤ 40% of chunk size keeps the
+    /// chunk as a reference + diff; diff > 40% forces a fresh re-store of the chunk's
+    /// own bytes so the encoder doesn't emit a near-full-chunk diff into the CCF.
     /// This is a BYTE-LEVEL metric (Hamming ratio), independent of the cosine similarity
     /// threshold which operates in LSH vector space. The two can diverge significantly.
     /// </summary>
     public static float BloatGuardThreshold =
-        float.TryParse(Environment.GetEnvironmentVariable("BLOAT_GUARD_THRESHOLD"), out var bgt) ? bgt : 0.75f;
+        float.TryParse(Environment.GetEnvironmentVariable("BLOAT_GUARD_THRESHOLD"), out var bgt) ? bgt : 0.40f;
 
     /// <summary>
-    /// Bloat guard threshold for clustered non-representative chunks. These chunks
-    /// share a bitstring with their rep, so they are genuinely similar. Ejecting a
-    /// non-rep ADDS to datacenter storage (new store). Keeping it only adds to client
-    /// .ccf diff size. Since datacenter growth is the priority metric, we tolerate a
-    /// larger diff for non-reps before ejecting. Default 0.85 = eject only if >85%
-    /// of bytes differ (nearly random relative to base).
+    /// Bloat guard threshold for clustered non-representative chunks. Same 60%-byte-
+    /// similarity floor as <see cref="BloatGuardThreshold"/> — non-reps that don't
+    /// reach 60% byte similarity with their rep get re-stored fresh rather than
+    /// emitted as a near-full-chunk diff. Diverging from the regular threshold here
+    /// only made sense when datacenter-storage growth was the priority metric; for
+    /// CCF correctness the 60% floor is identical regardless of rep status.
     /// </summary>
     public static float ClusterBloatGuardThreshold =
-        float.TryParse(Environment.GetEnvironmentVariable("CLUSTER_BLOAT_GUARD_THRESHOLD"), out var cbgt) ? cbgt : 0.85f;
+        float.TryParse(Environment.GetEnvironmentVariable("CLUSTER_BLOAT_GUARD_THRESHOLD"), out var cbgt) ? cbgt : 0.40f;
 
     /// <summary>
     /// Local chunk clustering: group chunks with identical LSH bitstrings before
