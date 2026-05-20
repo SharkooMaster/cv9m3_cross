@@ -3172,10 +3172,36 @@ public class CrossService : ICross
                         bId = r.BucketId; bKey = r.BucketKey;
                         expected = r.BaseBytes.ToByteArray();
                         break;
+                    case ChunkEncodeBase.Mosaic m:
+                        // Mosaic chunks rely on donor chunks. If a donor chunk is missing,
+                        // the mosaic cannot be reconstructed. We must verify all donors.
+                        foreach (var donor in m.Info.Donors)
+                        {
+                            if (donor.BucketId != 0)
+                            {
+                                try
+                                {
+                                    string bitstring = UlongToBitstring(donor.BucketId);
+                                    string canonicalAgent = RendezvousRouter.PickAgent(bitstring);
+                                    byte[]? got = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                                        donor.BucketId, donor.BucketKey,
+                                        targetAgent: string.IsNullOrWhiteSpace(canonicalAgent) ? null : canonicalAgent);
+                                    if (got == null || got.Length == 0)
+                                    {
+                                        demote[i] = true;
+                                        break;
+                                    }
+                                }
+                                catch
+                                {
+                                    demote[i] = true;
+                                    break;
+                                }
+                            }
+                        }
+                        return;
                     default:
-                        // Zeros (already self-contained) and Mosaic (donor-stitched
-                        // and covered by its own donor verification at fetch time)
-                        // don't need a single-bucket round-trip probe.
+                        // Zeros (already self-contained) don't need a single-bucket round-trip probe.
                         return;
                 }
                 if (bId == 0)
@@ -4650,6 +4676,12 @@ public class CrossService : ICross
                                         if (chunk != null) break;
                                     }
                                 }
+                                if (chunk == null)
+                                {
+                                    throw new InvalidDataException(
+                                        $"Missing donor chunk for mosaic reference ({dBucketId}, {dBucketIdx}). " +
+                                        $"Agent={targetAgent}, Bitstring={bitstring}");
+                                }
                             }
                             donorChunks[dIdx] = chunk ?? new byte[chSize];
                         });
@@ -4701,6 +4733,12 @@ public class CrossService : ICross
                                     await Task.Delay(100 * (retry + 1));
                                     chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(dBucketId, dBucketIdx, targetAgent);
                                     if (chunk != null) break;
+                                }
+                                if (chunk == null)
+                                {
+                                    throw new InvalidDataException(
+                                        $"Missing donor chunk for byte-merge reference ({dBucketId}, {dBucketIdx}). " +
+                                        $"Agent={targetAgent}, Bitstring={bitstring}");
                                 }
                             }
                             donorChunks[dIdx] = chunk ?? new byte[chSize];
