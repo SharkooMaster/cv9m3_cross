@@ -3113,6 +3113,110 @@ public class CrossService : ICross
 
         // v5.0.0: references are built by BuildV5References (ref table + compact indices)
 
+        // ── Pre-PatchEncode verification sweep ──
+        // Every Ref/SelfFresh/RepFresh encoding tells the decoder "fetch the base
+        // bytes from (BucketId, BucketKey) on the canonical agent and apply the
+        // diff". If that fetch returns null at decode time the file is unrecoverable
+        // (the smoketest throws "Missing base chunk for reference (B, K)"). The
+        // previous code path assumed fresh-stored chunks were always retrievable
+        // because we just wrote them, but that assumption fails when the agent's
+        // L1 bucket cache evicts the bucket between BatchStore-completes and
+        // Smoketest-runs, or when the RocksDB write-batcher hasn't yet flushed the
+        // first-write-to-bucket vector record (BucketKey == 0 cases are most
+        // exposed to this race).
+        //
+        // Verify every non-Mosaic, non-Zeros encoding by fetching the same way the
+        // decoder will (RendezvousRouter.PickAgent on UlongToBitstring(BucketId)).
+        // If the agent doesn't return the exact bytes the encoder is about to diff
+        // against, demote the chunk to Zeros — the encoder then subtracts an
+        // all-zero base, the diff carries the full chunk into the error payload
+        // (zstd-compressed), and the decoder reconstructs the chunk from the CCF
+        // alone with no agent fetch needed. Trades a controlled CCF-size increase
+        // for the elimination of "Missing base chunk" smoketest failures.
+        {
+            using var verifyStage = Observability.StartStage("IntegrityCheck:EncodeVerify");
+            var verifySw = Stopwatch.StartNew();
+            var demote = new bool[encodeBases.Length];
+            int verifyEligible = 0;
+
+            var verifyTasks = Enumerable.Range(0, encodeBases.Length).Select(async i =>
+            {
+                ulong bId, bKey;
+                byte[] expected;
+                switch (encodeBases[i])
+                {
+                    case ChunkEncodeBase.SelfFresh sf:
+                        bId = sf.BucketId; bKey = sf.BucketKey;
+                        expected = fileChunks[i];
+                        break;
+                    case ChunkEncodeBase.RepFresh rf:
+                        bId = rf.BucketId; bKey = rf.BucketKey;
+                        expected = fileChunks[rf.RepIndex];
+                        break;
+                    case ChunkEncodeBase.Ref r:
+                        bId = r.BucketId; bKey = r.BucketKey;
+                        expected = r.BaseBytes.ToByteArray();
+                        break;
+                    default:
+                        // Zeros (already self-contained) and Mosaic (donor-stitched
+                        // and covered by its own donor verification at fetch time)
+                        // don't need a single-bucket round-trip probe.
+                        return;
+                }
+                if (bId == 0)
+                    return;
+                Interlocked.Increment(ref verifyEligible);
+
+                try
+                {
+                    string bitstring = UlongToBitstring(bId);
+                    string canonicalAgent = RendezvousRouter.PickAgent(bitstring);
+                    byte[]? got = await _chunkReferenceClient.GetChunkByReferenceAsync(
+                        bId, bKey,
+                        targetAgent: string.IsNullOrWhiteSpace(canonicalAgent) ? null : canonicalAgent);
+                    if (got == null || got.Length != expected.Length
+                        || !got.AsSpan().SequenceEqual(expected))
+                    {
+                        demote[i] = true;
+                    }
+                }
+                catch
+                {
+                    demote[i] = true;
+                }
+            });
+            await Task.WhenAll(verifyTasks);
+
+            int demoted = 0;
+            for (int i = 0; i < encodeBases.Length; i++)
+            {
+                if (demote[i])
+                {
+                    pipelineState.SetEncodeBase(i, ChunkEncodeBase.Zeros.Instance);
+                    demoted++;
+                }
+            }
+            verifySw.Stop();
+
+            Console.WriteLine(
+                $"[Compress] EncodeVerify: {verifySw.ElapsedMilliseconds}ms, " +
+                $"eligible={verifyEligible}, demoted-to-zeros={demoted}");
+            Observability.RecordStage("IntegrityCheck:EncodeVerify",
+                verifySw.Elapsed.TotalMilliseconds,
+                ("chunk_count", verifyEligible), ("bucket_count", demoted));
+
+            if (demoted > 0)
+            {
+                // Surface the demotion in the integrity track so it correlates with
+                // any (hopefully now-zero) downstream smoketest noise.
+                Console.WriteLine(
+                    $"[Integrity] ⚠️ EncodeVerify demoted {demoted} chunks to Zeros " +
+                    $"because their (BucketId, BucketKey) didn't return the expected " +
+                    $"bytes at compress-time probe (decoder would have hit " +
+                    $"\"Missing base chunk\" at decompress).");
+            }
+        }
+
         // ── ERROR ENCODING ──
         byte[] errorDictionaryBytes;
         {
