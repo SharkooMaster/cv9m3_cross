@@ -147,6 +147,21 @@ public static class Globals
         string.Equals(Environment.GetEnvironmentVariable("CCF_ENCODING_V6"), "true",
             StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// v7.0.0 simplified encoding. Default ON. Set CCF_ENCODING_V7=false to revert to v5/v6.
+    /// v7 layout:
+    ///   [header:version|chunkCount|refsLen|errLen|trimLen]
+    ///   [refs: per chunk flag(0x00 zero / 0x01 exact / 0x02 diff) + (bucketId,chunkId,storageGuid) for non-zero]
+    ///   [errors: per 0x02 chunk errCount + (u16 deltaOff, i16 deltaVal)*]
+    ///   [trim raw bytes]
+    ///   [trailer: hashLen + sha256(chunks||trim)]
+    /// One encoder, one decoder, content-addressable fallback by storageGuid. No
+    /// mosaic, no clustering, no transform programs. ~10x simpler than v6.
+    /// </summary>
+    public static bool CcfEncodingV7 =
+        !string.Equals(Environment.GetEnvironmentVariable("CCF_ENCODING_V7"), "false",
+            StringComparison.OrdinalIgnoreCase);
+
     public static bool CcfNeuralErrorCompression =
         !string.Equals(Environment.GetEnvironmentVariable("CCF_NEURAL_ERROR_DISABLED"), "true",
             StringComparison.OrdinalIgnoreCase);

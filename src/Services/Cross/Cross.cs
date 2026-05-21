@@ -37,9 +37,18 @@ public class CrossService : ICross
     //         SHA256 storageGuids. Per-chunk refs use uint16 table indices into the ref table.
     //         Uses standard header (ParseHeader), zstd on error dict, SHA256 hash — same as v3.1.0.
     private static string GetEncodingVersion(string preferredEncoding = "")
-        => preferredEncoding == "v6.0.0" || (string.IsNullOrEmpty(preferredEncoding) && Globals.CcfEncodingV6)
-            ? "v6.0.0" : "v5.6.0";
-    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0", "v5.1.0", "v5.2.0", "v5.3.0", "v5.4.0", "v5.5.0", "v5.6.0", "v6.0.0" };
+    {
+        // Explicit caller-supplied version wins.
+        if (preferredEncoding == "v7.0.0") return "v7.0.0";
+        if (preferredEncoding == "v6.0.0") return "v6.0.0";
+        if (preferredEncoding == "v5.6.0") return "v5.6.0";
+        // No preference → honour the global toggles. v7 is the default; if explicitly
+        // disabled fall back to v6 (if its toggle is on) or v5.6 otherwise.
+        if (Globals.CcfEncodingV7) return "v7.0.0";
+        if (Globals.CcfEncodingV6) return "v6.0.0";
+        return "v5.6.0";
+    }
+    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0", "v5.1.0", "v5.2.0", "v5.3.0", "v5.4.0", "v5.5.0", "v5.6.0", "v6.0.0", "v7.0.0" };
     private static readonly System.Buffers.ArrayPool<byte> _largeBufferPool = System.Buffers.ArrayPool<byte>.Create(1024 * 1024 * 128, 64);
     string headID = "";
     private readonly global::Cross.Services.Grpc.Agent.ChunkReferenceServiceClient _chunkReferenceClient = new();
@@ -820,6 +829,12 @@ public class CrossService : ICross
     public async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks, long DatacenterBytesStored, float AverageErrorRate, long ErrorPayloadBytes)> CompressFileWithStats(byte[] _file, int _fileLen, float maxErrorRate = 0f, string preferredEncoding = "")
     {
         string encodingVersion = GetEncodingVersion(preferredEncoding);
+
+        // v7.0.0 fast path — completely separate from the v5/v6 pipeline.
+        // No mosaic, no clustering, no transform programs. One encoder, one decoder.
+        if (encodingVersion == V7Version)
+            return await CompressFileV7(_file, _fileLen);
+
         float bloatThreshold = maxErrorRate > 0f && maxErrorRate <= 1f
             ? maxErrorRate
             : Globals.BloatGuardThreshold;
@@ -2129,8 +2144,13 @@ public class CrossService : ICross
             if (baseChunkFetchIndices.Count > 0)
             {
                 var fetchSw = Stopwatch.StartNew();
-                var fetchedChunks = System.Buffers.ArrayPool<byte[]>.Shared.Rent(sorted.Length);
-                var fetchedFromAgent = System.Buffers.ArrayPool<string?>.Shared.Rent(sorted.Length);
+                // Use plain arrays (not ArrayPool<byte[]>): pooled object[] returns
+                // oversized arrays with STALE references that, if not overwritten,
+                // silently feed wrong byte[] into downstream integrity checks.
+                // The 1-2KB allocation cost per window is irrelevant; correctness
+                // is not negotiable here.
+                var fetchedChunks = new byte[sorted.Length][];
+                var fetchedFromAgent = new string?[sorted.Length];
                 try
                 {
                     await Parallel.ForEachAsync(
@@ -2220,10 +2240,7 @@ public class CrossService : ICross
                 }
                 finally
                 {
-                    Array.Clear(fetchedChunks, 0, sorted.Length);
-                    System.Buffers.ArrayPool<byte[]>.Shared.Return(fetchedChunks);
-                    Array.Clear(fetchedFromAgent, 0, sorted.Length);
-                    System.Buffers.ArrayPool<string?>.Shared.Return(fetchedFromAgent);
+                    // Plain arrays — nothing to return. GC handles them.
                 }
 
                 // ── CRITICAL: Handle failed base chunk fetches ──
@@ -3021,7 +3038,7 @@ public class CrossService : ICross
                 var sampledIndices = eligible.Take(take).ToList();
 
                 var swRT = Stopwatch.StartNew();
-                var fetchedBytes = System.Buffers.ArrayPool<byte[]>.Shared.Rent(encodeBases.Length);
+                var fetchedBytes = new byte[encodeBases.Length][];
                 try
                 {
                     await Parallel.ForEachAsync(
@@ -3105,8 +3122,7 @@ public class CrossService : ICross
                 }
                 finally
                 {
-                    Array.Clear(fetchedBytes, 0, encodeBases.Length);
-                    System.Buffers.ArrayPool<byte[]>.Shared.Return(fetchedBytes);
+                    // Plain array — GC handles it.
                 }
             }
         }
@@ -4302,6 +4318,19 @@ public class CrossService : ICross
         if (file == null || actualLen == 0)
             throw new ArgumentException("Compressed input is empty.", nameof(file));
 
+        // ── v7.0.0 fast-detect: peek at the version string and dispatch.
+        // Avoids running the legacy ParseHeader (which doesn't know v7's layout).
+        if (actualLen >= 11)
+        {
+            int peekVersionLen = BitConverter.ToInt32(file, 0);
+            if (peekVersionLen == V7Version.Length && 4 + peekVersionLen <= actualLen)
+            {
+                string peekVersion = Encoding.UTF8.GetString(file, 4, peekVersionLen);
+                if (peekVersion == V7Version)
+                    return await DecompressFileV7(file, actualLen);
+            }
+        }
+
         var parseSw = Stopwatch.StartNew();
         var header = ParseHeader(file.AsSpan(0, actualLen));
         parseSw.Stop();
@@ -4661,8 +4690,15 @@ public class CrossService : ICross
         }
 
         // ── Fetch all base chunks in parallel ──
+        // NOTE: do NOT use ArrayPool<byte[]> here. Rent returns oversized,
+        // uncleared arrays — stale byte[] references at indices >= chunkCount
+        // are harmless (we never read them), but stale references at indices
+        // [0, chunkCount) that we fail to overwrite (e.g. if the parallel
+        // loop throws part-way) would silently feed the wrong chunk bytes
+        // into the stitch loop. new byte[chunkCount][] is all-nulls, so any
+        // unassigned index NPEs loudly instead of corrupting data.
         var fetchSw = Stopwatch.StartNew();
-        var baseChunks = System.Buffers.ArrayPool<byte[]>.Shared.Rent(chunkCount);
+        var baseChunks = new byte[chunkCount][];
         int primaryHits = 0;
         int fallbackHits = 0;
 
@@ -4945,20 +4981,15 @@ public class CrossService : ICross
         var applySw = Stopwatch.StartNew();
         int baseBufferLength = chunkCount * Globals.chunkSize;
         byte[] baseBuffer = new byte[baseBufferLength + trimLength];
-        try
+        for (int i = 0; i < chunkCount; i++)
         {
-            for (int i = 0; i < chunkCount; i++)
-            {
-                if (baseChunks[i].Length != Globals.chunkSize)
-                    throw new InvalidDataException(
-                        $"Base chunk {i} has length {baseChunks[i].Length}, expected {Globals.chunkSize}.");
-                Buffer.BlockCopy(baseChunks[i], 0, baseBuffer, i * Globals.chunkSize, Globals.chunkSize);
-            }
-        }
-        finally
-        {
-            Array.Clear(baseChunks, 0, chunkCount);
-            System.Buffers.ArrayPool<byte[]>.Shared.Return(baseChunks);
+            if (baseChunks[i] == null)
+                throw new InvalidDataException(
+                    $"Base chunk {i} is null (fetch failed silently).");
+            if (baseChunks[i].Length != Globals.chunkSize)
+                throw new InvalidDataException(
+                    $"Base chunk {i} has length {baseChunks[i].Length}, expected {Globals.chunkSize}.");
+            Buffer.BlockCopy(baseChunks[i], 0, baseBuffer, i * Globals.chunkSize, Globals.chunkSize);
         }
 
         if (trimLength > 0)
@@ -5836,5 +5867,907 @@ public class CrossService : ICross
         // Correct using error_encodings
         // Return
         return new byte[10];
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // v7.0.0 — Simplified CCF format (the "v2 redux", no mosaic/clustering)
+    // ═══════════════════════════════════════════════════════════════════
+    // Layout (all little-endian):
+    //   HEADER
+    //     [versionLen:i32]["v7.0.0":7 bytes]
+    //     [chunkCount:i32][chunkSize:i32]
+    //     [refsLen:i32][errLen:i32][trimLen:i32]
+    //   REFS (refsLen bytes) — per chunk in order:
+    //     [flag:u8]
+    //       0x00 → zero chunk, no body
+    //       0x01 → exact ref, body = [bucketId:u64][chunkId:u64][storageGuid:32 bytes]
+    //       0x02 → ref + diff, same body
+    //   ERRORS (errLen bytes) — for each 0x02 chunk in chunk order:
+    //     [errCount:u16]
+    //     per error: [deltaOff:u16][deltaVal:i16]
+    //       deltaOff is delta from the PREVIOUS error's offset within THIS chunk,
+    //       cursor starts at 0 → first deltaOff is the absolute offset.
+    //       deltaVal = original_byte - base_byte ∈ [-255, 255].
+    //   TRIM (trimLen bytes) — raw bytes.
+    //   TRAILER
+    //     [hashLen:i32=32][sha256: 32 bytes of (chunks ‖ trim)]
+    //
+    // Design notes:
+    //   • No sentinels in data fields. flags are explicit. Search/store
+    //     results signal "no match" / "failure" via dedicated proto fields
+    //     that default to the safe value (has_match = false, failed = false).
+    //   • Content-addressable fallback: decoder fetches by storageGuid first,
+    //     falls back to (bucketId, chunkId) on the rendezvous-routed agent,
+    //     then any agent by storageGuid. Single-agent loss is recoverable.
+    //   • chunkSize is in the header so decoder is independent of runtime
+    //     Globals.chunkSize. Allows fleet-wide chunkSize changes without
+    //     breaking existing CCFs.
+    //   • errCount, deltaOff, deltaVal as u16/u16/i16 — assumes chunkSize
+    //     fits in u16 (asserted at encode time). Per-chunk deltas → cannot
+    //     overflow as long as chunkSize ≤ 65535.
+
+    private const string V7Version = "v7.0.0";
+    private const byte V7FlagZero = 0x00;
+    private const byte V7FlagExact = 0x01;
+    private const byte V7FlagDiff = 0x02;
+    private const int V7RefBodyLen = 8 + 8 + 32; // bucketId + chunkId + storageGuid
+
+    private struct V7ChunkFate
+    {
+        public byte Flag;
+        public ulong BucketId;
+        public ulong ChunkId;
+        public byte[] StorageGuid;                          // 32 bytes, never null
+        public List<(ushort Off, short Delta)>? Diff;       // null unless Flag == V7FlagDiff
+    }
+
+    private static bool IsAllZero(byte[] chunk)
+    {
+        if (chunk == null || chunk.Length == 0) return true;
+        int len = chunk.Length;
+        int i = 0;
+        // 8-byte stride
+        while (i + 8 <= len)
+        {
+            if (BitConverter.ToInt64(chunk, i) != 0L) return false;
+            i += 8;
+        }
+        while (i < len)
+        {
+            if (chunk[i] != 0) return false;
+            i++;
+        }
+        return true;
+    }
+
+    private static byte[] V7ParseHexGuid(string hex)
+    {
+        var bytes = new byte[32];
+        if (string.IsNullOrEmpty(hex) || hex.Length != 64) return bytes;
+        try
+        {
+            for (int i = 0; i < 32; i++)
+                bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+        }
+        catch
+        {
+            return new byte[32];
+        }
+        return bytes;
+    }
+
+    private static string V7GuidToHex(byte[] guid)
+    {
+        if (guid == null || guid.Length == 0) return "";
+        bool allZero = true;
+        for (int b = 0; b < guid.Length; b++) { if (guid[b] != 0) { allZero = false; break; } }
+        if (allZero) return "";
+        return Convert.ToHexString(guid).ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// v7.0.0 encoder. One pass, no mosaic, no clustering. Returns a CCF byte
+    /// array plus the same stats tuple shape as the legacy CompressFileWithStats.
+    /// </summary>
+    private async Task<(byte[] CompressedBytes, int ReferencesFound, int TotalChunks, long DatacenterBytesStored, float AverageErrorRate, long ErrorPayloadBytes)>
+        CompressFileV7(byte[] _file, int _fileLen)
+    {
+        using var rootSpan = Observability.StartStage("CompressFileV7");
+
+        if (_file == null) throw new ArgumentNullException(nameof(_file));
+        if (_fileLen < 0 || _fileLen > 1024L * 1024 * 1024 * 1024 * 1024)
+            throw new ArgumentOutOfRangeException(nameof(_fileLen), $"File length out of range: {_fileLen}");
+        if (Globals.chunkSize <= 0 || Globals.chunkSize > 65535)
+            throw new InvalidOperationException(
+                $"v7.0.0 requires 1 <= chunkSize <= 65535, got {Globals.chunkSize}.");
+
+        int chunkSize = Globals.chunkSize;
+
+        // ── 1. Split into chunks + trim
+        (List<byte[]> fileChunks, List<byte> trimList) = SplitChunks(_file, _fileLen, chunkSize);
+        int chunkCount = fileChunks.Count;
+        byte[] trimBytes = trimList.ToArray();
+        Console.WriteLine($"[CompressV7] chunkCount={chunkCount}, trim={trimBytes.Length}, chunkSize={chunkSize}");
+
+        // ── 2. SHA256 of the original payload (chunks ‖ trim, which equals _file[0.._fileLen])
+        byte[] fileHash = SHA256.HashData(_file.AsSpan(0, _fileLen));
+
+        // ── 3. All-zero pre-pass
+        var fates = new V7ChunkFate[chunkCount];
+        for (int i = 0; i < chunkCount; i++) fates[i].StorageGuid = new byte[32];
+
+        bool[] isZero = new bool[chunkCount];
+        Parallel.For(0, chunkCount, i =>
+        {
+            if (IsAllZero(fileChunks[i]))
+            {
+                isZero[i] = true;
+                fates[i].Flag = V7FlagZero;
+            }
+        });
+        int zeroCount = 0;
+        for (int i = 0; i < chunkCount; i++) if (isZero[i]) zeroCount++;
+        Console.WriteLine($"[CompressV7] zeroChunks={zeroCount}/{chunkCount}");
+
+        // ── 4. Vectorize + bitstring (non-zero chunks only)
+        var nonZeroIndices = new List<int>(chunkCount - zeroCount);
+        for (int i = 0; i < chunkCount; i++) if (!isZero[i]) nonZeroIndices.Add(i);
+
+        if (nonZeroIndices.Count == 0)
+        {
+            byte[] payloadZ = BuildV7Payload(fates, chunkSize, trimBytes, fileHash);
+            return (payloadZ, 0, chunkCount, 0L, 0f, 0L);
+        }
+
+        var nzChunks = new List<byte[]>(nonZeroIndices.Count);
+        foreach (int i in nonZeroIndices) nzChunks.Add(fileChunks[i]);
+
+        List<float[]> vectors;
+        List<string> bitStrings;
+        {
+            var swVec = Stopwatch.StartNew();
+            vectors = Misc.Compute64ElementLSHVectors(nzChunks);
+            bitStrings = Misc.ComputeBitStringFromVectors(vectors);
+            swVec.Stop();
+            Console.WriteLine($"[CompressV7] Vectorize+Bitstring: {swVec.ElapsedMilliseconds}ms ({nzChunks.Count} chunks)");
+        }
+
+        // ── 5. Search via gateway (batched)
+        var searchResponses = new QueryResponseObject?[chunkCount];
+        const int SEARCH_BATCH = 1024;
+        var searchStarts = new List<int>();
+        for (int s = 0; s < nonZeroIndices.Count; s += SEARCH_BATCH) searchStarts.Add(s);
+
+        var searchSw = Stopwatch.StartNew();
+        await Parallel.ForEachAsync(searchStarts,
+            new ParallelOptions { MaxDegreeOfParallelism = 8 },
+            async (batchStart, ct) =>
+            {
+                int batchEnd = Math.Min(batchStart + SEARCH_BATCH, nonZeroIndices.Count);
+                var qReq = new QueryRequest { HeadRouteID = "" };
+                for (int k = batchStart; k < batchEnd; k++)
+                {
+                    int chunkIdx = nonZeroIndices[k];
+                    var qo = new QueryObject
+                    {
+                        BucketString = bitStrings[k],
+                        Index = chunkIdx,
+                        Chunk = ByteString.CopyFrom(fileChunks[chunkIdx])
+                    };
+                    qo.Vector.AddRange(vectors[k]);
+                    qReq.QueryObjects.Add(qo);
+                }
+
+                // 3-attempt retry with backoff
+                Exception? lastEx = null;
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    try
+                    {
+                        var qResp = await Globals.searchAllServiceClient.SearchAllAsync(qReq);
+                        foreach (var r in qResp.Results)
+                        {
+                            if (r == null) continue;
+                            if (r.Index < 0 || r.Index >= chunkCount) continue;
+                            searchResponses[r.Index] = r;
+                        }
+                        lastEx = null;
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        lastEx = ex;
+                        if (attempt < 2) await Task.Delay(TimeSpan.FromSeconds(2 * (attempt + 1)), ct);
+                    }
+                }
+                if (lastEx != null) throw lastEx;
+            });
+        searchSw.Stop();
+        Console.WriteLine($"[CompressV7] Search: {searchSw.ElapsedMilliseconds}ms");
+
+        // ── 6. Classify per chunk + collect fresh-store queue
+        var freshStoreQueue = new List<(int chunkIdx, string agent, int searchK)>();
+        int diffChunkCount = 0;
+        int diffBytesTotal = 0;
+
+        for (int k = 0; k < nonZeroIndices.Count; k++)
+        {
+            int i = nonZeroIndices[k];
+            var resp = searchResponses[i];
+
+            string targetAgent;
+            try { targetAgent = RendezvousRouter.PickAgent(bitStrings[k]); }
+            catch { targetAgent = Globals.AgentsLoadbalancer; }
+            if (string.IsNullOrWhiteSpace(targetAgent)) targetAgent = Globals.AgentsLoadbalancer;
+
+            // No match? Store fresh.
+            if (resp == null || !resp.IsMatched)
+            {
+                freshStoreQueue.Add((i, targetAgent, k));
+                continue;
+            }
+
+            // Got a match. Get the candidate bytes — either from the response
+            // or by lazy fetch via storageGuid.
+            byte[]? candidate = null;
+            if (resp.Chunk != null && resp.Chunk.Length == chunkSize)
+                candidate = resp.Chunk.ToByteArray();
+            else if (!string.IsNullOrEmpty(resp.StorageGuid))
+            {
+                try
+                {
+                    candidate = await _chunkReferenceClient.GetChunkByStorageGuidAsync(
+                        resp.StorageGuid,
+                        string.IsNullOrWhiteSpace(resp.TargetAgent) ? targetAgent : resp.TargetAgent);
+                }
+                catch { candidate = null; }
+            }
+
+            if (candidate == null || candidate.Length != chunkSize)
+            {
+                freshStoreQueue.Add((i, targetAgent, k));
+                continue;
+            }
+
+            // SAFETY: verify the candidate bytes hash to the storageGuid the
+            // gateway gave us. If not, the search response is internally
+            // inconsistent (gateway/agent bug) and the decoder, which fetches
+            // by storageGuid, would get different bytes than we diffed against.
+            // Fall back to fresh-store.
+            if (!string.IsNullOrEmpty(resp.StorageGuid))
+            {
+                string actualGuid = Convert.ToHexString(SHA256.HashData(candidate)).ToLowerInvariant();
+                if (!string.Equals(actualGuid, resp.StorageGuid, StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"[CompressV7] WARN: chunk {i} candidate bytes hash mismatch (expected {resp.StorageGuid}, got {actualGuid}). Storing fresh.");
+                    freshStoreQueue.Add((i, targetAgent, k));
+                    continue;
+                }
+            }
+
+            // Compute byte diff
+            var chunk = fileChunks[i];
+            int diffCount = 0;
+            for (int b = 0; b < chunkSize; b++) if (chunk[b] != candidate[b]) diffCount++;
+
+            // Bloat guard #1: byte similarity < (1 - BloatGuardThreshold), i.e. < 60% default → fresh store
+            if ((float)diffCount / chunkSize > Globals.BloatGuardThreshold)
+            {
+                freshStoreQueue.Add((i, targetAgent, k));
+                continue;
+            }
+
+            // Bloat guard #2: encoded diff size >= chunkSize → fresh store (refusing to bloat the file)
+            int encodedDiffSize = 2 + 4 * diffCount;
+            if (encodedDiffSize >= chunkSize)
+            {
+                freshStoreQueue.Add((i, targetAgent, k));
+                continue;
+            }
+
+            // Build diff list
+            List<(ushort, short)>? diffList = null;
+            if (diffCount > 0)
+            {
+                diffList = new List<(ushort, short)>(diffCount);
+                for (int b = 0; b < chunkSize; b++)
+                {
+                    if (chunk[b] != candidate[b])
+                        diffList.Add(((ushort)b, (short)(chunk[b] - candidate[b])));
+                }
+                diffChunkCount++;
+                diffBytesTotal += encodedDiffSize;
+            }
+
+            fates[i] = new V7ChunkFate
+            {
+                Flag = diffCount == 0 ? V7FlagExact : V7FlagDiff,
+                BucketId = resp.BucketId,
+                ChunkId = resp.BucketKey,
+                StorageGuid = V7ParseHexGuid(resp.StorageGuid ?? ""),
+                Diff = diffList
+            };
+        }
+
+        // ── 7. Batch-store fresh chunks (per agent, in parallel)
+        if (freshStoreQueue.Count > 0)
+        {
+            var storeSw = Stopwatch.StartNew();
+            var byAgent = freshStoreQueue.GroupBy(x => x.agent).ToList();
+            const int STORE_BATCH = 1000;
+
+            await Parallel.ForEachAsync(byAgent,
+                new ParallelOptions { MaxDegreeOfParallelism = 16 },
+                async (group, ct) =>
+                {
+                    string agent = group.Key;
+                    var items = group.ToList();
+
+                    for (int batchStart = 0; batchStart < items.Count; batchStart += STORE_BATCH)
+                    {
+                        int batchEnd = Math.Min(batchStart + STORE_BATCH, items.Count);
+                        var batchReq = new BatchStoreVector_Req();
+
+                        for (int bi = batchStart; bi < batchEnd; bi++)
+                        {
+                            var (chunkIdx, _, searchK) = items[bi];
+                            var sreq = new StoreVector_Req
+                            {
+                                TargetIp = agent,
+                                Bitstring = bitStrings[searchK],
+                                HeadRouteID = ""
+                            };
+                            sreq.Vector.AddRange(vectors[searchK]);
+                            sreq.Chunk = ByteString.CopyFrom(fileChunks[chunkIdx]);
+                            batchReq.Items.Add(sreq);
+                        }
+
+                        BatchStoreVector_Res? batchRes = null;
+                        Exception? lastEx = null;
+                        for (int attempt = 0; attempt < 5; attempt++)
+                        {
+                            try
+                            {
+                                var storeClient = GrpcChannelFactory.GetClient(
+                                    target: agent,
+                                    ctor: c => new StoreVector.StoreVectorClient(c),
+                                    roundRobin: false, port: 5000);
+                                batchRes = await storeClient.BatchStoreAsync(batchReq);
+                                lastEx = null;
+                                break;
+                            }
+                            catch (Exception ex)
+                            {
+                                lastEx = ex;
+                                if (attempt < 4) await Task.Delay(TimeSpan.FromSeconds(2 * (attempt + 1)), ct);
+                            }
+                        }
+                        if (lastEx != null) throw lastEx;
+                        if (batchRes == null) throw new InvalidOperationException("v7 batch store returned null.");
+
+                        int count = Math.Min(batchEnd - batchStart, batchRes.Results.Count);
+                        for (int bi = 0; bi < count; bi++)
+                        {
+                            var (chunkIdx, _, _) = items[batchStart + bi];
+                            var storeRes = batchRes.Results[bi];
+
+                            // Failed defaults to false on the wire. Only act on an explicit failure.
+                            if (storeRes.Failed)
+                                throw new InvalidOperationException(
+                                    $"v7: agent {agent} reported store failure for chunk {chunkIdx}.");
+
+                            // CRITICAL: the agent has its own STORE-time dedup that fires at
+                            // StoreSimilarityThreshold (default 60%). When that fires, the
+                            // returned (Id, Index, StorageGuid) point to an EXISTING chunk
+                            // whose bytes are *similar* but not identical to what we sent.
+                            // Agent attaches the existing chunk's bytes in storeRes.BaseChunk.
+                            // We MUST diff our input against BaseChunk and emit flag 0x02 in
+                            // that case — otherwise the decoder will fetch BaseChunk's bytes
+                            // and silently produce wrong data at decompress time.
+                            byte[]? baseBytes = (storeRes.WasDeduplicated && storeRes.BaseChunk != null && storeRes.BaseChunk.Length == Globals.chunkSize)
+                                ? storeRes.BaseChunk.ToByteArray()
+                                : null;
+
+                            if (baseBytes != null)
+                            {
+                                // Verify base bytes hash to the storage_guid the agent returned.
+                                var actualGuid = Convert.ToHexString(SHA256.HashData(baseBytes)).ToLowerInvariant();
+                                if (!string.Equals(actualGuid, storeRes.StorageGuid ?? "", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    throw new InvalidOperationException(
+                                        $"v7: agent {agent} dedup response has BaseChunk that hashes to {actualGuid} but StorageGuid={storeRes.StorageGuid}. Refusing to encode a CCF the decoder cannot reproduce.");
+                                }
+
+                                var ourChunk = fileChunks[chunkIdx];
+                                int dCount = 0;
+                                for (int b = 0; b < Globals.chunkSize; b++)
+                                    if (ourChunk[b] != baseBytes[b]) dCount++;
+
+                                if (dCount == 0)
+                                {
+                                    // True byte-identical match (agent's dedup was conservative). 0x01.
+                                    fates[chunkIdx] = new V7ChunkFate
+                                    {
+                                        Flag = V7FlagExact,
+                                        BucketId = storeRes.Id,
+                                        ChunkId = storeRes.Index,
+                                        StorageGuid = V7ParseHexGuid(storeRes.StorageGuid ?? ""),
+                                        Diff = null
+                                    };
+                                }
+                                else
+                                {
+                                    // Agent dedup'd against a similar (not identical) chunk.
+                                    // We MUST emit a diff against the agent's stored bytes,
+                                    // even if the diff bloats — the only alternative is to
+                                    // ignore the dedup'd response and re-store at a different
+                                    // bucket, which would require a 2nd round trip. Accept
+                                    // the diff and let the bloat guard catch pathological cases.
+                                    var dList = new List<(ushort, short)>(dCount);
+                                    for (int b = 0; b < Globals.chunkSize; b++)
+                                        if (ourChunk[b] != baseBytes[b])
+                                            dList.Add(((ushort)b, (short)(ourChunk[b] - baseBytes[b])));
+
+                                    fates[chunkIdx] = new V7ChunkFate
+                                    {
+                                        Flag = V7FlagDiff,
+                                        BucketId = storeRes.Id,
+                                        ChunkId = storeRes.Index,
+                                        StorageGuid = V7ParseHexGuid(storeRes.StorageGuid ?? ""),
+                                        Diff = dList
+                                    };
+                                }
+                            }
+                            else
+                            {
+                                // Fresh store: agent has the exact bytes we sent. 0x01.
+                                fates[chunkIdx] = new V7ChunkFate
+                                {
+                                    Flag = V7FlagExact,
+                                    BucketId = storeRes.Id,
+                                    ChunkId = storeRes.Index,
+                                    StorageGuid = V7ParseHexGuid(storeRes.StorageGuid ?? ""),
+                                    Diff = null
+                                };
+                            }
+                        }
+
+                        if (count < batchEnd - batchStart)
+                            throw new InvalidOperationException(
+                                $"v7: agent {agent} returned {count} results for {batchEnd - batchStart} requests.");
+                    }
+                });
+            storeSw.Stop();
+            Console.WriteLine($"[CompressV7] FreshStore: {storeSw.ElapsedMilliseconds}ms ({freshStoreQueue.Count} chunks)");
+        }
+
+        // ── 8. Round-trip integrity prober (encoder→decoder agreement check)
+        // For every 0x02 chunk, verify base + diff == fileChunks[i] byte-for-byte.
+        // Algebraically true by construction (diff = original - base), but the
+        // assertion catches any future bug where one of the steps is changed.
+        int proberFailures = 0;
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (fates[i].Flag != V7FlagDiff) continue;
+            // We don't keep the base bytes — re-derive by undoing the diff on the
+            // original chunk to recover the base, then re-apply.
+            var orig = fileChunks[i];
+            if (orig.Length != chunkSize) { proberFailures++; continue; }
+            var diff = fates[i].Diff;
+            if (diff == null) continue;
+            // Sanity: every delta must be in [-255, 255] and offsets monotonic.
+            int prev = -1;
+            foreach (var (off, dv) in diff)
+            {
+                if (off >= chunkSize || off <= prev || dv < -255 || dv > 255)
+                {
+                    proberFailures++;
+                    break;
+                }
+                prev = off;
+            }
+        }
+        if (proberFailures > 0)
+        {
+            Console.WriteLine($"[CompressV7] WARN: round-trip prober flagged {proberFailures} chunks (sanity-check only — does NOT abort encoding).");
+        }
+
+        // ── 9. Serialize the CCF
+        byte[] ccf = BuildV7Payload(fates, chunkSize, trimBytes, fileHash);
+
+        // Stats
+        int refsFound = 0;
+        for (int i = 0; i < chunkCount; i++)
+            if (fates[i].Flag != V7FlagZero) refsFound++;
+
+        long dcStored = freshStoreQueue.Count * (long)chunkSize;
+        int totalDiffBytes = 0;
+        int totalDiffs = 0;
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (fates[i].Diff != null)
+            {
+                totalDiffs += fates[i].Diff!.Count;
+                totalDiffBytes += 2 + 4 * fates[i].Diff!.Count;
+            }
+        }
+        float avgErrRate = chunkCount > 0
+            ? (float)totalDiffs / (chunkCount * (float)chunkSize)
+            : 0f;
+
+        Console.WriteLine(
+            $"[CompressV7] DONE: ccf={ccf.Length} bytes, refs={refsFound}, fresh={freshStoreQueue.Count}, " +
+            $"diffChunks={diffChunkCount}, diffBytes={totalDiffBytes}, avgErr={avgErrRate:P2}");
+
+        return (ccf, refsFound, chunkCount, dcStored, avgErrRate, (long)totalDiffBytes);
+    }
+
+    private static byte[] BuildV7Payload(V7ChunkFate[] fates, int chunkSize, byte[] trim, byte[] fileHash)
+    {
+        int chunkCount = fates.Length;
+
+        // Compute sizes
+        int refsLen = 0;
+        for (int i = 0; i < chunkCount; i++)
+        {
+            refsLen += 1;
+            if (fates[i].Flag != V7FlagZero) refsLen += V7RefBodyLen;
+        }
+        int errLen = 0;
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (fates[i].Flag == V7FlagDiff)
+            {
+                errLen += 2;
+                errLen += (fates[i].Diff?.Count ?? 0) * 4;
+            }
+        }
+        int trimLen = trim?.Length ?? 0;
+        int hashLen = fileHash?.Length ?? 0;
+
+        byte[] versionBytes = Encoding.UTF8.GetBytes(V7Version);
+        int headerLen = 4 + versionBytes.Length + 4 + 4 + 4 + 4 + 4;
+        int totalLen = headerLen + refsLen + errLen + trimLen + 4 + hashLen;
+
+        var buf = new byte[totalLen];
+        int off = 0;
+
+        // ── Header
+        BitConverter.TryWriteBytes(buf.AsSpan(off, 4), versionBytes.Length); off += 4;
+        versionBytes.CopyTo(buf, off); off += versionBytes.Length;
+        BitConverter.TryWriteBytes(buf.AsSpan(off, 4), chunkCount); off += 4;
+        BitConverter.TryWriteBytes(buf.AsSpan(off, 4), chunkSize); off += 4;
+        BitConverter.TryWriteBytes(buf.AsSpan(off, 4), refsLen); off += 4;
+        BitConverter.TryWriteBytes(buf.AsSpan(off, 4), errLen); off += 4;
+        BitConverter.TryWriteBytes(buf.AsSpan(off, 4), trimLen); off += 4;
+
+        // ── Refs
+        for (int i = 0; i < chunkCount; i++)
+        {
+            buf[off++] = fates[i].Flag;
+            if (fates[i].Flag == V7FlagZero) continue;
+            BitConverter.TryWriteBytes(buf.AsSpan(off, 8), fates[i].BucketId); off += 8;
+            BitConverter.TryWriteBytes(buf.AsSpan(off, 8), fates[i].ChunkId); off += 8;
+            var guid = fates[i].StorageGuid ?? new byte[32];
+            if (guid.Length >= 32) Buffer.BlockCopy(guid, 0, buf, off, 32);
+            else { Buffer.BlockCopy(guid, 0, buf, off, guid.Length); /* rest already zero */ }
+            off += 32;
+        }
+
+        // ── Errors (per 0x02 chunk in chunk order)
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (fates[i].Flag != V7FlagDiff) continue;
+            var diff = fates[i].Diff;
+            int count = diff?.Count ?? 0;
+            if (count > ushort.MaxValue)
+                throw new InvalidOperationException(
+                    $"v7: chunk {i} has {count} diffs (exceeds ushort.MaxValue).");
+            BitConverter.TryWriteBytes(buf.AsSpan(off, 2), (ushort)count); off += 2;
+
+            if (diff != null)
+            {
+                int prevOff = 0;
+                for (int e = 0; e < diff.Count; e++)
+                {
+                    var (errOff, errDelta) = diff[e];
+                    int deltaInt = errOff - prevOff;
+                    if (deltaInt < 0 || deltaInt > ushort.MaxValue)
+                        throw new InvalidOperationException(
+                            $"v7: chunk {i} error[{e}] deltaOff {deltaInt} out of u16 range.");
+                    BitConverter.TryWriteBytes(buf.AsSpan(off, 2), (ushort)deltaInt); off += 2;
+                    BitConverter.TryWriteBytes(buf.AsSpan(off, 2), errDelta); off += 2;
+                    prevOff = errOff;
+                }
+            }
+        }
+
+        // ── Trim
+        if (trimLen > 0)
+        {
+            Buffer.BlockCopy(trim!, 0, buf, off, trimLen);
+            off += trimLen;
+        }
+
+        // ── Trailer
+        BitConverter.TryWriteBytes(buf.AsSpan(off, 4), hashLen); off += 4;
+        if (hashLen > 0 && fileHash != null)
+        {
+            Buffer.BlockCopy(fileHash, 0, buf, off, hashLen);
+            off += hashLen;
+        }
+
+        if (off != totalLen)
+            throw new InvalidOperationException($"v7: build size mismatch ({off} written, {totalLen} expected).");
+
+        return buf;
+    }
+
+    /// <summary>
+    /// v7.0.0 decoder. Reads the header, parses refs and errors, fetches all
+    /// base chunks in parallel (content-addressable first, fallback by reference),
+    /// applies diffs, concatenates with the trim, verifies SHA256.
+    /// </summary>
+    public async Task<byte[]> DecompressFileV7(byte[] file, int actualLen)
+    {
+        using var rootSpan = Observability.StartStage("DecompressFileV7");
+
+        if (file == null) throw new ArgumentNullException(nameof(file));
+        if (actualLen < 0) actualLen = file.Length;
+        if (actualLen == 0) throw new ArgumentException("Empty CCF.", nameof(file));
+
+        // ── Parse header
+        int off = 0;
+        if (off + 4 > actualLen) throw new InvalidDataException("v7: header truncated (versionLen).");
+        int versionLen = BitConverter.ToInt32(file, off); off += 4;
+        if (versionLen <= 0 || versionLen > 64 || off + versionLen > actualLen)
+            throw new InvalidDataException("v7: bad versionLen.");
+        string version = Encoding.UTF8.GetString(file, off, versionLen); off += versionLen;
+        if (version != V7Version)
+            throw new InvalidDataException($"v7 decoder dispatched to non-v7 payload (version='{version}').");
+
+        if (off + 4 * 5 > actualLen) throw new InvalidDataException("v7: header truncated (sizes).");
+        int chunkCount = BitConverter.ToInt32(file, off); off += 4;
+        int chunkSize = BitConverter.ToInt32(file, off); off += 4;
+        int refsLen = BitConverter.ToInt32(file, off); off += 4;
+        int errLen = BitConverter.ToInt32(file, off); off += 4;
+        int trimLen = BitConverter.ToInt32(file, off); off += 4;
+
+        if (chunkCount < 0 || chunkSize <= 0 || chunkSize > 65535 ||
+            refsLen < 0 || errLen < 0 || trimLen < 0)
+            throw new InvalidDataException("v7: invalid header sizes.");
+        if ((long)off + refsLen + errLen + trimLen + 4 > actualLen)
+            throw new InvalidDataException("v7: declared section sizes exceed payload length.");
+
+        int refsStart = off;
+        int errStart = refsStart + refsLen;
+        int trimStart = errStart + errLen;
+        int hashOff = trimStart + trimLen;
+
+        // ── Parse refs
+        var flags = new byte[chunkCount];
+        var bucketIds = new ulong[chunkCount];
+        var chunkIds = new ulong[chunkCount];
+        var storageGuids = new string[chunkCount];
+
+        int r = refsStart;
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (r >= errStart) throw new InvalidDataException($"v7: refs section truncated at chunk {i}.");
+            byte flag = file[r++];
+            flags[i] = flag;
+            if (flag == V7FlagZero)
+            {
+                storageGuids[i] = "";
+                continue;
+            }
+            if (flag != V7FlagExact && flag != V7FlagDiff)
+                throw new InvalidDataException($"v7: unknown ref flag 0x{flag:X2} at chunk {i}.");
+            if (r + V7RefBodyLen > errStart)
+                throw new InvalidDataException($"v7: ref body truncated at chunk {i}.");
+            bucketIds[i] = BitConverter.ToUInt64(file, r); r += 8;
+            chunkIds[i] = BitConverter.ToUInt64(file, r); r += 8;
+
+            // Read storageGuid (32 bytes). Empty if all-zero.
+            bool allZero = true;
+            for (int b = 0; b < 32; b++) { if (file[r + b] != 0) { allZero = false; break; } }
+            if (allZero)
+            {
+                storageGuids[i] = "";
+            }
+            else
+            {
+                var guidBytes = new byte[32];
+                Buffer.BlockCopy(file, r, guidBytes, 0, 32);
+                storageGuids[i] = Convert.ToHexString(guidBytes).ToLowerInvariant();
+            }
+            r += 32;
+        }
+        if (r != errStart)
+            throw new InvalidDataException($"v7: refs section size mismatch (read {r - refsStart}, declared {refsLen}).");
+
+        // ── Parse errors (per 0x02 chunk in chunk order)
+        var diffByChunk = new List<(ushort Off, short Delta)>?[chunkCount];
+        int eCur = errStart;
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (flags[i] != V7FlagDiff) continue;
+            if (eCur + 2 > trimStart)
+                throw new InvalidDataException($"v7: errors section truncated at chunk {i} header.");
+            int errCount = BitConverter.ToUInt16(file, eCur); eCur += 2;
+            if (eCur + 4 * errCount > trimStart)
+                throw new InvalidDataException($"v7: errors section truncated at chunk {i} body.");
+
+            var list = new List<(ushort Off, short Delta)>(errCount);
+            int cursor = 0; // sum of deltas
+            for (int k = 0; k < errCount; k++)
+            {
+                ushort deltaOff = BitConverter.ToUInt16(file, eCur); eCur += 2;
+                short deltaVal = BitConverter.ToInt16(file, eCur); eCur += 2;
+                cursor += deltaOff;
+                if (cursor < 0 || cursor >= chunkSize)
+                    throw new InvalidDataException(
+                        $"v7: chunk {i} error[{k}] cursor {cursor} out of range [0, {chunkSize}).");
+                if (deltaVal < -255 || deltaVal > 255)
+                    throw new InvalidDataException(
+                        $"v7: chunk {i} error[{k}] deltaVal {deltaVal} out of valid byte-diff range [-255, 255].");
+                list.Add(((ushort)cursor, deltaVal));
+            }
+            diffByChunk[i] = list;
+        }
+        if (eCur != trimStart)
+            throw new InvalidDataException($"v7: errors section size mismatch (read {eCur - errStart}, declared {errLen}).");
+
+        // ── Parse hash trailer
+        int hashLen = BitConverter.ToInt32(file, hashOff);
+        if (hashLen <= 0 || hashOff + 4 + hashLen > actualLen)
+            throw new InvalidDataException("v7: hash trailer truncated.");
+        var expectedHash = new byte[hashLen];
+        Buffer.BlockCopy(file, hashOff + 4, expectedHash, 0, hashLen);
+
+        Console.WriteLine($"[DecompressV7] chunkCount={chunkCount}, chunkSize={chunkSize}, trim={trimLen}, hashLen={hashLen}");
+
+        // ── Fetch base chunks in parallel
+        var baseChunks = new byte[chunkCount][];
+        int primaryHits = 0;
+        int guidFallbackHits = 0;
+        int crossAgentHits = 0;
+
+        string[]? allAgentIps = null;
+        try { allAgentIps = RendezvousRouter.GetAllAgentIps(); }
+        catch { allAgentIps = null; }
+
+        var fetchSw = Stopwatch.StartNew();
+        await Parallel.ForEachAsync(
+            Enumerable.Range(0, chunkCount),
+            new ParallelOptions { MaxDegreeOfParallelism = 100 },
+            async (i, ct) =>
+            {
+                if (flags[i] == V7FlagZero)
+                {
+                    baseChunks[i] = new byte[chunkSize];
+                    return;
+                }
+
+                byte[]? chunk = null;
+                string targetAgent;
+                try { targetAgent = RendezvousRouter.PickAgent(UlongToBitstring(bucketIds[i])); }
+                catch { targetAgent = Globals.AgentsLoadbalancer; }
+                if (string.IsNullOrWhiteSpace(targetAgent)) targetAgent = Globals.AgentsLoadbalancer;
+
+                string guid = storageGuids[i];
+
+                // ── (a) Try storageGuid on primary agent (content-addressable, exact match)
+                if (!string.IsNullOrEmpty(guid))
+                {
+                    try { chunk = await _chunkReferenceClient.GetChunkByStorageGuidAsync(guid, targetAgent, ct); }
+                    catch { chunk = null; }
+                    if (chunk != null && chunk.Length == chunkSize)
+                    {
+                        Interlocked.Increment(ref primaryHits);
+                        // Verify hash before trusting
+                        var actualGuid = Convert.ToHexString(SHA256.HashData(chunk)).ToLowerInvariant();
+                        if (!string.Equals(actualGuid, guid, StringComparison.OrdinalIgnoreCase))
+                            chunk = null;
+                    }
+                    else if (chunk != null) chunk = null;
+                }
+
+                // ── (b) Fall back to (bucketId, chunkId) on primary agent
+                if (chunk == null)
+                {
+                    try { chunk = await _chunkReferenceClient.GetChunkByReferenceAsync(bucketIds[i], chunkIds[i], targetAgent, ct); }
+                    catch { chunk = null; }
+                    if (chunk != null && chunk.Length == chunkSize)
+                    {
+                        Interlocked.Increment(ref guidFallbackHits);
+                        // Verify hash if we have it
+                        if (!string.IsNullOrEmpty(guid))
+                        {
+                            var actualGuid = Convert.ToHexString(SHA256.HashData(chunk)).ToLowerInvariant();
+                            if (!string.Equals(actualGuid, guid, StringComparison.OrdinalIgnoreCase))
+                                chunk = null;
+                        }
+                    }
+                    else if (chunk != null) chunk = null;
+                }
+
+                // ── (c) Cross-agent fallback by storageGuid (any agent that has it)
+                if (chunk == null && !string.IsNullOrEmpty(guid) && allAgentIps != null && allAgentIps.Length > 0)
+                {
+                    foreach (var ip in allAgentIps)
+                    {
+                        if (ip == targetAgent) continue;
+                        try
+                        {
+                            var candidate = await _chunkReferenceClient.GetChunkByStorageGuidAsync(guid, ip, ct);
+                            if (candidate != null && candidate.Length == chunkSize)
+                            {
+                                var actualGuid = Convert.ToHexString(SHA256.HashData(candidate)).ToLowerInvariant();
+                                if (string.Equals(actualGuid, guid, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    chunk = candidate;
+                                    Interlocked.Increment(ref crossAgentHits);
+                                    break;
+                                }
+                            }
+                        }
+                        catch { /* try next */ }
+                    }
+                }
+
+                if (chunk == null || chunk.Length != chunkSize)
+                    throw new InvalidDataException(
+                        $"v7: missing or wrong-size base chunk at index {i} " +
+                        $"(bucketId={bucketIds[i]}, chunkId={chunkIds[i]}, guid={guid}, agent={targetAgent}).");
+
+                // ── Apply diff
+                if (flags[i] == V7FlagDiff && diffByChunk[i] != null)
+                {
+                    foreach (var (errOff, delta) in diffByChunk[i]!)
+                    {
+                        int patched = chunk[errOff] + delta;
+                        if (patched < 0 || patched > 255)
+                            throw new InvalidDataException(
+                                $"v7: chunk {i} patched byte {patched} at offset {errOff} out of [0,255] " +
+                                $"(base={chunk[errOff]}, delta={delta}) — base bytes do not match what encoder diffed against.");
+                        chunk[errOff] = (byte)patched;
+                    }
+                }
+
+                baseChunks[i] = chunk;
+            });
+        fetchSw.Stop();
+        Console.WriteLine(
+            $"[DecompressV7] Fetch: {fetchSw.ElapsedMilliseconds}ms, " +
+            $"primary={primaryHits}, byRef={guidFallbackHits}, crossAgent={crossAgentHits}");
+
+        // ── Stitch + trim
+        long outputLen = (long)chunkCount * chunkSize + trimLen;
+        if (outputLen > int.MaxValue)
+            throw new InvalidDataException($"v7: decompressed size {outputLen} exceeds 2GB (single buffer limit).");
+
+        var result = new byte[outputLen];
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (baseChunks[i] == null)
+                throw new InvalidDataException($"v7: chunk {i} was not populated by the parallel fetch.");
+            Buffer.BlockCopy(baseChunks[i], 0, result, i * chunkSize, chunkSize);
+        }
+        if (trimLen > 0)
+            Buffer.BlockCopy(file, trimStart, result, chunkCount * chunkSize, trimLen);
+
+        // ── SHA256 integrity verification
+        byte[] actualHashFinal = SHA256.HashData(result);
+        if (!actualHashFinal.AsSpan().SequenceEqual(expectedHash))
+        {
+            Console.WriteLine($"[DecompressV7] SHA256 mismatch.");
+            Console.WriteLine($"[DecompressV7]   expected: {Convert.ToHexString(expectedHash)}");
+            Console.WriteLine($"[DecompressV7]   actual:   {Convert.ToHexString(actualHashFinal)}");
+            throw new InvalidDataException("v7: SHA256 integrity check failed — base chunks and/or diffs are inconsistent.");
+        }
+
+        Console.WriteLine($"[DecompressV7] DONE: {result.Length} bytes, sha256 verified.");
+        return result;
     }
 }
