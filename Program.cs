@@ -66,8 +66,8 @@ builder.WebHost.ConfigureKestrel(options =>
     options.Limits.MaxRequestBodySize = null;
     
     options.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(10);
-    options.Limits.Http2.KeepAlivePingDelay = TimeSpan.FromSeconds(30);
-    options.Limits.Http2.KeepAlivePingTimeout = TimeSpan.FromSeconds(60);
+    // options.Limits.Http2.KeepAlivePingDelay = TimeSpan.FromSeconds(30);
+    // options.Limits.Http2.KeepAlivePingTimeout = TimeSpan.FromSeconds(60);
 });
 
 builder.Services.AddEndpointsApiExplorer();
