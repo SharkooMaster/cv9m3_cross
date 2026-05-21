@@ -246,7 +246,15 @@ public static class Globals
                             HttpHandler = new SocketsHttpHandler()
                             {
                                 EnableMultipleHttp2Connections = true,
-                                PooledConnectionIdleTimeout = Timeout.InfiniteTimeSpan,
+                                // CRITICAL: do NOT set Timeout.InfiniteTimeSpan here. When a
+                                // backend pod restarts (every deploy) the k8s Service silently
+                                // rebinds the 5-tuple to a different pod mid-stream. Cross then
+                                // reuses the now-dead connection and gets HTTP/2 PROTOCOL_ERROR
+                                // back from a peer that never opened those streams. Finite
+                                // idle+lifetime timeouts force periodic re-resolution and
+                                // make rolling deploys safe.
+                                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
+                                PooledConnectionLifetime = TimeSpan.FromMinutes(5),
                                 KeepAlivePingDelay = TimeSpan.FromSeconds(30),
                                 KeepAlivePingTimeout = TimeSpan.FromSeconds(10)
                             },
@@ -263,7 +271,13 @@ public static class Globals
                                             InitialBackoff = TimeSpan.FromMilliseconds(200),
                                             MaxBackoff = TimeSpan.FromSeconds(1),
                                             BackoffMultiplier = 2,
-                                            RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable, Grpc.Core.StatusCode.ResourceExhausted}
+                                            // Internal covers HTTP/2 PROTOCOL_ERROR on stale
+                                            // connections after a pod restart (the .NET HttpClient
+                                            // surfaces HttpProtocolException as gRPC Internal).
+                                            // Idempotent calls (Search is a read; Store is
+                                            // content-addressable so dedups on retry) — safe to
+                                            // retry transparently.
+                                            RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable, Grpc.Core.StatusCode.ResourceExhausted, Grpc.Core.StatusCode.Internal}
                                         }
                                     }
                                 }

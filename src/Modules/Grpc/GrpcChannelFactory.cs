@@ -40,7 +40,10 @@ public static class GrpcChannelFactory
         var handler = new SocketsHttpHandler
         {
             EnableMultipleHttp2Connections = true,
-            PooledConnectionIdleTimeout = Timeout.InfiniteTimeSpan,
+            // Finite recycling — Timeout.InfiniteTimeSpan keeps stale HTTP/2 connections
+            // to dead/restarted pods forever, producing PROTOCOL_ERROR on every reuse.
+            PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
+            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
             KeepAlivePingDelay = TimeSpan.FromSeconds(30),
             KeepAlivePingTimeout = TimeSpan.FromSeconds(10),
         };
@@ -103,7 +106,10 @@ public static class GrpcChannelFactory
                     InitialBackoff = sourceRetryPolicy?.InitialBackoff ?? TimeSpan.FromMilliseconds(200),
                     MaxBackoff = sourceRetryPolicy?.MaxBackoff ?? TimeSpan.FromSeconds(1),
                     BackoffMultiplier = sourceRetryPolicy?.BackoffMultiplier ?? 2,
-                    RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable }
+                    // Internal covers HTTP/2 PROTOCOL_ERROR on stale connections after
+                    // pod restart. All our RPCs are either reads (Search) or content-
+                    // addressable stores (chunk hash dedups on agent side) — safe to retry.
+                    RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable, Grpc.Core.StatusCode.Internal }
                 }
             };
             sc.MethodConfigs.Add(newMethodConfig);
@@ -127,7 +133,9 @@ public static class GrpcChannelFactory
                     InitialBackoff = sourceRetryPolicy?.InitialBackoff ?? TimeSpan.FromMilliseconds(200),
                     MaxBackoff = sourceRetryPolicy?.MaxBackoff ?? TimeSpan.FromSeconds(1),
                     BackoffMultiplier = sourceRetryPolicy?.BackoffMultiplier ?? 2,
-                    RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable }
+                    // Internal covers HTTP/2 PROTOCOL_ERROR on stale connections after
+                    // pod restart. Same rationale as round-robin case above.
+                    RetryableStatusCodes = { Grpc.Core.StatusCode.Unavailable, Grpc.Core.StatusCode.Internal }
                 }
             };
             sc.MethodConfigs.Add(newMethodConfig);
