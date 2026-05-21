@@ -26,12 +26,34 @@ internal sealed class ChunkPipelineState
     public ChunkEncodeBase[] EncodeBases { get; }
     public int Length => Sorted.Length;
 
+    // Per-chunk lock used to serialize writers competing for the same chunk
+    // index from multiple parallel tasks (e.g. the per-agent BatchGet workers
+    // in CompressFileWithStats merging search responses for the same chunk).
+    // Without this, the (Sorted[i], EncodeBases[i]) pair could be torn between
+    // two responses — encoder reads EncodeBases[i] from one response and
+    // sorted[i].TargetAgent from a different one, sending bytes to the wrong
+    // agent. The lock makes "decide if this is better" + "adopt as best" a
+    // single atomic step per chunk; locks for different chunks don't interact,
+    // so search merge stays fully parallel across chunks.
+    private readonly object[] _locks;
+
+    /// <summary>
+    /// Per-chunk lock object. Callers competing for the same chunk index MUST
+    /// take this lock around the read-then-write sequence (e.g. compare-against-
+    /// best-similarity then <see cref="AdoptSearchResponse"/>).
+    /// </summary>
+    public object LockFor(int i) => _locks[i];
+
     public ChunkPipelineState(int length)
     {
         Sorted = new QueryResponseObject?[length];
         EncodeBases = new ChunkEncodeBase[length];
+        _locks = new object[length];
         for (int i = 0; i < length; i++)
+        {
             EncodeBases[i] = ChunkEncodeBase.Zeros.Instance;
+            _locks[i] = new object();
+        }
     }
 
     /// <summary>

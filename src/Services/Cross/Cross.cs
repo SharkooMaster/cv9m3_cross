@@ -1103,6 +1103,12 @@ public class CrossService : ICross
                                 }
                                 catch (Exception searchEx)
                                 {
+                                    // Drop the cached channel/clients for this agent on
+                                    // transport failure — a Kubernetes pod restart that
+                                    // recycles the same IP will leave the pooled HTTP/2
+                                    // connection wedged forever otherwise (see
+                                    // GrpcChannelFactory.EvictOnFailure).
+                                    GrpcChannelFactory.EvictOnFailure(currentAgent, searchEx);
                                     attempt++;
                                     if (attempt >= AgentRpcThrottle.MaxAttempts)
                                     {
@@ -1131,29 +1137,35 @@ public class CrossService : ICross
                                 {
                                     var best = res.Results[0];
                                     float sim = best.Similarity;
-                                    if (sim >= MIN_THRESH && sim > bestSims[idx])
+                                    if (sim >= MIN_THRESH && sim > Volatile.Read(ref bestSims[idx]))
                                     {
-                                        float current;
-                                        do
+                                        // Per-chunk lock makes "is this the new best?" + the
+                                        // matching pipeline-state adoption a single atomic step.
+                                        // The previous lock-free CAS only guarded bestSims[idx];
+                                        // the AdoptSearchResponse that followed was a separate
+                                        // pair of writes (Sorted[i], EncodeBases[i]) that two
+                                        // racing winners could interleave, leaving Sorted from
+                                        // one match and EncodeBases from another. Cheap because
+                                        // the locks are per-chunk — different chunks never
+                                        // contend, so search-merge across agents stays parallel.
+                                        lock (pipelineState.LockFor(idx))
                                         {
-                                            current = Volatile.Read(ref bestSims[idx]);
-                                            if (sim <= current) break;
-                                        } while (Interlocked.CompareExchange(ref bestSims[idx], sim, current) != current);
-
-                                        if (sim > current)
-                                        {
-                                            pipelineState.AdoptSearchResponse(idx, new QueryResponseObject
+                                            if (sim > bestSims[idx])
                                             {
-                                                BucketId = best.BucketId,
-                                                BucketKey = (ulong)best.BucketKey,
-                                                Similarity = sim,
-                                                Chunk = best.Chunk,
-                                                Index = idx,
-                                                Duplicate = true,
-                                                NeedToStore = false,
-                                                TargetAgent = agent,
-                                                StorageGuid = best.StorageGuid ?? ""
-                                            });
+                                                bestSims[idx] = sim;
+                                                pipelineState.AdoptSearchResponse(idx, new QueryResponseObject
+                                                {
+                                                    BucketId = best.BucketId,
+                                                    BucketKey = (ulong)best.BucketKey,
+                                                    Similarity = sim,
+                                                    Chunk = best.Chunk,
+                                                    Index = idx,
+                                                    Duplicate = true,
+                                                    NeedToStore = false,
+                                                    TargetAgent = agent,
+                                                    StorageGuid = best.StorageGuid ?? ""
+                                                });
+                                            }
                                         }
                                     }
 
@@ -1619,6 +1631,7 @@ public class CrossService : ICross
                         }
                         catch (Exception ex)
                         {
+                            GrpcChannelFactory.EvictOnFailure(agentIp, ex);
                             Console.WriteLine($"[Compress] Lane search to {agentIp} failed: {ex.Message}");
                         }
                     })).ToArray();
@@ -1896,6 +1909,7 @@ public class CrossService : ICross
                                 }
                                 catch (Exception storeEx)
                                 {
+                                    GrpcChannelFactory.EvictOnFailure(storeAgent, storeEx);
                                     storeAttempt++;
                                     if (storeAttempt >= AgentRpcThrottle.MaxAttempts)
                                     {
@@ -2695,6 +2709,7 @@ public class CrossService : ICross
                         }
                         catch (Exception ex)
                         {
+                            GrpcChannelFactory.EvictOnFailure(agentIp, ex);
                             Console.WriteLine($"[Compress] Lane fallback search to {agentIp} failed: {ex.Message}");
                         }
                     })).ToArray();
@@ -2906,6 +2921,7 @@ public class CrossService : ICross
                             }
                             catch (Exception reStoreEx)
                             {
+                                GrpcChannelFactory.EvictOnFailure(reStoreAgent, reStoreEx);
                                 reStoreAttempt++;
                                 if (reStoreAttempt >= AgentRpcThrottle.MaxAttempts)
                                 {
@@ -6076,6 +6092,11 @@ public class CrossService : ICross
                     }
                     catch (Exception ex)
                     {
+                        // Evict the cached round-robin (dns:///) gateway channel on
+                        // transport failure so the next attempt rebuilds a fresh
+                        // HTTP/2 connection and re-resolves DNS — necessary after
+                        // a gateway pod restart.
+                        GrpcChannelFactory.EvictOnFailure(Globals.GatewayLoadbalancer, ex);
                         lastEx = ex;
                         if (attempt < 2) await Task.Delay(TimeSpan.FromSeconds(2 * (attempt + 1)), ct);
                     }
@@ -6238,6 +6259,9 @@ public class CrossService : ICross
                             }
                             catch (Exception ex)
                             {
+                                // Drop the cached direct-IP channel on transport failure;
+                                // the next attempt will re-resolve and rebuild.
+                                GrpcChannelFactory.EvictOnFailure(agent, ex);
                                 lastEx = ex;
                                 if (attempt < 4) await Task.Delay(TimeSpan.FromSeconds(2 * (attempt + 1)), ct);
                             }

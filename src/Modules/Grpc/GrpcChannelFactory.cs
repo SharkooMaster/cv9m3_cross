@@ -51,8 +51,16 @@ public static class GrpcChannelFactory
         var options = new GrpcChannelOptions
         {
             HttpHandler = handler,
-            MaxReceiveMessageSize = 32 * 1024 * 1024,
-            MaxSendMessageSize = 32 * 1024 * 1024,
+            // 256 MiB cap: the V7 batch path sends `SEARCH_BATCH=1024` query
+            // objects with embedded chunk bytes per request. At Globals.chunkSize
+            // = 64 KiB that's already 64 MiB of payload; the previous 32 MiB
+            // limit silently failed those calls with ResourceExhausted as soon
+            // as chunk size grew. Match the gateway's 1 GiB *read* limit on
+            // the receive side too — the gateway can ship up to 1 GiB back
+            // when it forwards multi-agent search results, and we'd rather
+            // accept a fat message than retry-storm.
+            MaxReceiveMessageSize = 256 * 1024 * 1024,
+            MaxSendMessageSize = 256 * 1024 * 1024,
             Credentials = ChannelCredentials.Insecure
         };
 
@@ -185,22 +193,65 @@ public static class GrpcChannelFactory
     }
 
     /// <summary>
-    /// Remove cached channel and all client stubs for a given target IP.
-    /// Called when an agent's pod IP changes or the agent is removed from topology.
+    /// Remove cached channel and all client stubs for a given target.
+    /// Evicts BOTH the direct-IP form (`http://target:port`) and the
+    /// round-robin DNS form (`dns:///target:port`), because the previous
+    /// implementation only removed the direct-IP form — round-robin clients
+    /// stayed cached on a dead-channel forever after a pod restart, manifesting
+    /// as repeated PROTOCOL_ERROR / Unavailable on the same target.
     /// </summary>
     public static void EvictChannel(string target, int port = 5000)
     {
-        var uri = $"http://{target}:{port}";
+        var httpUri = $"http://{target}:{port}";
+        var dnsUri = $"dns:///{target}:{port}";
 
-        if (_channels.TryRemove(uri, out var channel))
+        foreach (var uri in new[] { httpUri, dnsUri })
         {
-            Console.WriteLine($"[GrpcChannelFactory] Evicting channel to {uri}");
-            try { channel.Dispose(); } catch { }
+            if (_channels.TryRemove(uri, out var channel))
+            {
+                Console.WriteLine($"[GrpcChannelFactory] Evicting channel to {uri}");
+                try { channel.Dispose(); } catch { }
+            }
+
+            var suffix = $"@{uri}";
+            var keysToRemove = _clients.Keys.Where(k => k.EndsWith(suffix, StringComparison.Ordinal)).ToList();
+            foreach (var key in keysToRemove)
+                _clients.TryRemove(key, out _);
+        }
+    }
+
+    /// <summary>
+    /// Inspect <paramref name="ex"/>; if it indicates a dead/stale connection
+    /// to <paramref name="target"/> (RpcException Unavailable / Internal /
+    /// DeadlineExceeded, or a raw transport failure), evict the cached channel
+    /// + client stubs for that target. Safe to call on every retry path —
+    /// non-transport errors are no-ops, and a missing cache entry is also a
+    /// no-op. The next <see cref="GetClient{TClient}"/> for the same target
+    /// rebuilds a fresh channel + does a fresh DNS resolve, which is the only
+    /// reliable recovery for a Kubernetes pod restart that reused the same
+    /// service hostname.
+    /// </summary>
+    public static void EvictOnFailure(string target, Exception ex, int port = 5000)
+    {
+        bool shouldEvict = false;
+        if (ex is RpcException rex)
+        {
+            shouldEvict = rex.StatusCode == StatusCode.Unavailable
+                       || rex.StatusCode == StatusCode.Internal
+                       || rex.StatusCode == StatusCode.DeadlineExceeded;
+        }
+        else if (ex is System.Net.Http.HttpRequestException
+              || ex is System.Net.Sockets.SocketException
+              || (ex.InnerException is System.Net.Http.HttpRequestException)
+              || (ex.InnerException is System.Net.Sockets.SocketException))
+        {
+            shouldEvict = true;
         }
 
-        var keysToRemove = _clients.Keys.Where(k => k.Contains(uri)).ToList();
-        foreach (var key in keysToRemove)
-            _clients.TryRemove(key, out _);
+        if (shouldEvict && !string.IsNullOrWhiteSpace(target))
+        {
+            try { EvictChannel(target, port); } catch { /* best effort */ }
+        }
     }
 
 }

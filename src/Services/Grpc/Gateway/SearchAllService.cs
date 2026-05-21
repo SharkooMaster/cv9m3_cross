@@ -40,6 +40,12 @@ public class SearchAllServiceClient
             }
             catch (RpcException ex) when (IsTransient(ex) && attempt + 1 < maxAttempts)
             {
+                // After a transport failure against the gateway dns:/// channel,
+                // evict the cached channel + clients so the next attempt
+                // re-resolves DNS and rebuilds a fresh HTTP/2 connection.
+                // Without this, a single PROTOCOL_ERROR on the cached channel
+                // can poison every subsequent retry too.
+                GrpcChannelFactory.EvictOnFailure(Globals.GatewayLoadbalancer, ex);
                 lastEx = ex;
                 var backoff = ComputeBackoff(attempt);
                 if (attempt == 0 || attempt == maxAttempts - 2)
