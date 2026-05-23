@@ -102,6 +102,58 @@ Cross.Utilities.RuntimeStatsEndpoint.Map(app, "cross");
 
 app.MapGet("/", () => "Hello World!");
 
+// ── Destructive admin endpoint (Phase 8 dev tooling) ─────────────────
+// POST /admin/cluster/wipe → fans out POST /admin/wipe to every agent
+// known to the consistent-hash ring. Each agent process exits and is
+// restarted by k8s; with `--set dev.fastReset=true` the restart wipes
+// /data/chunks because the volume is emptyDir.
+//
+// Gated on ADMIN_DESTRUCTIVE_ENABLED=true. Without that env var set,
+// the endpoint always returns 403 — there is no safe production
+// configuration where wiping the cluster is a one-HTTP-call away.
+app.MapPost("/admin/cluster/wipe", async () =>
+{
+    var gate = System.Environment.GetEnvironmentVariable("ADMIN_DESTRUCTIVE_ENABLED");
+    if (!string.Equals(gate, "true", System.StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.StatusCode(403);
+    }
+
+    var ring = Cross.Routing.RingState.Current;
+    var agents = ring.Agents;
+    if (agents.Count == 0)
+    {
+        return Results.Json(new { wiped = 0, total = 0, errors = new[] { "ring is empty" } });
+    }
+
+    int ok = 0;
+    var errors = new System.Collections.Generic.List<string>();
+    using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+    foreach (var name in agents)
+    {
+        var ip = ring.GetIp(name);
+        if (string.IsNullOrEmpty(ip))
+        {
+            errors.Add($"{name} -> no ip in ring");
+            continue;
+        }
+        try
+        {
+            var url = $"http://{ip}:5001/admin/wipe";
+            var resp = await http.PostAsync(url, new System.Net.Http.StringContent(""));
+            if (resp.IsSuccessStatusCode) ok++;
+            else errors.Add($"{name}({ip}) -> HTTP {(int)resp.StatusCode}");
+        }
+        catch (Exception ex)
+        {
+            errors.Add($"{name}({ip}) -> {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    Console.WriteLine($"[ADMIN] /admin/cluster/wipe fan-out: ok={ok}/{agents.Count} errors={errors.Count}");
+    return Results.Json(new { wiped = ok, total = agents.Count, errors });
+});
+
 // ── Global exception handlers to prevent silent crashes ──
 AppDomain.CurrentDomain.UnhandledException += (sender, eventArgs) =>
 {

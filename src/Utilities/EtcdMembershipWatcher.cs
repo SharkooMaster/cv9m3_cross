@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Cross.Routing;
 using dotnet_etcd;
 using Etcdserverpb;
 using Google.Protobuf;
@@ -42,6 +43,17 @@ public class EtcdMembershipWatcher : IHostedService
     // immutable handed off to RendezvousRouter so concurrent readers can't
     // observe a partially-mutated state.
     private readonly Dictionary<string, string> _members = new();
+
+    // Per-agent vnode counts read from the v2 schema. Tracked separately so
+    // we can honour the publishing agent's chosen value (vnodes per agent
+    // is configurable per-pod for heterogeneous clusters where one agent
+    // has more disk than another, even if the default cluster-wide
+    // ConsistentHashRing.Build only takes a single int).
+    //
+    // For now we feed a single VnodesPerAgent into the ring builder using
+    // the most common value across members; future work can extend the
+    // ring to per-agent vnode counts if heterogeneity becomes interesting.
+    private readonly Dictionary<string, int> _vnodesPerMember = new();
 
     public EtcdMembershipWatcher()
     {
@@ -241,11 +253,13 @@ public class EtcdMembershipWatcher : IHostedService
         var resp = await _etcd.GetAsync(rangeReq, cancellationToken: token);
 
         _members.Clear();
+        _vnodesPerMember.Clear();
         foreach (var kv in resp.Kvs)
         {
-            if (TryParseEntry(kv, out var name, out var ip))
+            if (TryParseEntry(kv, out var name, out var ip, out var vnodes))
             {
                 _members[name] = ip;
+                _vnodesPerMember[name] = vnodes;
             }
         }
 
@@ -261,11 +275,14 @@ public class EtcdMembershipWatcher : IHostedService
             switch (ev.Type)
             {
                 case Event.Types.EventType.Put:
-                    if (TryParseEntry(ev.Kv, out var name, out var ip))
+                    if (TryParseEntry(ev.Kv, out var name, out var ip, out var vnodes))
                     {
-                        if (!_members.TryGetValue(name, out var prev) || prev != ip)
+                        bool ipChanged = !_members.TryGetValue(name, out var prev) || prev != ip;
+                        bool vnodesChanged = !_vnodesPerMember.TryGetValue(name, out var prevV) || prevV != vnodes;
+                        if (ipChanged || vnodesChanged)
                         {
                             _members[name] = ip;
+                            _vnodesPerMember[name] = vnodes;
                             changed = true;
                         }
                     }
@@ -274,8 +291,9 @@ public class EtcdMembershipWatcher : IHostedService
                 case Event.Types.EventType.Delete:
                     if (TryGetKeyName(ev.Kv, out var delName))
                     {
-                        if (_members.Remove(delName))
-                            changed = true;
+                        bool removed = _members.Remove(delName);
+                        _vnodesPerMember.Remove(delName);
+                        if (removed) changed = true;
                     }
                     break;
             }
@@ -288,16 +306,48 @@ public class EtcdMembershipWatcher : IHostedService
     private void PublishToRouter()
     {
         // Hand off an immutable copy — the watcher's internal dict keeps
-        // mutating as new events arrive, RendezvousRouter must see a frozen
-        // snapshot.
+        // mutating as new events arrive, downstream consumers must see a
+        // frozen snapshot.
         var snapshot = new Dictionary<string, string>(_members);
+
+        // ── Legacy publish: keep RendezvousRouter alive ──
+        // Phases 2/3 wire the new replicated path through RingState; until
+        // every call site is migrated, the old single-pick PickAgent path
+        // still drives some routing decisions. Publishing both keeps both
+        // views consistent during the rolling transition.
         RendezvousRouter.SetMembershipFromEtcd(snapshot);
+
+        // ── New publish: ConsistentHashRing for replicated routing ──
+        // Pick the modal vnode count across members so the ring is built
+        // from a single int. In a homogeneous fleet (every agent published
+        // the same vnodes value) this is just that value; in a transient
+        // mixed deployment the modal value is what most members agreed on.
+        int vnodesPerAgent = ConsistentHashRing.DefaultVnodesPerAgent;
+        if (_vnodesPerMember.Count > 0)
+        {
+            vnodesPerAgent = _vnodesPerMember.Values
+                .GroupBy(v => v)
+                .OrderByDescending(g => g.Count())
+                .First()
+                .Key;
+        }
+        var ring = ConsistentHashRing.Build(snapshot, vnodesPerAgent);
+        bool changed = RingState.Set(ring);
+        if (changed)
+        {
+            Console.WriteLine(
+                $"[EtcdMembershipWatcher] ring rebuilt: {ring.Agents.Count} agents, " +
+                $"{vnodesPerAgent} vnodes/agent, topology version {RingState.TopologyVersion}");
+        }
     }
 
-    private static bool TryParseEntry(KeyValue kv, out string name, out string ip)
+    private static bool TryParseEntry(KeyValue kv, out string name, out string ip, out int vnodesPerAgent)
     {
         name = string.Empty;
         ip = string.Empty;
+        // Default vnode count when the publishing agent didn't include the
+        // field (legacy v1 schema). Matches ConsistentHashRing.DefaultVnodesPerAgent.
+        vnodesPerAgent = 256;
         if (!TryGetKeyName(kv, out name)) return false;
 
         try
@@ -305,15 +355,41 @@ public class EtcdMembershipWatcher : IHostedService
             var json = kv.Value.ToStringUtf8();
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
-            if (root.TryGetProperty("ip", out var ipEl))
+            if (!root.TryGetProperty("ip", out var ipEl))
+                return false;
+            var parsed = ipEl.GetString();
+            if (string.IsNullOrWhiteSpace(parsed))
+                return false;
+            ip = parsed!;
+
+            // v2 fields — optional. An older agent registering against a
+            // newer cross will simply use the defaults. A newer agent
+            // registering against an older cross will be parsed by the
+            // legacy parser (which only reads "ip") and the new fields
+            // are ignored.
+            if (root.TryGetProperty("vnodes", out var vnEl) && vnEl.ValueKind == JsonValueKind.Number)
             {
-                var parsed = ipEl.GetString();
-                if (!string.IsNullOrWhiteSpace(parsed))
+                if (vnEl.TryGetInt32(out var vn) && vn > 0) vnodesPerAgent = vn;
+            }
+
+            // status: filter out non-ready agents from membership so the
+            // ring doesn't route writes to a draining or warming pod.
+            // Missing field = ready (back-compat with the v1 schema).
+            if (root.TryGetProperty("status", out var statusEl)
+                && statusEl.ValueKind == JsonValueKind.String)
+            {
+                var status = statusEl.GetString();
+                if (!string.IsNullOrEmpty(status) &&
+                    !string.Equals(status, "ready", StringComparison.OrdinalIgnoreCase))
                 {
-                    ip = parsed!;
-                    return true;
+                    // Non-ready agents are not added to membership. The
+                    // ring will not pick them as a replica until they
+                    // republish with status=ready.
+                    return false;
                 }
             }
+
+            return true;
         }
         catch (Exception ex)
         {

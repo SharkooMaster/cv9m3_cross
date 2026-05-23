@@ -9,6 +9,7 @@ using System.Threading;
 using System.Text;
 using Cross.Interfaces.Cross;
 using Cross.Modules;
+using Cross.Routing;
 using Cross.Utilities;
 using GatewayService;
 using Google.Protobuf;
@@ -5982,6 +5983,93 @@ public class CrossService : ICross
     }
 
     /// <summary>
+    /// Processes a single agent's StoreVector_Res into the per-chunk
+    /// V7ChunkFate. Pulled out of the inline freshStore loop so the
+    /// dedup-handling logic can be invoked once per chunk *after* the
+    /// replicated fan-out completes (instead of inline for every batch
+    /// response, which produced the same fate slot in N=R places).
+    ///
+    /// The full dedup-handling rationale lives at the call site this
+    /// replaces — see the V7 freshStoreQueue block below. Briefly: when
+    /// the agent dedup'd against a similar (not byte-identical) existing
+    /// chunk, BaseChunk + StorageGuid in the response describe that
+    /// existing chunk; we MUST encode a diff against it so the decoder
+    /// (which fetches by storage_guid) reproduces the original bytes.
+    /// </summary>
+    private static void ApplyV7StoreResponseToFate(
+        V7ChunkFate[] fates,
+        int chunkIdx,
+        List<byte[]> fileChunks,
+        int chunkSize,
+        StoreVector_Res storeRes,
+        string sourceAgent)
+    {
+        byte[]? baseBytes = (storeRes.WasDeduplicated && storeRes.BaseChunk != null && storeRes.BaseChunk.Length == chunkSize)
+            ? storeRes.BaseChunk.ToByteArray()
+            : null;
+
+        if (baseBytes != null)
+        {
+            // Verify base bytes hash to the storage_guid the agent returned.
+            // If they don't, the agent's dedup state is internally inconsistent
+            // and the decoder (which fetches by storage_guid) would get
+            // different bytes than we diffed against → silent corruption.
+            var actualGuid = Convert.ToHexString(SHA256.HashData(baseBytes)).ToLowerInvariant();
+            if (!string.Equals(actualGuid, storeRes.StorageGuid ?? "", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"v7: agent {sourceAgent} dedup response has BaseChunk that hashes to {actualGuid} " +
+                    $"but StorageGuid={storeRes.StorageGuid}. Refusing to encode a CCF the decoder cannot reproduce.");
+            }
+
+            var ourChunk = fileChunks[chunkIdx];
+            int dCount = 0;
+            for (int b = 0; b < chunkSize; b++)
+                if (ourChunk[b] != baseBytes[b]) dCount++;
+
+            if (dCount == 0)
+            {
+                fates[chunkIdx] = new V7ChunkFate
+                {
+                    Flag = V7FlagExact,
+                    BucketId = storeRes.Id,
+                    ChunkId = storeRes.Index,
+                    StorageGuid = V7ParseHexGuid(storeRes.StorageGuid ?? ""),
+                    Diff = null
+                };
+            }
+            else
+            {
+                var dList = new List<(ushort, short)>(dCount);
+                for (int b = 0; b < chunkSize; b++)
+                    if (ourChunk[b] != baseBytes[b])
+                        dList.Add(((ushort)b, (short)(ourChunk[b] - baseBytes[b])));
+
+                fates[chunkIdx] = new V7ChunkFate
+                {
+                    Flag = V7FlagDiff,
+                    BucketId = storeRes.Id,
+                    ChunkId = storeRes.Index,
+                    StorageGuid = V7ParseHexGuid(storeRes.StorageGuid ?? ""),
+                    Diff = dList
+                };
+            }
+        }
+        else
+        {
+            // Fresh store: agent has the exact bytes we sent.
+            fates[chunkIdx] = new V7ChunkFate
+            {
+                Flag = V7FlagExact,
+                BucketId = storeRes.Id,
+                ChunkId = storeRes.Index,
+                StorageGuid = V7ParseHexGuid(storeRes.StorageGuid ?? ""),
+                Diff = null
+            };
+        }
+    }
+
+    /// <summary>
     /// v7.0.0 encoder. One pass, no mosaic, no clustering. Returns a CCF byte
     /// array plus the same stats tuple shape as the legacy CompressFileWithStats.
     /// </summary>
@@ -6245,163 +6333,55 @@ public class CrossService : ICross
             ("diff_chunks", diffChunkCount),
             ("fresh_count", freshStoreQueue.Count));
 
-        // ── 7. Batch-store fresh chunks (per agent, in parallel)
+        // ── 7. Replicated fan-out for fresh chunks (R replicas, W quorum)
+        // Replaces the legacy single-target BatchStore: instead of writing
+        // each chunk to one rendezvous-picked agent, we resolve the chunk's
+        // R replicas via the consistent-hash ring and fan out to all of
+        // them in parallel. The write succeeds only when at least W
+        // replicas have acked, which is what makes a single agent failure
+        // (or a vnode rebalance in flight) survivable without losing data.
+        //
+        // The dedup-handling logic that used to be inlined here is now
+        // applied per-chunk after fan-out, using the primary replica's
+        // response when available — that keeps the encoder deterministic
+        // across cross pods that processed the same chunk against the
+        // same ring.
         if (freshStoreQueue.Count > 0)
         {
             var storeSw = Stopwatch.StartNew();
-            var byAgent = freshStoreQueue.GroupBy(x => x.agent).ToList();
-            const int STORE_BATCH = 1000;
 
-            await Parallel.ForEachAsync(byAgent,
-                new ParallelOptions { MaxDegreeOfParallelism = 16 },
-                async (group, ct) =>
-                {
-                    string agent = group.Key;
-                    var items = group.ToList();
+            var workItems = new List<ReplicatedBatchStore.WorkItem>(freshStoreQueue.Count);
+            for (int q = 0; q < freshStoreQueue.Count; q++)
+            {
+                var (chunkIdx, _, searchK) = freshStoreQueue[q];
+                workItems.Add(new ReplicatedBatchStore.WorkItem(
+                    chunkIdx,
+                    bitStrings[searchK],
+                    vectors[searchK],
+                    fileChunks[chunkIdx]));
+            }
 
-                    for (int batchStart = 0; batchStart < items.Count; batchStart += STORE_BATCH)
-                    {
-                        int batchEnd = Math.Min(batchStart + STORE_BATCH, items.Count);
-                        var batchReq = new BatchStoreVector_Req();
+            var results = await ReplicatedBatchStore.RunAsync(workItems, default);
 
-                        for (int bi = batchStart; bi < batchEnd; bi++)
-                        {
-                            var (chunkIdx, _, searchK) = items[bi];
-                            var sreq = new StoreVector_Req
-                            {
-                                TargetIp = agent,
-                                Bitstring = bitStrings[searchK],
-                                HeadRouteID = ""
-                            };
-                            sreq.Vector.AddRange(vectors[searchK]);
-                            sreq.Chunk = ByteString.CopyFrom(fileChunks[chunkIdx]);
-                            batchReq.Items.Add(sreq);
-                        }
+            foreach (var r in results)
+            {
+                ApplyV7StoreResponseToFate(
+                    fates,
+                    r.ChunkIdx,
+                    fileChunks,
+                    chunkSize,
+                    r.ResponseToEncode,
+                    sourceAgent: r.AckedReplicas.Count > 0 ? r.AckedReplicas[0] : "(unknown)");
+            }
 
-                        BatchStoreVector_Res? batchRes = null;
-                        Exception? lastEx = null;
-                        for (int attempt = 0; attempt < 5; attempt++)
-                        {
-                            try
-                            {
-                                var storeClient = GrpcChannelFactory.GetClient(
-                                    target: agent,
-                                    ctor: c => new StoreVector.StoreVectorClient(c),
-                                    roundRobin: false, port: 5000);
-                                batchRes = await storeClient.BatchStoreAsync(batchReq);
-                                lastEx = null;
-                                break;
-                            }
-                            catch (Exception ex)
-                            {
-                                // Drop the cached direct-IP channel on transport failure;
-                                // the next attempt will re-resolve and rebuild.
-                                GrpcChannelFactory.EvictOnFailure(agent, ex);
-                                lastEx = ex;
-                                if (attempt < 4) await Task.Delay(TimeSpan.FromSeconds(2 * (attempt + 1)), ct);
-                            }
-                        }
-                        if (lastEx != null) throw lastEx;
-                        if (batchRes == null) throw new InvalidOperationException("v7 batch store returned null.");
-
-                        int count = Math.Min(batchEnd - batchStart, batchRes.Results.Count);
-                        for (int bi = 0; bi < count; bi++)
-                        {
-                            var (chunkIdx, _, _) = items[batchStart + bi];
-                            var storeRes = batchRes.Results[bi];
-
-                            // Failed defaults to false on the wire. Only act on an explicit failure.
-                            if (storeRes.Failed)
-                                throw new InvalidOperationException(
-                                    $"v7: agent {agent} reported store failure for chunk {chunkIdx}.");
-
-                            // CRITICAL: the agent has its own STORE-time dedup that fires at
-                            // StoreSimilarityThreshold (default 60%). When that fires, the
-                            // returned (Id, Index, StorageGuid) point to an EXISTING chunk
-                            // whose bytes are *similar* but not identical to what we sent.
-                            // Agent attaches the existing chunk's bytes in storeRes.BaseChunk.
-                            // We MUST diff our input against BaseChunk and emit flag 0x02 in
-                            // that case — otherwise the decoder will fetch BaseChunk's bytes
-                            // and silently produce wrong data at decompress time.
-                            byte[]? baseBytes = (storeRes.WasDeduplicated && storeRes.BaseChunk != null && storeRes.BaseChunk.Length == Globals.chunkSize)
-                                ? storeRes.BaseChunk.ToByteArray()
-                                : null;
-
-                            if (baseBytes != null)
-                            {
-                                // Verify base bytes hash to the storage_guid the agent returned.
-                                var actualGuid = Convert.ToHexString(SHA256.HashData(baseBytes)).ToLowerInvariant();
-                                if (!string.Equals(actualGuid, storeRes.StorageGuid ?? "", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    throw new InvalidOperationException(
-                                        $"v7: agent {agent} dedup response has BaseChunk that hashes to {actualGuid} but StorageGuid={storeRes.StorageGuid}. Refusing to encode a CCF the decoder cannot reproduce.");
-                                }
-
-                                var ourChunk = fileChunks[chunkIdx];
-                                int dCount = 0;
-                                for (int b = 0; b < Globals.chunkSize; b++)
-                                    if (ourChunk[b] != baseBytes[b]) dCount++;
-
-                                if (dCount == 0)
-                                {
-                                    // True byte-identical match (agent's dedup was conservative). 0x01.
-                                    fates[chunkIdx] = new V7ChunkFate
-                                    {
-                                        Flag = V7FlagExact,
-                                        BucketId = storeRes.Id,
-                                        ChunkId = storeRes.Index,
-                                        StorageGuid = V7ParseHexGuid(storeRes.StorageGuid ?? ""),
-                                        Diff = null
-                                    };
-                                }
-                                else
-                                {
-                                    // Agent dedup'd against a similar (not identical) chunk.
-                                    // We MUST emit a diff against the agent's stored bytes,
-                                    // even if the diff bloats — the only alternative is to
-                                    // ignore the dedup'd response and re-store at a different
-                                    // bucket, which would require a 2nd round trip. Accept
-                                    // the diff and let the bloat guard catch pathological cases.
-                                    var dList = new List<(ushort, short)>(dCount);
-                                    for (int b = 0; b < Globals.chunkSize; b++)
-                                        if (ourChunk[b] != baseBytes[b])
-                                            dList.Add(((ushort)b, (short)(ourChunk[b] - baseBytes[b])));
-
-                                    fates[chunkIdx] = new V7ChunkFate
-                                    {
-                                        Flag = V7FlagDiff,
-                                        BucketId = storeRes.Id,
-                                        ChunkId = storeRes.Index,
-                                        StorageGuid = V7ParseHexGuid(storeRes.StorageGuid ?? ""),
-                                        Diff = dList
-                                    };
-                                }
-                            }
-                            else
-                            {
-                                // Fresh store: agent has the exact bytes we sent. 0x01.
-                                fates[chunkIdx] = new V7ChunkFate
-                                {
-                                    Flag = V7FlagExact,
-                                    BucketId = storeRes.Id,
-                                    ChunkId = storeRes.Index,
-                                    StorageGuid = V7ParseHexGuid(storeRes.StorageGuid ?? ""),
-                                    Diff = null
-                                };
-                            }
-                        }
-
-                        if (count < batchEnd - batchStart)
-                            throw new InvalidOperationException(
-                                $"v7: agent {agent} returned {count} results for {batchEnd - batchStart} requests.");
-                    }
-                });
             storeSw.Stop();
-            // Stage name matches V5/V6's "StoreChunks" so the rolling
-            // p50/p95/p99 in stage_stats aggregates across encoder versions.
             Observability.RecordStage("StoreChunks", storeSw.Elapsed.TotalMilliseconds,
-                ("chunk_count", freshStoreQueue.Count));
-            Console.WriteLine($"[CompressV7] FreshStore: {storeSw.ElapsedMilliseconds}ms ({freshStoreQueue.Count} chunks)");
+                ("chunk_count", freshStoreQueue.Count),
+                ("replication_factor", ReplicaResolver.ReplicationFactor),
+                ("write_quorum", ReplicaResolver.WriteQuorum));
+            Console.WriteLine(
+                $"[CompressV7] FreshStore (R={ReplicaResolver.ReplicationFactor}/W={ReplicaResolver.WriteQuorum}): " +
+                $"{storeSw.ElapsedMilliseconds}ms ({freshStoreQueue.Count} chunks)");
         }
 
         // ── 8. Round-trip integrity prober (encoder→decoder agreement check)

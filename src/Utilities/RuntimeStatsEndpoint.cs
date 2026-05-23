@@ -106,6 +106,18 @@ public static class RuntimeStatsEndpoint
                 grpc_channel_cache_count = GrpcChannelFactory.ChannelCacheCount,
                 grpc_client_cache_count  = GrpcChannelFactory.ClientCacheCount,
 
+                // ── Replication health (Phase 7) ──
+                // ring_size = number of agents currently on the
+                // consistent-hash ring (matches what the etcd watcher
+                // last published). topology_version increments on every
+                // membership delta; the control center plots its rate
+                // to surface "is the cluster churning?".
+                ring_size           = Cross.Routing.RingState.Current.Agents.Count,
+                topology_version    = Cross.Routing.RingState.TopologyVersion,
+                replication_factor  = Cross.Routing.ReplicaResolver.ReplicationFactor,
+                write_quorum        = Cross.Routing.ReplicaResolver.WriteQuorum,
+                vnodes_per_agent    = Cross.Routing.RingState.Current.VnodesPerAgent,
+
                 // Per-agent circuit breaker snapshot. Open / HalfOpen entries
                 // here are the leading indicator of a wedged agent.
                 breakers = AgentRpcThrottle.Snapshot(),
