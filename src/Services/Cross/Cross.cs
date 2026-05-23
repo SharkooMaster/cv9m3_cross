@@ -5989,6 +5989,12 @@ public class CrossService : ICross
         CompressFileV7(byte[] _file, int _fileLen)
     {
         using var rootSpan = Observability.StartStage("CompressFileV7");
+        // Wall-clock for the whole V7 path so the journal carries an overall
+        // "CompressFileV7" stage alongside the per-substage breakdown. Without
+        // this, post-hoc analysis can correlate the per-stage rollups but
+        // can't separate "all stages got slower together" (system-wide
+        // pressure) from "stage X got slower" (component-specific).
+        var swV7Total = Stopwatch.StartNew();
 
         if (_file == null) throw new ArgumentNullException(nameof(_file));
         if (_fileLen < 0 || _fileLen > 1024L * 1024 * 1024 * 1024 * 1024)
@@ -6000,15 +6006,19 @@ public class CrossService : ICross
         int chunkSize = Globals.chunkSize;
 
         // ── 1. Split into chunks + trim
+        var swSplit = Stopwatch.StartNew();
         (List<byte[]> fileChunks, List<byte> trimList) = SplitChunks(_file, _fileLen, chunkSize);
         int chunkCount = fileChunks.Count;
         byte[] trimBytes = trimList.ToArray();
+        swSplit.Stop();
+        Observability.RecordStage("SplitChunks", swSplit.Elapsed.TotalMilliseconds, ("chunk_count", chunkCount));
         Console.WriteLine($"[CompressV7] chunkCount={chunkCount}, trim={trimBytes.Length}, chunkSize={chunkSize}");
 
         // ── 2. SHA256 of the original payload (chunks ‖ trim, which equals _file[0.._fileLen])
         byte[] fileHash = SHA256.HashData(_file.AsSpan(0, _fileLen));
 
         // ── 3. All-zero pre-pass
+        var swZero = Stopwatch.StartNew();
         var fates = new V7ChunkFate[chunkCount];
         for (int i = 0; i < chunkCount; i++) fates[i].StorageGuid = new byte[32];
 
@@ -6023,6 +6033,8 @@ public class CrossService : ICross
         });
         int zeroCount = 0;
         for (int i = 0; i < chunkCount; i++) if (isZero[i]) zeroCount++;
+        swZero.Stop();
+        Observability.RecordStage("ZeroPrepass", swZero.Elapsed.TotalMilliseconds, ("chunk_count", chunkCount));
         Console.WriteLine($"[CompressV7] zeroChunks={zeroCount}/{chunkCount}");
 
         // ── 4. Vectorize + bitstring (non-zero chunks only)
@@ -6032,6 +6044,10 @@ public class CrossService : ICross
         if (nonZeroIndices.Count == 0)
         {
             byte[] payloadZ = BuildV7Payload(fates, chunkSize, trimBytes, fileHash);
+            // Even the all-zero short-circuit gets an overall stage so the
+            // journal doesn't silently drop empty/zero windows.
+            Observability.RecordStage("CompressFileV7", swV7Total.Elapsed.TotalMilliseconds,
+                ("chunk_count", chunkCount), ("output_bytes", payloadZ.Length));
             return (payloadZ, 0, chunkCount, 0L, 0f, 0L);
         }
 
@@ -6045,6 +6061,10 @@ public class CrossService : ICross
             vectors = Misc.Compute64ElementLSHVectors(nzChunks);
             bitStrings = Misc.ComputeBitStringFromVectors(vectors);
             swVec.Stop();
+            // Stage name matches V5/V6's "Vectorize" so the dashboard and
+            // /stats/runtime stage_stats keep one row per logical stage
+            // regardless of which encoder version emitted it.
+            Observability.RecordStage("Vectorize", swVec.Elapsed.TotalMilliseconds, ("chunk_count", nzChunks.Count));
             Console.WriteLine($"[CompressV7] Vectorize+Bitstring: {swVec.ElapsedMilliseconds}ms ({nzChunks.Count} chunks)");
         }
 
@@ -6104,9 +6124,19 @@ public class CrossService : ICross
                 if (lastEx != null) throw lastEx;
             });
         searchSw.Stop();
+        Observability.RecordStage("SearchBuckets", searchSw.Elapsed.TotalMilliseconds,
+            ("chunk_count", nonZeroIndices.Count));
         Console.WriteLine($"[CompressV7] Search: {searchSw.ElapsedMilliseconds}ms");
 
         // ── 6. Classify per chunk + collect fresh-store queue
+        // This is the largest "invisible" stage in the V7 path: it iterates
+        // every non-zero chunk, decides exact / diff / fresh-store, and lazy-
+        // fetches base bytes by storageGuid for chunks the gateway didn't
+        // ship inline. A slow agent on the GetChunkByStorageGuid path will
+        // show up here before it shows up in StoreChunks. Critical to
+        // separate from SearchBuckets so we don't blame the gateway for an
+        // agent fetch latency problem.
+        var swDiffEncode = Stopwatch.StartNew();
         var freshStoreQueue = new List<(int chunkIdx, string agent, int searchK)>();
         int diffChunkCount = 0;
         int diffBytesTotal = 0;
@@ -6209,6 +6239,11 @@ public class CrossService : ICross
                 Diff = diffList
             };
         }
+        swDiffEncode.Stop();
+        Observability.RecordStage("DiffEncode", swDiffEncode.Elapsed.TotalMilliseconds,
+            ("chunk_count", nonZeroIndices.Count),
+            ("diff_chunks", diffChunkCount),
+            ("fresh_count", freshStoreQueue.Count));
 
         // ── 7. Batch-store fresh chunks (per agent, in parallel)
         if (freshStoreQueue.Count > 0)
@@ -6362,6 +6397,10 @@ public class CrossService : ICross
                     }
                 });
             storeSw.Stop();
+            // Stage name matches V5/V6's "StoreChunks" so the rolling
+            // p50/p95/p99 in stage_stats aggregates across encoder versions.
+            Observability.RecordStage("StoreChunks", storeSw.Elapsed.TotalMilliseconds,
+                ("chunk_count", freshStoreQueue.Count));
             Console.WriteLine($"[CompressV7] FreshStore: {storeSw.ElapsedMilliseconds}ms ({freshStoreQueue.Count} chunks)");
         }
 
@@ -6397,7 +6436,12 @@ public class CrossService : ICross
         }
 
         // ── 9. Serialize the CCF
+        var swSerialize = Stopwatch.StartNew();
         byte[] ccf = BuildV7Payload(fates, chunkSize, trimBytes, fileHash);
+        swSerialize.Stop();
+        // Stage name matches V5/V6's "Serialize" for cross-version aggregation.
+        Observability.RecordStage("Serialize", swSerialize.Elapsed.TotalMilliseconds,
+            ("chunk_count", chunkCount), ("output_bytes", ccf.Length));
 
         // Stats
         int refsFound = 0;
@@ -6418,6 +6462,17 @@ public class CrossService : ICross
         float avgErrRate = chunkCount > 0
             ? (float)totalDiffs / (chunkCount * (float)chunkSize)
             : 0f;
+
+        // Overall wall-clock for the V7 path. Lets the dashboard and journal
+        // show the end-to-end stage alongside the substages so they can be
+        // sanity-checked against each other (sum of substages should ≈ total
+        // minus inherent parallelism overlap).
+        swV7Total.Stop();
+        Observability.RecordStage("CompressFileV7", swV7Total.Elapsed.TotalMilliseconds,
+            ("chunk_count", chunkCount),
+            ("refs_found", refsFound),
+            ("fresh_count", freshStoreQueue.Count),
+            ("output_bytes", ccf.Length));
 
         Console.WriteLine(
             $"[CompressV7] DONE: ccf={ccf.Length} bytes, refs={refsFound}, fresh={freshStoreQueue.Count}, " +
