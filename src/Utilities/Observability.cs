@@ -48,6 +48,11 @@ public static class Observability
         }
         StageDurationMs.Record(durationMs, tagList);
         Cross.Services.JobEvents.JobEventBus.EmitStageDone(stageName, durationMs, chunkCount, bucketCount, bytes);
+        // Feed the live rolling-percentile rollup that /stats/runtime surfaces.
+        // Allocation-free, lock-free; safe to call from anywhere RecordStage
+        // already runs — which means every existing stage callsite is now
+        // automatically dashboard-visible without further code changes.
+        StageStatsRollup.Record(stageName, durationMs);
     }
 
     public static ResourceBuilder CreateResourceBuilder() =>
