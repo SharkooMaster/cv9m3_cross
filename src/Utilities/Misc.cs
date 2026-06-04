@@ -75,6 +75,39 @@ static public class Misc
     }
 
     /// <summary>
+    /// Buffer overload: vectorizes chunks that live as contiguous, exact-size
+    /// slices inside <paramref name="buffer"/> instead of as a materialized
+    /// <c>List&lt;byte[]&gt;</c>. <paramref name="chunkIndices"/> are absolute
+    /// chunk indices; chunk k occupies
+    /// <c>buffer[chunkIndices[k] * chunkSize .. + chunkSize]</c>. Identical
+    /// math to the <see cref="Compute64ElementLSHVectors(IEnumerable{byte[]})"/>
+    /// overload — only the source of the bytes differs (zero-copy spans), so
+    /// the produced vectors are bit-for-bit the same.
+    /// </summary>
+    public static List<float[]> Compute64ElementLSHVectors(byte[] buffer, IReadOnlyList<int> chunkIndices, int chunkSize)
+    {
+        if (buffer == null)
+            throw new ArgumentNullException(nameof(buffer));
+        if (chunkIndices == null)
+            throw new ArgumentNullException(nameof(chunkIndices));
+
+        int count = chunkIndices.Count;
+        var results = new float[count][];
+
+        const int nComponents = 64;
+        int dataSize = Globals.chunkSize;
+        float[] projection = GetOrCreateProjectionMatrixFlat(nComponents, dataSize);
+
+        Parallel.For(0, count, new ParallelOptions { MaxDegreeOfParallelism = -1 }, i =>
+        {
+            int off = chunkIndices[i] * chunkSize;
+            results[i] = Compute64ElementLSHVector(buffer.AsSpan(off, dataSize), projection, nComponents, dataSize);
+        });
+
+        return new List<float[]>(results);
+    }
+
+    /// <summary>
     /// Creates a FLAT 1D projection matrix (row-major). Thread-safe, cached.
     /// Using float[] instead of float[,] eliminates per-element bounds checks,
     /// letting the .NET JIT auto-vectorize the inner dot-product loop with SIMD (AVX2/SSE4).
@@ -117,7 +150,7 @@ static public class Misc
     /// The JIT can now auto-vectorize the inner loop (no bounds checks per element).
     /// Measured 2-4x faster than float[,] on .NET 8.
     /// </summary>
-    private static float[] Compute64ElementLSHVector(byte[] chunk, float[] projection, int nComponents, int dataSize)
+    private static float[] Compute64ElementLSHVector(ReadOnlySpan<byte> chunk, float[] projection, int nComponents, int dataSize)
     {
         // Pre-convert bytes → floats ONCE (reuse thread-local buffer)
         if (_tlsChunkFloats == null || _tlsChunkFloats.Length < dataSize)

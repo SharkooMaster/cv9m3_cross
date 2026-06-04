@@ -51,9 +51,12 @@ public static class ReplicatedBatchStore
         public readonly int ChunkIdx;
         public readonly string BitString;
         public readonly float[] Vector;
-        public readonly byte[] ChunkBytes;
+        // Zero-copy view of the chunk's bytes (a slice of the caller's block
+        // buffer). The caller guarantees the backing buffer stays alive for the
+        // whole RunAsync call, so the wire serialization can wrap it directly.
+        public readonly ReadOnlyMemory<byte> ChunkBytes;
 
-        public WorkItem(int chunkIdx, string bitString, float[] vector, byte[] chunkBytes)
+        public WorkItem(int chunkIdx, string bitString, float[] vector, ReadOnlyMemory<byte> chunkBytes)
         {
             ChunkIdx = chunkIdx;
             BitString = bitString;
@@ -178,7 +181,10 @@ public static class ReplicatedBatchStore
                             HeadRouteID = ""
                         };
                         sreq.Vector.AddRange(item.Vector);
-                        sreq.Chunk = ByteString.CopyFrom(item.ChunkBytes);
+                        // Zero-copy: wrap the caller's slice rather than copying
+                        // it into a fresh ByteString. Valid because the backing
+                        // buffer outlives this awaited fan-out (see WorkItem).
+                        sreq.Chunk = UnsafeByteOperations.UnsafeWrap(item.ChunkBytes);
                         batchReq.Items.Add(sreq);
                     }
 

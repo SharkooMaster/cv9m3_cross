@@ -5934,19 +5934,46 @@ public class CrossService : ICross
         public byte Flag;
         public ulong BucketId;
         public ulong ChunkId;
-        public byte[] StorageGuid;                          // 32 bytes, never null
+        public byte[]? StorageGuid;                         // 32-byte guid for non-zero chunks; null for zero chunks (lazily allocated)
         public List<(ushort Off, short Delta)>? Diff;       // null unless Flag == V7FlagDiff
     }
 
     private static bool IsAllZero(byte[] chunk)
     {
         if (chunk == null || chunk.Length == 0) return true;
+        return IsAllZero(chunk.AsSpan());
+    }
+
+    // Synchronous span helpers used from the (async) v7 encoder, where
+    // ReadOnlySpan<byte> locals are illegal (CS4012). Callers pass `.Span`
+    // rvalues directly so no span local is ever declared in the async method.
+    private static int CountByteDiffs(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+    {
+        int c = 0;
+        int len = Math.Min(a.Length, b.Length);
+        for (int i = 0; i < len; i++) if (a[i] != b[i]) c++;
+        return c;
+    }
+
+    private static List<(ushort, short)> BuildByteDiffList(ReadOnlySpan<byte> chunk, ReadOnlySpan<byte> candidate, int diffCount)
+    {
+        var list = new List<(ushort, short)>(diffCount);
+        int len = Math.Min(chunk.Length, candidate.Length);
+        for (int i = 0; i < len; i++)
+            if (chunk[i] != candidate[i])
+                list.Add(((ushort)i, (short)(chunk[i] - candidate[i])));
+        return list;
+    }
+
+    private static bool IsAllZero(ReadOnlySpan<byte> chunk)
+    {
+        if (chunk.Length == 0) return true;
         int len = chunk.Length;
         int i = 0;
         // 8-byte stride
         while (i + 8 <= len)
         {
-            if (BitConverter.ToInt64(chunk, i) != 0L) return false;
+            if (BitConverter.ToInt64(chunk.Slice(i, 8)) != 0L) return false;
             i += 8;
         }
         while (i < len)
@@ -5999,7 +6026,7 @@ public class CrossService : ICross
     private static void ApplyV7StoreResponseToFate(
         V7ChunkFate[] fates,
         int chunkIdx,
-        List<byte[]> fileChunks,
+        byte[] file,
         int chunkSize,
         StoreVector_Res storeRes,
         string sourceAgent)
@@ -6022,7 +6049,7 @@ public class CrossService : ICross
                     $"but StorageGuid={storeRes.StorageGuid}. Refusing to encode a CCF the decoder cannot reproduce.");
             }
 
-            var ourChunk = fileChunks[chunkIdx];
+            ReadOnlySpan<byte> ourChunk = file.AsSpan(chunkIdx * chunkSize, chunkSize);
             int dCount = 0;
             for (int b = 0; b < chunkSize; b++)
                 if (ourChunk[b] != baseBytes[b]) dCount++;
@@ -6094,10 +6121,18 @@ public class CrossService : ICross
         int chunkSize = Globals.chunkSize;
 
         // ── 1. Split into chunks + trim
+        // A-optimization: chunks are exact-size, contiguous slices of _file, so
+        // we do NOT materialize a List<byte[]> (which used to copy the entire
+        // block into N separate chunkSize arrays — one whole block-size of GC
+        // churn per call). Every downstream stage reads chunk i directly as
+        // _file[i*chunkSize .. +chunkSize]. Only the sub-chunkSize trailing
+        // remainder ("trim") is copied out, once.
         var swSplit = Stopwatch.StartNew();
-        (List<byte[]> fileChunks, List<byte> trimList) = SplitChunks(_file, _fileLen, chunkSize);
-        int chunkCount = fileChunks.Count;
-        byte[] trimBytes = trimList.ToArray();
+        int chunkCount = _fileLen / chunkSize;
+        int trimLen = _fileLen - chunkCount * chunkSize;
+        byte[] trimBytes = trimLen > 0
+            ? _file.AsSpan(chunkCount * chunkSize, trimLen).ToArray()
+            : Array.Empty<byte>();
         swSplit.Stop();
         Observability.RecordStage("SplitChunks", swSplit.Elapsed.TotalMilliseconds, ("chunk_count", chunkCount));
         Console.WriteLine($"[CompressV7] chunkCount={chunkCount}, trim={trimBytes.Length}, chunkSize={chunkSize}");
@@ -6106,14 +6141,18 @@ public class CrossService : ICross
         byte[] fileHash = SHA256.HashData(_file.AsSpan(0, _fileLen));
 
         // ── 3. All-zero pre-pass
+        // B-optimization: StorageGuid is allocated lazily. Only non-zero chunks
+        // ever carry one (set via V7ParseHexGuid on the match/store paths), and
+        // BuildV7Payload skips the guid for zero chunks. The old unconditional
+        // `new byte[32]` per chunk allocated N tiny arrays per block — including
+        // for all-zero chunks that never read it.
         var swZero = Stopwatch.StartNew();
         var fates = new V7ChunkFate[chunkCount];
-        for (int i = 0; i < chunkCount; i++) fates[i].StorageGuid = new byte[32];
 
         bool[] isZero = new bool[chunkCount];
         Parallel.For(0, chunkCount, i =>
         {
-            if (IsAllZero(fileChunks[i]))
+            if (IsAllZero(_file.AsSpan(i * chunkSize, chunkSize)))
             {
                 isZero[i] = true;
                 fates[i].Flag = V7FlagZero;
@@ -6139,21 +6178,20 @@ public class CrossService : ICross
             return (payloadZ, 0, chunkCount, 0L, 0f, 0L);
         }
 
-        var nzChunks = new List<byte[]>(nonZeroIndices.Count);
-        foreach (int i in nonZeroIndices) nzChunks.Add(fileChunks[i]);
-
         List<float[]> vectors;
         List<string> bitStrings;
         {
             var swVec = Stopwatch.StartNew();
-            vectors = Misc.Compute64ElementLSHVectors(nzChunks);
+            // Vectorize the non-zero chunks directly from _file (zero-copy
+            // slices) instead of from a copied-out List<byte[]>.
+            vectors = Misc.Compute64ElementLSHVectors(_file, nonZeroIndices, chunkSize);
             bitStrings = Misc.ComputeBitStringFromVectors(vectors);
             swVec.Stop();
             // Stage name matches V5/V6's "Vectorize" so the dashboard and
             // /stats/runtime stage_stats keep one row per logical stage
             // regardless of which encoder version emitted it.
-            Observability.RecordStage("Vectorize", swVec.Elapsed.TotalMilliseconds, ("chunk_count", nzChunks.Count));
-            Console.WriteLine($"[CompressV7] Vectorize+Bitstring: {swVec.ElapsedMilliseconds}ms ({nzChunks.Count} chunks)");
+            Observability.RecordStage("Vectorize", swVec.Elapsed.TotalMilliseconds, ("chunk_count", nonZeroIndices.Count));
+            Console.WriteLine($"[CompressV7] Vectorize+Bitstring: {swVec.ElapsedMilliseconds}ms ({nonZeroIndices.Count} chunks)");
         }
 
         // ── 5. Search via gateway (batched)
@@ -6176,7 +6214,12 @@ public class CrossService : ICross
                     {
                         BucketString = bitStrings[k],
                         Index = chunkIdx,
-                        Chunk = ByteString.CopyFrom(fileChunks[chunkIdx])
+                        // A-optimization: zero-copy view over _file instead of a
+                        // fresh ByteString.CopyFrom. _file outlives this awaited
+                        // SearchAll RPC (and any transparent retry), so the
+                        // wrapped slice stays valid for the duration of every
+                        // serialization of the request.
+                        Chunk = UnsafeByteOperations.UnsafeWrap(_file.AsMemory(chunkIdx * chunkSize, chunkSize))
                     };
                     qo.Vector.AddRange(vectors[k]);
                     qReq.QueryObjects.Add(qo);
@@ -6246,23 +6289,33 @@ public class CrossService : ICross
                 continue;
             }
 
-            // Got a match. Get the candidate bytes — either from the response
-            // or by lazy fetch via storageGuid.
-            byte[]? candidate = null;
-            if (resp.Chunk != null && resp.Chunk.Length == chunkSize)
-                candidate = resp.Chunk.ToByteArray();
-            else if (!string.IsNullOrEmpty(resp.StorageGuid))
+            // Got a match. Get the candidate bytes — inline from the response
+            // (zero-copy span over the protobuf payload) or by lazy fetch via
+            // storageGuid (which returns its own array). A-optimization: the
+            // inline path no longer ToByteArray()-copies. The fetch is the only
+            // awaiting branch, so we resolve the ReadOnlySpan AFTER all awaits —
+            // a span must never be held across a suspension point.
+            bool inlineCandidate = resp.Chunk != null && resp.Chunk.Length == chunkSize;
+            byte[]? fetchedCandidate = null;
+            if (!inlineCandidate && !string.IsNullOrEmpty(resp.StorageGuid))
             {
                 try
                 {
-                    candidate = await _chunkReferenceClient.GetChunkByStorageGuidAsync(
+                    fetchedCandidate = await _chunkReferenceClient.GetChunkByStorageGuidAsync(
                         resp.StorageGuid,
                         string.IsNullOrWhiteSpace(resp.TargetAgent) ? targetAgent : resp.TargetAgent);
                 }
-                catch { candidate = null; }
+                catch { fetchedCandidate = null; }
             }
 
-            if (candidate == null || candidate.Length != chunkSize)
+            // ReadOnlyMemory (not Span) because this method is async — span
+            // locals are illegal here. `.Span` is taken as an rvalue at the
+            // point of use (hash / diff helpers) instead.
+            ReadOnlyMemory<byte> candidate = inlineCandidate
+                ? resp.Chunk.Memory
+                : (fetchedCandidate != null ? fetchedCandidate.AsMemory() : default);
+
+            if (candidate.Length != chunkSize)
             {
                 freshStoreQueue.Add((i, targetAgent, k));
                 continue;
@@ -6275,7 +6328,7 @@ public class CrossService : ICross
             // Fall back to fresh-store.
             if (!string.IsNullOrEmpty(resp.StorageGuid))
             {
-                string actualGuid = Convert.ToHexString(SHA256.HashData(candidate)).ToLowerInvariant();
+                string actualGuid = Convert.ToHexString(SHA256.HashData(candidate.Span)).ToLowerInvariant();
                 if (!string.Equals(actualGuid, resp.StorageGuid, StringComparison.OrdinalIgnoreCase))
                 {
                     Console.WriteLine($"[CompressV7] WARN: chunk {i} candidate bytes hash mismatch (expected {resp.StorageGuid}, got {actualGuid}). Storing fresh.");
@@ -6284,10 +6337,9 @@ public class CrossService : ICross
                 }
             }
 
-            // Compute byte diff
-            var chunk = fileChunks[i];
-            int diffCount = 0;
-            for (int b = 0; b < chunkSize; b++) if (chunk[b] != candidate[b]) diffCount++;
+            // Compute byte diff (chunk is a zero-copy slice of _file)
+            ReadOnlyMemory<byte> chunkMem = _file.AsMemory(i * chunkSize, chunkSize);
+            int diffCount = CountByteDiffs(chunkMem.Span, candidate.Span);
 
             // Bloat guard #1: byte similarity < (1 - BloatGuardThreshold), i.e. < 60% default → fresh store
             if ((float)diffCount / chunkSize > Globals.BloatGuardThreshold)
@@ -6308,12 +6360,7 @@ public class CrossService : ICross
             List<(ushort, short)>? diffList = null;
             if (diffCount > 0)
             {
-                diffList = new List<(ushort, short)>(diffCount);
-                for (int b = 0; b < chunkSize; b++)
-                {
-                    if (chunk[b] != candidate[b])
-                        diffList.Add(((ushort)b, (short)(chunk[b] - candidate[b])));
-                }
+                diffList = BuildByteDiffList(chunkMem.Span, candidate.Span, diffCount);
                 diffChunkCount++;
                 diffBytesTotal += encodedDiffSize;
             }
@@ -6358,7 +6405,10 @@ public class CrossService : ICross
                     chunkIdx,
                     bitStrings[searchK],
                     vectors[searchK],
-                    fileChunks[chunkIdx]));
+                    // Zero-copy slice of _file. _file outlives the awaited
+                    // ReplicatedBatchStore.RunAsync below, so the wrapped slice
+                    // stays valid through every store RPC (and retry).
+                    _file.AsMemory(chunkIdx * chunkSize, chunkSize)));
             }
 
             var results = await ReplicatedBatchStore.RunAsync(workItems, default);
@@ -6368,7 +6418,7 @@ public class CrossService : ICross
                 ApplyV7StoreResponseToFate(
                     fates,
                     r.ChunkIdx,
-                    fileChunks,
+                    _file,
                     chunkSize,
                     r.ResponseToEncode,
                     sourceAgent: r.AckedReplicas.Count > 0 ? r.AckedReplicas[0] : "(unknown)");
@@ -6392,10 +6442,9 @@ public class CrossService : ICross
         for (int i = 0; i < chunkCount; i++)
         {
             if (fates[i].Flag != V7FlagDiff) continue;
-            // We don't keep the base bytes — re-derive by undoing the diff on the
-            // original chunk to recover the base, then re-apply.
-            var orig = fileChunks[i];
-            if (orig.Length != chunkSize) { proberFailures++; continue; }
+            // Sanity-check the diff structure itself (offsets monotonic + in
+            // range, deltas in [-255,255]). Chunks are exact-size slices of
+            // _file by construction, so there's no per-chunk length to verify.
             var diff = fates[i].Diff;
             if (diff == null) continue;
             // Sanity: every delta must be in [-255, 255] and offsets monotonic.
