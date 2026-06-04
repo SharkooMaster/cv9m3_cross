@@ -6259,14 +6259,72 @@ public class CrossService : ICross
             ("chunk_count", nonZeroIndices.Count));
         Console.WriteLine($"[CompressV7] Search: {searchSw.ElapsedMilliseconds}ms");
 
+        // ── 5b. Batched base-chunk prefetch ────────────────────────────────
+        // The classify loop needs the *base* bytes for every matched chunk the
+        // gateway didn't ship inline. Previously each such chunk did its own
+        // sequential `await GetChunkByStorageGuid`, so a window with N
+        // non-inline matches paid N serial agent round-trips — the dominant
+        // term in V7 latency at small chunk sizes. Here we resolve every
+        // DISTINCT storageGuid once and fetch them concurrently (bounded), so
+        // the classify loop becomes a pure CPU pass over already-materialized
+        // bytes.
+        //
+        // This changes only *when* bytes are fetched, never *which* bytes:
+        // chunk lookups are content-addressed (SHA256 == storageGuid), so
+        // dedup-by-guid and parallel fetch are byte-for-byte equivalent to the
+        // old serial path — same dedup decisions, same diffs, same ratio. A
+        // failed/absent fetch stays absent → the classify loop falls back to
+        // fresh-store exactly as before.
+        var prefetched = new ConcurrentDictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        var prefetchSw = Stopwatch.StartNew();
+        {
+            var fetchTargets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int k = 0; k < nonZeroIndices.Count; k++)
+            {
+                int i = nonZeroIndices[k];
+                var resp = searchResponses[i];
+                if (resp == null || !resp.IsMatched) continue;
+                bool inlineCandidate = resp.Chunk != null && resp.Chunk.Length == chunkSize;
+                if (inlineCandidate || string.IsNullOrEmpty(resp.StorageGuid)) continue;
+                if (fetchTargets.ContainsKey(resp.StorageGuid)) continue;
+
+                string agent;
+                try { agent = RendezvousRouter.PickAgent(bitStrings[k]); }
+                catch { agent = Globals.AgentsLoadbalancer; }
+                if (string.IsNullOrWhiteSpace(agent)) agent = Globals.AgentsLoadbalancer;
+                fetchTargets[resp.StorageGuid] =
+                    string.IsNullOrWhiteSpace(resp.TargetAgent) ? agent : resp.TargetAgent;
+            }
+
+            if (fetchTargets.Count > 0)
+            {
+                int fetchPar = Math.Max(8, Environment.ProcessorCount * 2);
+                var rawPar = Environment.GetEnvironmentVariable("CROSS_CLASSIFY_FETCH_PARALLELISM");
+                if (int.TryParse(rawPar, out var fp) && fp > 0) fetchPar = fp;
+
+                await Parallel.ForEachAsync(fetchTargets,
+                    new ParallelOptions { MaxDegreeOfParallelism = fetchPar },
+                    async (kv, ct) =>
+                    {
+                        try
+                        {
+                            var bytes = await _chunkReferenceClient.GetChunkByStorageGuidAsync(kv.Key, kv.Value, ct);
+                            if (bytes != null)
+                                prefetched[kv.Key] = bytes;
+                        }
+                        catch { /* leave absent → classify falls back to fresh-store */ }
+                    });
+            }
+        }
+        prefetchSw.Stop();
+        Observability.RecordStage("ClassifyFetch", prefetchSw.Elapsed.TotalMilliseconds,
+            ("fetch_count", prefetched.Count));
+
         // ── 6. Classify per chunk + collect fresh-store queue
-        // This is the largest "invisible" stage in the V7 path: it iterates
-        // every non-zero chunk, decides exact / diff / fresh-store, and lazy-
-        // fetches base bytes by storageGuid for chunks the gateway didn't
-        // ship inline. A slow agent on the GetChunkByStorageGuid path will
-        // show up here before it shows up in StoreChunks. Critical to
-        // separate from SearchBuckets so we don't blame the gateway for an
-        // agent fetch latency problem.
+        // Iterates every non-zero chunk and decides exact / diff / fresh-store.
+        // Base bytes come either inline from the search response or from the
+        // batched prefetch map above (keyed by storageGuid) — there are no
+        // network awaits in this loop anymore, so it is a pure CPU pass.
         var swDiffEncode = Stopwatch.StartNew();
         var freshStoreQueue = new List<(int chunkIdx, string agent, int searchK)>();
         int diffChunkCount = 0;
@@ -6290,23 +6348,13 @@ public class CrossService : ICross
             }
 
             // Got a match. Get the candidate bytes — inline from the response
-            // (zero-copy span over the protobuf payload) or by lazy fetch via
-            // storageGuid (which returns its own array). A-optimization: the
-            // inline path no longer ToByteArray()-copies. The fetch is the only
-            // awaiting branch, so we resolve the ReadOnlySpan AFTER all awaits —
-            // a span must never be held across a suspension point.
+            // (zero-copy span over the protobuf payload) or from the batched
+            // prefetch map (step 5b), keyed by content-addressed storageGuid.
+            // No awaits here: the fetch already happened in parallel above.
             bool inlineCandidate = resp.Chunk != null && resp.Chunk.Length == chunkSize;
             byte[]? fetchedCandidate = null;
             if (!inlineCandidate && !string.IsNullOrEmpty(resp.StorageGuid))
-            {
-                try
-                {
-                    fetchedCandidate = await _chunkReferenceClient.GetChunkByStorageGuidAsync(
-                        resp.StorageGuid,
-                        string.IsNullOrWhiteSpace(resp.TargetAgent) ? targetAgent : resp.TargetAgent);
-                }
-                catch { fetchedCandidate = null; }
-            }
+                prefetched.TryGetValue(resp.StorageGuid, out fetchedCandidate);
 
             // ReadOnlyMemory (not Span) because this method is async — span
             // locals are illegal here. `.Span` is taken as an rvalue at the
