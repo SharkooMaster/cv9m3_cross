@@ -147,7 +147,7 @@ public class CompressFileService : FileService.FileServiceBase
     // ── Concurrency limiter: prevent OOM by limiting parallel compressions ──
     // Each compression can use 500 MB-2 GB RAM. With 16 GiB limit, max 4 concurrent is safe.
     private static readonly int MaxConcurrentCompressions = Math.Max(2,
-        int.TryParse(Environment.GetEnvironmentVariable("CROSS_MAX_CONCURRENT"), out var mc) ? mc : 4);
+        int.TryParse(Environment.GetEnvironmentVariable("CROSS_MAX_CONCURRENT"), out var mc) ? mc : 8);
     private static readonly SemaphoreSlim _compressionGate = new(MaxConcurrentCompressions, MaxConcurrentCompressions);
 
     // ── Dedicated ArrayPool for windowed compression buffers ──
