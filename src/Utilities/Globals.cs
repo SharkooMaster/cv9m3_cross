@@ -7,7 +7,7 @@ namespace Cross.Utilities;
 
 public static class Globals
 {
-    public static int chunkSize = int.TryParse(Environment.GetEnvironmentVariable("CHUNK_SIZE"), out var cs) ? cs : 5120;
+    public static int chunkSize = int.TryParse(Environment.GetEnvironmentVariable("CHUNK_SIZE"), out var cs) ? cs : 4096;
     public static int k = 16;
 
     /// <summary>

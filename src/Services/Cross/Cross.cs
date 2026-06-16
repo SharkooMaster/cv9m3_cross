@@ -49,7 +49,7 @@ public class CrossService : ICross
         if (Globals.CcfEncodingV6) return "v6.0.0";
         return "v5.6.0";
     }
-    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0", "v5.1.0", "v5.2.0", "v5.3.0", "v5.4.0", "v5.5.0", "v5.6.0", "v6.0.0", "v7.0.0" };
+    private static readonly string[] SupportedVersions = { "v2.0.0", "v2.1.0", "v3.0.0", "v3.1.0", "v5.0.0", "v5.1.0", "v5.2.0", "v5.3.0", "v5.4.0", "v5.5.0", "v5.6.0", "v6.0.0", "v7.0.0", "v7.1.0" };
     private static readonly System.Buffers.ArrayPool<byte> _largeBufferPool = System.Buffers.ArrayPool<byte>.Create(1024 * 1024 * 128, 64);
     string headID = "";
     private readonly global::Cross.Services.Grpc.Agent.ChunkReferenceServiceClient _chunkReferenceClient = new();
@@ -4340,10 +4340,11 @@ public class CrossService : ICross
         if (actualLen >= 11)
         {
             int peekVersionLen = BitConverter.ToInt32(file, 0);
+            // v7.0.0 and v7.1.0 share a length (6) and the same V7 decoder.
             if (peekVersionLen == V7Version.Length && 4 + peekVersionLen <= actualLen)
             {
                 string peekVersion = Encoding.UTF8.GetString(file, 4, peekVersionLen);
-                if (peekVersion == V7Version)
+                if (peekVersion == V7Version || peekVersion == V7_1Version)
                     return await DecompressFileV7(file, actualLen);
             }
         }
@@ -5924,10 +5925,36 @@ public class CrossService : ICross
     //     overflow as long as chunkSize ≤ 65535.
 
     private const string V7Version = "v7.0.0";
+    // v7.1.0: identical layout to v7.0.0 except the error section is entropy-coded.
+    // The per-chunk diffs are split into separate streams (counts / offset-gaps /
+    // delta-bytes), each delta packed to a single (original-base) mod 256 byte
+    // (losslessly inverted as (base+s) mod 256), and the whole thing zstd-wrapped
+    // (with a raw fallback when compression doesn't pay). Decoders accept both
+    // versions, so already-stored v7.0.0 CCFs keep round-tripping unchanged.
+    private const string V7_1Version = "v7.1.0";
+    private const int V7ErrorZstdLevel = 19;
+    private const byte V7ErrModeRaw = 0x00;
+    private const byte V7ErrModeZstd = 0x01;
     private const byte V7FlagZero = 0x00;
     private const byte V7FlagExact = 0x01;
     private const byte V7FlagDiff = 0x02;
     private const int V7RefBodyLen = 8 + 8 + 32; // bucketId + chunkId + storageGuid
+
+    /// <summary>LEB128 varint reader over a byte[] with a moving cursor. Mirrors WriteVarint(Stream,uint).</summary>
+    private static uint ReadVarintBuf(byte[] buf, ref int pos, int limit)
+    {
+        uint result = 0;
+        int shift = 0;
+        while (true)
+        {
+            if (pos >= limit) throw new InvalidDataException("v7.1: unexpected end of buffer reading varint.");
+            byte b = buf[pos++];
+            result |= (uint)(b & 0x7F) << shift;
+            if ((b & 0x80) == 0) return result;
+            shift += 7;
+            if (shift > 28) throw new InvalidDataException("v7.1: varint too large.");
+        }
+    }
 
     private struct V7ChunkFate
     {
@@ -6170,7 +6197,7 @@ public class CrossService : ICross
 
         if (nonZeroIndices.Count == 0)
         {
-            byte[] payloadZ = BuildV7Payload(fates, chunkSize, trimBytes, fileHash);
+            byte[] payloadZ = BuildV7Payload(fates, chunkSize, trimBytes, fileHash, out _);
             // Even the all-zero short-circuit gets an overall stage so the
             // journal doesn't silently drop empty/zero windows.
             Observability.RecordStage("CompressFileV7", swV7Total.Elapsed.TotalMilliseconds,
@@ -6514,7 +6541,7 @@ public class CrossService : ICross
 
         // ── 9. Serialize the CCF
         var swSerialize = Stopwatch.StartNew();
-        byte[] ccf = BuildV7Payload(fates, chunkSize, trimBytes, fileHash);
+        byte[] ccf = BuildV7Payload(fates, chunkSize, trimBytes, fileHash, out int errorSectionLen);
         swSerialize.Stop();
         // Stage name matches V5/V6's "Serialize" for cross-version aggregation.
         Observability.RecordStage("Serialize", swSerialize.Elapsed.TotalMilliseconds,
@@ -6526,16 +6553,13 @@ public class CrossService : ICross
             if (fates[i].Flag != V7FlagZero) refsFound++;
 
         long dcStored = freshStoreQueue.Count * (long)chunkSize;
-        int totalDiffBytes = 0;
         int totalDiffs = 0;
         for (int i = 0; i < chunkCount; i++)
-        {
             if (fates[i].Diff != null)
-            {
                 totalDiffs += fates[i].Diff!.Count;
-                totalDiffBytes += 2 + 4 * fates[i].Diff!.Count;
-            }
-        }
+        // ErrorPayloadBytes now reflects the actual entropy-coded section size
+        // (post stream-separation + zstd), not the old raw 2 + 4*count estimate.
+        int totalDiffBytes = errorSectionLen;
         float avgErrRate = chunkCount > 0
             ? (float)totalDiffs / (chunkCount * (float)chunkSize)
             : 0f;
@@ -6553,12 +6577,187 @@ public class CrossService : ICross
 
         Console.WriteLine(
             $"[CompressV7] DONE: ccf={ccf.Length} bytes, refs={refsFound}, fresh={freshStoreQueue.Count}, " +
-            $"diffChunks={diffChunkCount}, diffBytes={totalDiffBytes}, avgErr={avgErrRate:P2}");
+            $"diffChunks={diffChunkCount}, errSectionBytes={errorSectionLen} (v7.1 entropy-coded), avgErr={avgErrRate:P2}");
 
         return (ccf, refsFound, chunkCount, dcStored, avgErrRate, (long)totalDiffBytes);
     }
 
-    private static byte[] BuildV7Payload(V7ChunkFate[] fates, int chunkSize, byte[] trim, byte[] fileHash)
+    /// <summary>
+    /// v7.1.0 error-section encoder. Transposes the per-chunk diff lists into three
+    /// homogeneous streams — per-diff-chunk error counts, per-error offset gaps, and
+    /// per-error delta bytes — then zstd-wraps the concatenation. Stream separation
+    /// lets the entropy coder model each distribution independently (gaps are small,
+    /// deltas cluster around 0/255), which the old interleaved (u16 gap, i16 delta)
+    /// layout defeated. Each delta is stored as a single (original-base) mod 256
+    /// byte; the decoder inverts it as (base + byte) mod 256, which is exact because
+    /// the original byte is in [0,255]. Returns an empty section when there are no
+    /// diffs. A raw (uncompressed) mode is emitted when zstd would not shrink it.
+    /// </summary>
+    private static byte[] EncodeV7ErrorSection(V7ChunkFate[] fates, int chunkCount)
+    {
+        // Total error count (also drives the gap/delta stream lengths on decode).
+        long totalErrors = 0;
+        for (int i = 0; i < chunkCount; i++)
+            if (fates[i].Flag == V7FlagDiff)
+                totalErrors += fates[i].Diff?.Count ?? 0;
+
+        if (totalErrors == 0) return Array.Empty<byte>();
+
+        using var raw = new MemoryStream();
+        WriteVarint(raw, (uint)totalErrors);
+
+        // Stream 1: per-diff-chunk error counts (chunk order).
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (fates[i].Flag != V7FlagDiff) continue;
+            WriteVarint(raw, (uint)(fates[i].Diff?.Count ?? 0));
+        }
+
+        // Stream 2: offset gaps (per error, chunk order then offset order). The first
+        // gap in each chunk is the absolute offset (prevOff resets to 0 per chunk),
+        // matching the v7.0.0 delta-of-offset convention exactly.
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (fates[i].Flag != V7FlagDiff) continue;
+            var diff = fates[i].Diff;
+            if (diff == null) continue;
+            int prevOff = 0;
+            for (int e = 0; e < diff.Count; e++)
+            {
+                int gap = diff[e].Off - prevOff;
+                if (gap < 0)
+                    throw new InvalidOperationException(
+                        $"v7.1: chunk {i} error[{e}] non-monotonic offset gap {gap}.");
+                WriteVarint(raw, (uint)gap);
+                prevOff = diff[e].Off;
+            }
+        }
+
+        // Stream 3: delta bytes ((original-base) mod 256), one per error.
+        for (int i = 0; i < chunkCount; i++)
+        {
+            if (fates[i].Flag != V7FlagDiff) continue;
+            var diff = fates[i].Diff;
+            if (diff == null) continue;
+            for (int e = 0; e < diff.Count; e++)
+                raw.WriteByte((byte)diff[e].Delta);
+        }
+
+        byte[] rawBytes = raw.ToArray();
+
+        byte[] compressed;
+        using (var c = new Compressor(V7ErrorZstdLevel))
+            compressed = c.Wrap(rawBytes).ToArray();
+
+        using var zstdMode = new MemoryStream();
+        zstdMode.WriteByte(V7ErrModeZstd);
+        WriteVarint(zstdMode, (uint)rawBytes.Length);
+        zstdMode.Write(compressed, 0, compressed.Length);
+        byte[] zstdSection = zstdMode.ToArray();
+
+        // Only keep the zstd section if it actually beats the raw (mode byte + raw)
+        // layout — tiny diff sets can grow under a zstd frame's fixed overhead.
+        if (zstdSection.Length < rawBytes.Length + 1)
+            return zstdSection;
+
+        using var rawMode = new MemoryStream();
+        rawMode.WriteByte(V7ErrModeRaw);
+        rawMode.Write(rawBytes, 0, rawBytes.Length);
+        return rawMode.ToArray();
+    }
+
+    /// <summary>
+    /// v7.1.0 error-section decoder. Reverses <see cref="EncodeV7ErrorSection"/>:
+    /// unwraps (mode byte → optional zstd), then walks the count/gap/delta streams to
+    /// rebuild one diff list per V7FlagDiff chunk. Delta bytes are returned verbatim
+    /// (0..255) in the short Delta field; the apply step interprets them mod 256.
+    /// </summary>
+    private static List<(ushort Off, short Delta)>?[] DecodeV7ErrorSection(
+        byte[] file, int errStart, int errLen, byte[] flags, int chunkCount, int chunkSize)
+    {
+        var diffByChunk = new List<(ushort Off, short Delta)>?[chunkCount];
+        if (errLen == 0) return diffByChunk;
+
+        int sectionEnd = errStart + errLen;
+        int p = errStart;
+        byte mode = file[p++];
+
+        byte[] raw;
+        if (mode == V7ErrModeZstd)
+        {
+            uint rawLen = ReadVarintBuf(file, ref p, sectionEnd);
+            using var d = new Decompressor();
+            raw = d.Unwrap(file.AsSpan(p, sectionEnd - p), (int)rawLen).ToArray();
+            if (raw.Length != rawLen)
+                throw new InvalidDataException(
+                    $"v7.1: error stream decompressed to {raw.Length}, expected {rawLen}.");
+        }
+        else if (mode == V7ErrModeRaw)
+        {
+            raw = file.AsSpan(p, sectionEnd - p).ToArray();
+        }
+        else
+        {
+            throw new InvalidDataException($"v7.1: unknown error-section mode 0x{mode:X2}.");
+        }
+
+        int rp = 0;
+        int rlimit = raw.Length;
+        uint totalErrors = ReadVarintBuf(raw, ref rp, rlimit);
+
+        // Diff chunk indices, in chunk order (the same order the encoder wrote).
+        var diffChunks = new List<int>();
+        for (int i = 0; i < chunkCount; i++)
+            if (flags[i] == V7FlagDiff) diffChunks.Add(i);
+
+        // Stream 1: counts.
+        var counts = new int[diffChunks.Count];
+        long countSum = 0;
+        for (int d = 0; d < diffChunks.Count; d++)
+        {
+            counts[d] = (int)ReadVarintBuf(raw, ref rp, rlimit);
+            countSum += counts[d];
+        }
+        if (countSum != totalErrors)
+            throw new InvalidDataException(
+                $"v7.1: error counts sum {countSum} != declared total {totalErrors}.");
+
+        // Stream 2: offset gaps → absolute offsets, per chunk.
+        for (int d = 0; d < diffChunks.Count; d++)
+        {
+            int count = counts[d];
+            var list = new List<(ushort Off, short Delta)>(count);
+            int cursor = 0;
+            for (int e = 0; e < count; e++)
+            {
+                int gap = (int)ReadVarintBuf(raw, ref rp, rlimit);
+                cursor += gap;
+                if (cursor < 0 || cursor >= chunkSize)
+                    throw new InvalidDataException(
+                        $"v7.1: chunk {diffChunks[d]} error[{e}] offset {cursor} out of range [0, {chunkSize}).");
+                list.Add(((ushort)cursor, 0));
+            }
+            diffByChunk[diffChunks[d]] = list;
+        }
+
+        // Stream 3: delta bytes, in the same chunk/error order.
+        for (int d = 0; d < diffChunks.Count; d++)
+        {
+            var list = diffByChunk[diffChunks[d]]!;
+            for (int e = 0; e < list.Count; e++)
+            {
+                if (rp >= rlimit)
+                    throw new InvalidDataException("v7.1: delta stream truncated.");
+                byte deltaByte = raw[rp++];
+                var (off, _) = list[e];
+                list[e] = (off, deltaByte);
+            }
+        }
+
+        return diffByChunk;
+    }
+
+    private static byte[] BuildV7Payload(V7ChunkFate[] fates, int chunkSize, byte[] trim, byte[] fileHash, out int errorSectionLen)
     {
         int chunkCount = fates.Length;
 
@@ -6569,19 +6768,16 @@ public class CrossService : ICross
             refsLen += 1;
             if (fates[i].Flag != V7FlagZero) refsLen += V7RefBodyLen;
         }
-        int errLen = 0;
-        for (int i = 0; i < chunkCount; i++)
-        {
-            if (fates[i].Flag == V7FlagDiff)
-            {
-                errLen += 2;
-                errLen += (fates[i].Diff?.Count ?? 0) * 4;
-            }
-        }
+
+        // v7.1.0 entropy-coded error section (stream-separated + zstd).
+        byte[] errSection = EncodeV7ErrorSection(fates, chunkCount);
+        int errLen = errSection.Length;
+        errorSectionLen = errLen;
+
         int trimLen = trim?.Length ?? 0;
         int hashLen = fileHash?.Length ?? 0;
 
-        byte[] versionBytes = Encoding.UTF8.GetBytes(V7Version);
+        byte[] versionBytes = Encoding.UTF8.GetBytes(V7_1Version);
         int headerLen = 4 + versionBytes.Length + 4 + 4 + 4 + 4 + 4;
         int totalLen = headerLen + refsLen + errLen + trimLen + 4 + hashLen;
 
@@ -6610,32 +6806,11 @@ public class CrossService : ICross
             off += 32;
         }
 
-        // ── Errors (per 0x02 chunk in chunk order)
-        for (int i = 0; i < chunkCount; i++)
+        // ── Errors (v7.1.0 entropy-coded section, opaque blob)
+        if (errLen > 0)
         {
-            if (fates[i].Flag != V7FlagDiff) continue;
-            var diff = fates[i].Diff;
-            int count = diff?.Count ?? 0;
-            if (count > ushort.MaxValue)
-                throw new InvalidOperationException(
-                    $"v7: chunk {i} has {count} diffs (exceeds ushort.MaxValue).");
-            BitConverter.TryWriteBytes(buf.AsSpan(off, 2), (ushort)count); off += 2;
-
-            if (diff != null)
-            {
-                int prevOff = 0;
-                for (int e = 0; e < diff.Count; e++)
-                {
-                    var (errOff, errDelta) = diff[e];
-                    int deltaInt = errOff - prevOff;
-                    if (deltaInt < 0 || deltaInt > ushort.MaxValue)
-                        throw new InvalidOperationException(
-                            $"v7: chunk {i} error[{e}] deltaOff {deltaInt} out of u16 range.");
-                    BitConverter.TryWriteBytes(buf.AsSpan(off, 2), (ushort)deltaInt); off += 2;
-                    BitConverter.TryWriteBytes(buf.AsSpan(off, 2), errDelta); off += 2;
-                    prevOff = errOff;
-                }
-            }
+            Buffer.BlockCopy(errSection, 0, buf, off, errLen);
+            off += errLen;
         }
 
         // ── Trim
@@ -6679,8 +6854,12 @@ public class CrossService : ICross
         if (versionLen <= 0 || versionLen > 64 || off + versionLen > actualLen)
             throw new InvalidDataException("v7: bad versionLen.");
         string version = Encoding.UTF8.GetString(file, off, versionLen); off += versionLen;
-        if (version != V7Version)
+        if (version != V7Version && version != V7_1Version)
             throw new InvalidDataException($"v7 decoder dispatched to non-v7 payload (version='{version}').");
+        // v7.1.0 entropy-codes the error section and stores deltas as (original-base)
+        // mod 256 bytes; v7.0.0 stores raw signed (offset-gap, delta) pairs. The apply
+        // step below interprets deltas accordingly.
+        bool errorsModByte = version == V7_1Version;
 
         if (off + 4 * 5 > actualLen) throw new InvalidDataException("v7: header truncated (sizes).");
         int chunkCount = BitConverter.ToInt32(file, off); off += 4;
@@ -6743,36 +6922,46 @@ public class CrossService : ICross
             throw new InvalidDataException($"v7: refs section size mismatch (read {r - refsStart}, declared {refsLen}).");
 
         // ── Parse errors (per 0x02 chunk in chunk order)
-        var diffByChunk = new List<(ushort Off, short Delta)>?[chunkCount];
-        int eCur = errStart;
-        for (int i = 0; i < chunkCount; i++)
+        List<(ushort Off, short Delta)>?[] diffByChunk;
+        if (errorsModByte)
         {
-            if (flags[i] != V7FlagDiff) continue;
-            if (eCur + 2 > trimStart)
-                throw new InvalidDataException($"v7: errors section truncated at chunk {i} header.");
-            int errCount = BitConverter.ToUInt16(file, eCur); eCur += 2;
-            if (eCur + 4 * errCount > trimStart)
-                throw new InvalidDataException($"v7: errors section truncated at chunk {i} body.");
-
-            var list = new List<(ushort Off, short Delta)>(errCount);
-            int cursor = 0; // sum of deltas
-            for (int k = 0; k < errCount; k++)
-            {
-                ushort deltaOff = BitConverter.ToUInt16(file, eCur); eCur += 2;
-                short deltaVal = BitConverter.ToInt16(file, eCur); eCur += 2;
-                cursor += deltaOff;
-                if (cursor < 0 || cursor >= chunkSize)
-                    throw new InvalidDataException(
-                        $"v7: chunk {i} error[{k}] cursor {cursor} out of range [0, {chunkSize}).");
-                if (deltaVal < -255 || deltaVal > 255)
-                    throw new InvalidDataException(
-                        $"v7: chunk {i} error[{k}] deltaVal {deltaVal} out of valid byte-diff range [-255, 255].");
-                list.Add(((ushort)cursor, deltaVal));
-            }
-            diffByChunk[i] = list;
+            // v7.1.0: entropy-coded, stream-separated section.
+            diffByChunk = DecodeV7ErrorSection(file, errStart, errLen, flags, chunkCount, chunkSize);
         }
-        if (eCur != trimStart)
-            throw new InvalidDataException($"v7: errors section size mismatch (read {eCur - errStart}, declared {errLen}).");
+        else
+        {
+            // v7.0.0: raw interleaved (u16 offset-gap, i16 delta) pairs.
+            diffByChunk = new List<(ushort Off, short Delta)>?[chunkCount];
+            int eCur = errStart;
+            for (int i = 0; i < chunkCount; i++)
+            {
+                if (flags[i] != V7FlagDiff) continue;
+                if (eCur + 2 > trimStart)
+                    throw new InvalidDataException($"v7: errors section truncated at chunk {i} header.");
+                int errCount = BitConverter.ToUInt16(file, eCur); eCur += 2;
+                if (eCur + 4 * errCount > trimStart)
+                    throw new InvalidDataException($"v7: errors section truncated at chunk {i} body.");
+
+                var list = new List<(ushort Off, short Delta)>(errCount);
+                int cursor = 0; // sum of deltas
+                for (int k = 0; k < errCount; k++)
+                {
+                    ushort deltaOff = BitConverter.ToUInt16(file, eCur); eCur += 2;
+                    short deltaVal = BitConverter.ToInt16(file, eCur); eCur += 2;
+                    cursor += deltaOff;
+                    if (cursor < 0 || cursor >= chunkSize)
+                        throw new InvalidDataException(
+                            $"v7: chunk {i} error[{k}] cursor {cursor} out of range [0, {chunkSize}).");
+                    if (deltaVal < -255 || deltaVal > 255)
+                        throw new InvalidDataException(
+                            $"v7: chunk {i} error[{k}] deltaVal {deltaVal} out of valid byte-diff range [-255, 255].");
+                    list.Add(((ushort)cursor, deltaVal));
+                }
+                diffByChunk[i] = list;
+            }
+            if (eCur != trimStart)
+                throw new InvalidDataException($"v7: errors section size mismatch (read {eCur - errStart}, declared {errLen}).");
+        }
 
         // ── Parse hash trailer
         int hashLen = BitConverter.ToInt32(file, hashOff);
@@ -6880,14 +7069,26 @@ public class CrossService : ICross
                 // ── Apply diff
                 if (flags[i] == V7FlagDiff && diffByChunk[i] != null)
                 {
-                    foreach (var (errOff, delta) in diffByChunk[i]!)
+                    if (errorsModByte)
                     {
-                        int patched = chunk[errOff] + delta;
-                        if (patched < 0 || patched > 255)
-                            throw new InvalidDataException(
-                                $"v7: chunk {i} patched byte {patched} at offset {errOff} out of [0,255] " +
-                                $"(base={chunk[errOff]}, delta={delta}) — base bytes do not match what encoder diffed against.");
-                        chunk[errOff] = (byte)patched;
+                        // v7.1.0: delta is (original-base) mod 256 in [0,255].
+                        // (base + delta) mod 256 == original exactly, since original
+                        // is a byte — no bounds check is meaningful or needed.
+                        foreach (var (errOff, delta) in diffByChunk[i]!)
+                            chunk[errOff] = (byte)(chunk[errOff] + (byte)delta);
+                    }
+                    else
+                    {
+                        // v7.0.0: delta is the signed (original-base) in [-255,255].
+                        foreach (var (errOff, delta) in diffByChunk[i]!)
+                        {
+                            int patched = chunk[errOff] + delta;
+                            if (patched < 0 || patched > 255)
+                                throw new InvalidDataException(
+                                    $"v7: chunk {i} patched byte {patched} at offset {errOff} out of [0,255] " +
+                                    $"(base={chunk[errOff]}, delta={delta}) — base bytes do not match what encoder diffed against.");
+                            chunk[errOff] = (byte)patched;
+                        }
                     }
                 }
 
